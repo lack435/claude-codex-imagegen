@@ -1,0 +1,20 @@
+[package]
+name = "codex-imagegen"
+version = "0.1.0"
+edition = "2021"
+# jpeg-encoder, which the preview pipeline will use, needs 1.87 (see docs/design.md).
+rust-version = "1.87"
+description = "MCP server that lets Claude Code generate and refine images through a local Codex CLI"
+publish = false
+
+[[bin]]
+name = "codex-imagegen"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

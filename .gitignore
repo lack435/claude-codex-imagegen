@@ -1,0 +1,8 @@
+/target
+*.pdb
+
+# Built artifact. Published via GitHub Releases rather than committed: a committed binary
+# cannot be kept honest (a running MCP server locks it, CI cannot tell a stale one from a
+# current one because the version is pinned, and an unremapped build embeds the builder's
+# home directory). build.ps1 stages here after a local build.
+/dist
