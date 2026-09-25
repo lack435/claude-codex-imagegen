@@ -1,7 +1,7 @@
 # codex-imagegen v1 design
 
-Status: draft for owner review, 2026-09-25 (revision 3: adversarial review applied; cleanup added). Nothing
-is implemented yet.
+Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applied; cleanup added). M0 (repo
+scaffold) is in place; no server behaviour is implemented yet.
 
 Claims carry one of three tags:
 
@@ -822,8 +822,10 @@ The estimate is about 3,500 lines without tests.
 
 **Build and CI.**
 
-- `build.ps1` runs fmt, `clippy -D warnings` and test. It then does a release build with remapped paths,
-  stages the result to a gitignored `dist\`, verifies it by hash, and checks for leaked user paths.
+- `build.ps1` runs fmt, `clippy -D warnings` and test. It then does a release build with remapped paths
+  and a statically linked C runtime, so the exe needs no VC++ Redistributable. It stages the result to a
+  gitignored `dist\` and verifies it by hash. It checks, with a self-tested check, that no user path leaked
+  in and that the exe does not import `VCRUNTIME140.dll` [verified].
 - CI runs on Windows. It includes a no-quota contract check: the shipped exe, given a missing `--codex-bin`,
   must return `CLI_NOT_FOUND` with an ACTION REQUIRED block.
 - The tag-driven release workflow comes later.

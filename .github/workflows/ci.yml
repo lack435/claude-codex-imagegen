@@ -39,8 +39,9 @@ jobs:
       - name: Tests
         run: cargo test
 
-      # Via build.ps1 so CI exercises the same build definition a release uses, including
-      # the --remap-path-prefix flags and its check that no home directory leaked in.
+      # Via build.ps1 so CI exercises the one build definition, including the path remapping,
+      # the static CRT, and its checks that no home directory leaked in and that the exe does
+      # not import VCRUNTIME140.dll.
       - name: Build and verify
         shell: pwsh
         env:

@@ -70,8 +70,12 @@ answer it explicitly.
 
 ## Conventions that are easy to get wrong
 
-- **Never commit `codex-imagegen.exe`.** `dist\` is gitignored. Releases are built and published by
-  CI, never from a workstation.
+- **Never commit `codex-imagegen.exe`.** `dist\` is gitignored. Distributed binaries come from CI,
+  never from a workstation. Today that is the per-commit build artifact; a tag-driven release
+  workflow may come later.
+- **Release build flags live in `build.ps1`.** Its `CARGO_ENCODED_RUSTFLAGS` overrides every
+  `rustflags` key in `.cargo/config.toml`, so a flag the release needs, such as the path remapping or
+  the static CRT, must go in that list.
 - **Pin models by full id** (`gpt-6-astra`). Aliases move.
 - **stdout is protocol traffic only.** All diagnostics go to stderr.
 - **The Codex child's isolation and posture are security boundaries.** This covers:
