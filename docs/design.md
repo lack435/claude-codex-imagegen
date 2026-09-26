@@ -2,8 +2,10 @@
 
 Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applied; cleanup added). M0 (repo
 scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
-and the CI contract check. `generate` and `refine` validate their arguments and run preflight, then return
-`INTERNAL_ERROR` until M2. V0, V7 and V8 are not yet run.
+and the CI contract check. M2 is in progress: output publishing (`output.rs`), the preview pipeline
+(`preview.rs`) and the turn registry (`registry.rs`) exist with their unit tests, but `generate` is not wired to
+them yet, so `generate` and `refine` still validate their arguments, run preflight and return `INTERNAL_ERROR`.
+V0 is not yet run.
 
 Claims carry one of three tags:
 
@@ -576,7 +578,10 @@ created in it and deleted. Any failure is `BAD_REQUEST`, naming the path.
 - The copy goes to a temp file in the destination directory, `.<session>-v<N>.<pid>-<seq>.tmp`, and is then
   published with `MoveFileExW` *without* `MOVEFILE_REPLACE_EXISTING`.
 - On `ERROR_ALREADY_EXISTS` or `ERROR_FILE_EXISTS`, N is bumped and the publish retried, and `next_version`
-  records the N actually used plus one.
+  records the N actually used plus one. A folder in the way counts as taken [verified: unit test].
+- The temp file is flushed to disk before the rename, so the published name never shows a partial file. A
+  rename refused with a sharing or access error, typically an antivirus scanner holding the fresh file, is
+  retried for about 0.8 s before it counts as a failed copy.
 - Nothing is ever overwritten, even when several projects or processes share a folder [decided].
 
 **Copy.** A byte-for-byte copy of `savedPath`, so the C2PA chunk survives. It is never re-encoded. If the copy
@@ -585,15 +590,21 @@ fails despite the pre-check, the result is still a success: its image line point
 
 **Preview.** Built from the image bytes:
 
-1. Decode with `png`.
+1. Decode with `png`, normalised to 8 bits per sample.
 2. Downscale with an exact area average to a long edge of at most 1024 px. Never upscale.
 3. Encode as JPEG, quality 85, with `jpeg-encoder` (4:2:0, standard Huffman tables).
 4. Base64.
 
 Measured: 89–317 KB, about 50 ms [verified: benchmark].
 
-If the decoded image has alpha (transparent background), the preview is a PNG. If that PNG is over 500 KB, it
-is flattened onto white instead, and the text says so.
+If the JPEG is over 512,000 bytes, the quality steps down (75, 65, 50, 35) until it fits. Real images fit at 85
+[verified: benchmark]; only noise-like content needs the steps (a 1024 px noise image fits at 50 [verified: unit
+test]). If nothing fits, there is no image block, only the warning line.
+
+If the decoded image has transparency (any pixel less than opaque; an alpha channel that is opaque everywhere
+does not count), the preview is a PNG, downscaled with colour premultiplied by alpha so transparent pixels
+cannot darken the edges. If that PNG is over 500 KB, it is flattened onto white and sent as JPEG instead, and
+the text says so.
 
 **Huffman trap.** `jpeg-encoder`'s `set_optimized_huffman_tables(true)` produces non-interleaved 4:2:0 scans.
 These decoded as garbage in `zune-jpeg`, and were garbled through Claude Code's Read path [verified]. It must
@@ -691,8 +702,14 @@ later `thread/resume` then fails with `no rollout found for thread id <id>`. Cod
 
 - Wait up to about 15 s for `turn/completed`.
 - If it does not arrive, return anyway, but keep the session marked busy in the registry until
-  `turn/completed` or child death. No later `turn/start` can then merge into it.
-- If a `turn/start` reply arrives after the call gave up, interrupt that turn at once.
+  `turn/completed` or child death. No later `turn/start` can then merge into it. The lingering turn still
+  counts against `--max-concurrent`, since Codex may still be generating it.
+- That thread's `thread/unsubscribe` is sent when its `turn/completed` arrives, not when the call returns:
+  unsubscribing earlier would also stop the notification that frees the session.
+- If the turn starts after the call gave up (its `turn/start` reply came too late), interrupt that turn as soon
+  as its id is known. A late reply is dropped, but the `turn/started` notification that follows it names the
+  turn [verified: smoke log]. The same holds for a cancel that arrives while `turn/start` is still unanswered.
+- The registry hands out each turn's interrupt once, whichever of these paths asks first.
 
 **Timeout.** When `--timeout-seconds` runs out mid-turn, the turn is interrupted. The call returns `TIMEOUT`,
 or success with a warning if an image had already completed.
@@ -845,11 +862,11 @@ Planned modules:
 | `cancel.rs` | Per-request arbitration between a cancel and the response. |
 | `appserver.rs` | Child supervisor: spawn in the job, handshake, pending-reply table with deadlines, routing, answers to server requests, respawn and recycle. |
 | `codex.rs` | Binary resolution, preflight, per-thread config map, thread/turn parameters, developer instructions, input text. |
-| `registry.rs` | Running turns per session: busy check, cap, phases, lingering-interrupt state, shutdown. |
+| `registry.rs` | Running turns per session: busy check, cap, phases, per-thread event routing, lingering-interrupt state, shutdown. |
 | `session.rs` | Session store: atomic JSON, `LockFileEx` store lock and per-name leases, record type. |
-| `output.rs` | Output-dir pre-check, no-replace versioned publish. |
+| `output.rs` | Output-dir resolution and pre-check, no-replace versioned publish, automatic session names. |
 | `cleanup.rs` | Session expiry and the `--cleanup` sweep, with the deletion safety rules. |
-| `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode, base64. |
+| `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode with the size steps, base64. |
 | `errors.rs` | Failure contract, item-level and `codexErrorInfo` mapping. |
 | `config.rs` | Flags, state directory derivation, `fnv1a64`. |
 | `winjob.rs` | Job object and suspended spawn. |

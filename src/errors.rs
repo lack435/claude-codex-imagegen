@@ -407,6 +407,38 @@ pub fn server_shutting_down() -> Failure {
     )
 }
 
+/// Another call in this process is using the session. `interrupted` is the case where that call
+/// has already returned, but its turn was interrupted and Codex has not yet confirmed that it
+/// stopped: a new turn on the thread would merge into it (docs/design.md, "After `turn/interrupt`").
+// Raised by the registry, which generate is wired to in the change that follows this one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn session_busy(session: &str, interrupted: bool) -> Failure {
+    let why = if interrupted {
+        "its previous turn was interrupted and Codex has not yet confirmed that it stopped"
+    } else {
+        "another call on it is still running"
+    };
+    Failure::new(
+        "SESSION_BUSY",
+        format!("The session '{session}' is busy: {why}."),
+        "Nothing was spent. Wait for the other call to finish and call again, or use a different \
+         session name.",
+    )
+}
+
+/// `--max-concurrent` image calls are already running in this process.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn too_many_running(max: usize) -> Failure {
+    Failure::new(
+        "TOO_MANY_RUNNING",
+        format!(
+            "codex-imagegen is already running {max} image call(s), its limit (--max-concurrent \
+             {max})."
+        ),
+        "Nothing was spent. Wait for one of the running calls to finish, then call again.",
+    )
+}
+
 /// The request was cancelled before an image completed. A cancelled request normally gets no
 /// response at all; this exists for the paths that still need a result value.
 pub fn cancelled() -> Failure {
@@ -471,6 +503,9 @@ mod tests {
             not_implemented_yet(),
             timeout(300),
             server_shutting_down(),
+            session_busy("fox", false),
+            session_busy("fox", true),
+            too_many_running(4),
             cancelled(),
         ]
     }

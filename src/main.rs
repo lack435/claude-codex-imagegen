@@ -16,6 +16,15 @@ mod config;
 mod errors;
 mod jsonrpc;
 mod mcp;
+// Milestone M2's building blocks. generate is wired to them in the change that follows, and until
+// then only their own tests use them. Remove these three allowances with that change, so anything
+// still unused shows up.
+#[cfg_attr(not(test), allow(dead_code))]
+mod output;
+#[cfg_attr(not(test), allow(dead_code))]
+mod preview;
+#[cfg_attr(not(test), allow(dead_code))]
+mod registry;
 #[cfg(test)]
 mod testutil;
 mod tools;

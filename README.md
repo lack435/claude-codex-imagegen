@@ -25,3 +25,22 @@ being built and why.
 
 This runs the checks and tests, builds the release binary, and stages it at
 `dist\codex-imagegen.exe`.
+
+## Output files (planned)
+
+Each image is saved as a full-resolution PNG, `<session>-v<N>.png`, in `generated-images\` under the
+project Claude Code has open, unless a call's `output_dir` or the server's `--output-dir` names another
+folder. Nothing there is ever overwritten.
+
+That folder is scratch space, not a place to keep work: its files expire with their session after
+`--session-ttl-days` idle (7 by default). Move or copy the images worth keeping into the project proper,
+and keep the folder out of version control by adding this line to the project's `.gitignore`:
+
+```
+generated-images/
+```
+
+## Acknowledgements
+
+This software is based in part on the work of the Independent JPEG Group. The JPEG encoder that builds
+the previews includes code derived from the IJG's.

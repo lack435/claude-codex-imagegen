@@ -2,7 +2,7 @@
 name = "codex-imagegen"
 version = "0.1.0"
 edition = "2021"
-# jpeg-encoder, which the preview pipeline will use, needs 1.87 (see docs/design.md).
+# jpeg-encoder, which the preview pipeline uses, needs 1.87 (see docs/design.md).
 rust-version = "1.87"
 description = "MCP server that lets Claude Code generate and refine images through a local Codex CLI"
 publish = false
@@ -16,6 +16,16 @@ serde = { version = "1", features = ["derive"] }
 # raw_value: the app-server reader parses a borrowed envelope, so a multi-megabyte image line is
 # routed without being copied into a serde_json::Value (see docs/design.md, "Message handling").
 serde_json = { version = "1", features = ["raw_value"] }
+# The preview pipeline (docs/design.md, "Output files"): png decodes the image (and encodes a
+# preview when it has transparency), jpeg-encoder writes the JPEG preview. Default features only:
+# jpeg-encoder's "simd" feature is the only thing that lets unsafe code into it.
+png = "0.18"
+jpeg-encoder = "0.7"
+
+[dev-dependencies]
+# Only to differentially test the hand-written base64 in preview.rs. std without its default
+# "simd-unsafe" feature keeps the crate forbid(unsafe_code).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "z"
