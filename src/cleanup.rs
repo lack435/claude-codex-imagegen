@@ -171,9 +171,10 @@ pub fn is_uuid(text: &str) -> bool {
         })
 }
 
-/// Whether two paths name the same folder as Windows compares them: case-insensitively, with or
-/// without a trailing separator, and with or without the `\\?\` prefix Codex's canonicalised
-/// `CODEX_HOME` carries.
+/// Whether two paths name the same folder as Windows usually compares them: case-insensitively, with
+/// or without a trailing separator, and with or without the `\\?\` prefix. Only for paths this
+/// server derives itself, such as matching a project's state folder; every identity check that
+/// guards a delete uses [`same_resolved_path`] instead.
 pub fn same_path(a: &Path, b: &Path) -> bool {
     fn plain(path: &Path) -> String {
         let text = path.to_string_lossy().replace('/', "\\");
@@ -186,19 +187,23 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     plain(a) == plain(b)
 }
 
-/// Whether two final paths, both read with `GetFinalPathNameByHandleW`, are the same file's path:
-/// exactly, apart from the `\\?\` prefix. Both carry the on-disk case, so a real match is
-/// byte-identical, and a case-insensitive compare would let a junction redirect a delete to a
-/// sibling whose name differs only by case (a case-sensitive folder) or by a Unicode case fold NTFS
-/// does not apply, such as U+212A KELVIN SIGN for `k` [verified: scratch test, 2026-09-26]. The cost:
-/// a folder renamed by case alone keeps its file, which fails closed.
-fn same_final_path(a: &Path, b: &Path) -> bool {
+/// Whether two resolved paths name the same thing: exactly, apart from the `\\?\` prefix, a
+/// trailing separator and `/` for `\`. For paths that both came from the file system with their
+/// on-disk case -- final paths read with `GetFinalPathNameByHandleW`, Codex's canonicalised
+/// `codexHome`, and folders joined onto it from names Codex created -- a real match is identical,
+/// while a case-insensitive compare would accept a sibling whose name differs only by case (in a
+/// case-sensitive folder) or by a Unicode case fold NTFS does not apply, such as U+212A KELVIN SIGN
+/// for `k` [verified: scratch test, 2026-09-26]. Every identity check before a delete uses this. The
+/// cost: a folder or home renamed by case alone is treated as someone else's and kept, which fails
+/// closed.
+pub fn same_resolved_path(a: &Path, b: &Path) -> bool {
     fn plain(path: &Path) -> String {
-        let text = path.to_string_lossy().into_owned();
-        match text.strip_prefix(r"\\?\UNC\") {
+        let text = path.to_string_lossy().replace('/', "\\");
+        let text = match text.strip_prefix(r"\\?\UNC\") {
             Some(rest) => format!(r"\\{rest}"),
             None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
-        }
+        };
+        text.trim_end_matches('\\').to_string()
     }
     plain(a) == plain(b)
 }
@@ -244,7 +249,7 @@ fn remove_session(
                 .to_string(),
         );
     }
-    if !same_path(&record.codex_home, codex_home) {
+    if !same_resolved_path(&record.codex_home, codex_home) {
         return Fate::Skipped(format!(
             "its Codex thread lives in another Codex home ({}), so nothing of it was deleted; \
              codex-imagegen --cleanup covers every home",
@@ -395,7 +400,7 @@ fn check_codex_folder(codex_home: &Path, thread_id: &str) -> FolderCheck {
     };
     let expected = home.join("generated_images").join(thread_id);
     match fs::canonicalize(&dir) {
-        Ok(actual) if same_path(&actual, &expected) => FolderCheck::Ours(expected),
+        Ok(actual) if same_resolved_path(&actual, &expected) => FolderCheck::Ours(expected),
         Ok(actual) => FolderCheck::LeftAlone(format!(
             "it resolves to {}, not {}",
             actual.display(),
@@ -510,7 +515,10 @@ fn delete_codex_png(path: &Path, folder: &Path) -> io::Result<Verdict> {
         return Ok(Verdict::Kept("it is not a plain file".to_string()));
     }
     let at = file.final_path()?;
-    if !at.parent().is_some_and(|parent| same_path(parent, folder)) {
+    if !at
+        .parent()
+        .is_some_and(|parent| same_resolved_path(parent, folder))
+    {
         return Ok(Verdict::Refused(format!(
             "it resolves to {}, outside {}",
             at.display(),
@@ -535,7 +543,7 @@ fn remove_codex_folder(dir: &Path, folder: &Path) -> io::Result<Verdict> {
         return Ok(Verdict::Kept("it is no longer a plain folder".to_string()));
     }
     let at = opened.final_path()?;
-    if !same_path(&at, folder) {
+    if !same_resolved_path(&at, folder) {
         return Ok(Verdict::Refused(format!("it resolves to {}", at.display())));
     }
     if opened.is_read_only() {
@@ -629,7 +637,7 @@ fn delete_output(
         ));
     }
     let at = file.final_path()?;
-    if !same_final_path(&at, resolved) {
+    if !same_resolved_path(&at, resolved) {
         return Ok(Verdict::Kept(format!(
             "it is no longer where it was published: it resolves to {}, not {}",
             at.display(),
@@ -825,7 +833,10 @@ pub fn sweep(
             Ok(file) => {
                 tallies.push(Some(Tally::default()));
                 for (name, home) in due_names(&file, now, days) {
-                    match groups.iter_mut().find(|(h, _)| same_path(h, &home)) {
+                    match groups
+                        .iter_mut()
+                        .find(|(h, _)| same_resolved_path(h, &home))
+                    {
                         Some((_, members)) => members.push((index, name)),
                         None => groups.push((home, vec![(index, name)])),
                     }
@@ -947,7 +958,7 @@ fn sweep_groups(
     for (home, members) in groups {
         let own;
         let child = match &default {
-            Ok((server, handshake)) if same_path(&handshake.codex_home, home) => {
+            Ok((server, handshake)) if same_resolved_path(&handshake.codex_home, home) => {
                 Ok((server, handshake))
             }
             _ => {
@@ -955,7 +966,7 @@ fn sweep_groups(
                 for_home.codex_home = Some(home.clone());
                 own = start_child(launcher, &for_home, &bin);
                 match &own {
-                    Ok((server, handshake)) if same_path(&handshake.codex_home, home) => {
+                    Ok((server, handshake)) if same_resolved_path(&handshake.codex_home, home) => {
                         Ok((server, handshake))
                     }
                     Ok((_, handshake)) => Err(format!(
@@ -1994,6 +2005,44 @@ mod tests {
             .iter()
             .any(|s| s.why.contains("not a well-formed UUID")));
         assert!(skipped.iter().any(|s| s.why.contains("another Codex home")));
+    }
+
+    #[test]
+    fn a_codex_home_that_differs_only_by_case_is_another_home() {
+        // Under a case-sensitive parent these are two homes; Codex reports its home with the
+        // on-disk case, so a real match is identical and a case-only difference means another one.
+        let world = World::new();
+        let case_twin = world.session("twin", THREAD, OLD, &[1]);
+        let upper = PathBuf::from(world.home.to_string_lossy().to_uppercase());
+        assert_ne!(upper, world.home);
+        world
+            .store
+            .update(|file| {
+                file.sessions.get_mut("twin").unwrap().codex_home = upper.clone();
+                Ok(())
+            })
+            .unwrap();
+        let deletes = Deletes::ok();
+        expire_with(&world, 7, &deletes, &|_| false);
+        assert!(deletes.asked().is_empty(), "{:?}", deletes.asked());
+        assert!(case_twin.outputs[0].path.exists());
+        assert!(world.images_dir(THREAD).is_dir());
+        let file = world.file();
+        assert!(file.get("twin").is_some());
+        assert!(file
+            .last_cleanup
+            .unwrap()
+            .skipped
+            .iter()
+            .any(|s| s.why.contains("another Codex home")));
+        assert!(same_resolved_path(
+            Path::new(r"\\?\C:\Homes\Codex\"),
+            Path::new(r"C:\Homes\Codex")
+        ));
+        assert!(!same_resolved_path(
+            Path::new(r"C:\Homes\Codex"),
+            Path::new(r"C:\Homes\CODEX")
+        ));
     }
 
     #[test]

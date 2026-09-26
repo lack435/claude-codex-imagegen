@@ -823,8 +823,9 @@ session can no longer be refined. Expiry is therefore per session [decided].
      holds it, skip the session until next time.
   2. Read the record again under the lease. One that a call refreshed since the listing, or that is gone, is
      left alone.
-  3. A record whose `codex_home` is not the child's `codexHome`, or whose `threadId` is not a well-formed UUID,
-     is skipped whole: nothing of it is deleted, not even its thread (`--cleanup` covers other homes).
+  3. A record whose `codex_home` is not the child's `codexHome` (compared exactly, apart from the `\\?\` prefix and
+     a trailing separator: both come from Codex's canonicalised home, so a home differing only by case is another
+     home [decided]), or whose `threadId` is not a well-formed UUID, is skipped whole: nothing of it is deleted, not even its thread (`--cleanup` covers other homes).
   4. `thread/delete {threadId}`. "no rollout found" (and "thread not found") counts as already gone: for a
      thread id Codex does not know, `thread/delete` answers `no rollout found for thread id <id>`, in the ambient
      home and in a fresh dedicated one [verified: live, `--cleanup` on fabricated records, 2026-09-25]. "active
@@ -832,7 +833,7 @@ session can no longer be refined. Expiry is therefore per session [decided].
   5. Delete Codex's per-thread image folder, `<codex_home>\generated_images\<threadId>\`: only `*.png` entries
      that are plain files, then the folder once it is empty. First, neither `<codex_home>\generated_images` nor
      the thread's folder may be a link (a reparse point), and the folder's canonical path must equal the
-     canonical Codex home joined with `generated_images\<threadId>` (compared case-insensitively, without the
+     canonical Codex home joined with `generated_images\<threadId>` (compared exactly, without the
      `\\?\` prefix). Otherwise the whole step is skipped, with the reason logged, and the rest of the session's
      cleanup goes on: the folder is left alone on purpose, like a changed output. A Codex home that is itself
      reached through a link passes, since both canonical paths resolve through it [verified: unit test, with

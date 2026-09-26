@@ -735,7 +735,7 @@ impl App {
             .expect("a returned child is ready")
             .handshake
             .codex_home;
-        if !cleanup::same_path(&record.codex_home, home) {
+        if !cleanup::same_resolved_path(&record.codex_home, home) {
             return mcp::failure_result(&errors::session_not_resumable(
                 &record.name,
                 format!(
