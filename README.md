@@ -21,11 +21,13 @@ tagged releases yet. [`docs/design.md`](docs/design.md) describes how it works a
 
 ## Install
 
-1. **Install the Codex CLI and sign it in**, if you have not already:
+1. **Install the Codex CLI and sign it in**, if you have not already. With winget:
 
    ```powershell
-   npm install -g @openai/codex
+   winget install OpenAI.Codex
    ```
+
+   or, if you have Node.js, `npm install -g @openai/codex`. Then, in a new terminal:
 
    ```powershell
    codex login
@@ -54,7 +56,9 @@ tagged releases yet. [`docs/design.md`](docs/design.md) describes how it works a
    Options go after the exe (see [Options](#options)). Start a new Claude Code session to pick it up.
 
 **Updating.** Close the Claude Code sessions that use it (each one holds the exe open), then copy the new
-exe over the old one. A new Codex login needs no restart; changed options do.
+exe over the old one. Changed options also need a restart of the MCP server, and so does switching the
+Codex login to another account: a running Codex keeps the login it started with. After a failed sign-in
+check, the next call starts a fresh Codex and picks up the new login by itself.
 
 ## Check that it works in Claude Code
 
@@ -68,8 +72,10 @@ Run these in a fresh Claude Code session. The first two are free; the rest spend
       and names the file, `generated-images\<session>-v1.png` in the project.
 - [ ] **Refine** (1 image). Ask *"Make it daytime, keep everything else."* Claude continues the same
       session and gets `<session>-v2.png`.
-- [ ] **Cancel** (optional, 1 image cut short). Ask for another image and press Esc while it is
-      generating. No file appears, and a status check afterwards shows `running turns: none`.
+- [ ] **Cancel** (optional, 1 image cut short). Ask for another image and press Esc while it is still
+      generating in the foreground, before any image comes back. No file appears, and a status check a
+      few seconds later shows `running turns: none`. (A call Claude Code has moved to the background is
+      stopped with its task controls instead.)
 
 Where the image appears depends on the client. The terminal shows a progress line and the preview in the
 tool result. The desktop app shows no progress line and puts the preview in the expanded tool row, so the
@@ -89,8 +95,10 @@ The prompt and the feedback reach Codex's image tool verbatim. A generation take
 moves a call that runs past 120 s to the background, and the server stops a call after
 `--timeout-seconds` (300 by default).
 
-When a call fails, the result names a code and the fix, and tells Claude to pass it on and stop. It never
-suggests making an image some other way.
+When a call fails, the result names a code and the fix. A problem Claude can correct itself, such as a bad
+argument or a busy session, gets a short correction. Anything else, such as a missing sign-in, a quota
+limit or a Codex failure, tells Claude to pass the fix on to you and stop. Neither suggests making an image
+some other way.
 
 ## Options
 
@@ -100,14 +108,14 @@ Options are arguments on the MCP registration, after the exe. There is no config
 | --- | --- | --- |
 | `--codex-bin <path>` | PATH, then `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` | The Codex CLI to run |
 | `--codex-home <dir>` | your own Codex home | Run Codex with a dedicated home (see below) |
-| `--output-dir <dir>` | `generated-images\` in the project | Where images are saved |
+| `--output-dir <dir>` | `generated-images\` in the project | Where new sessions save their images |
 | `--timeout-seconds <n>` | 300 | Limit for one generate or refine, 60 to 86400 |
 | `--max-concurrent <n>` | 4 | Image turns running at once, across sessions |
 | `--session-ttl-days <n>` | 7 | Expire sessions idle this long; 0 disables expiry |
 | `--model <id>`, `--effort <level>` | `gpt-6-astra`, `low` | The Codex agent that relays the prompt |
 | `--state-dir <dir>` | `%USERPROFILE%\.codex-imagegen\<project>-<hash>` | Where session records are kept |
 
-`codex-imagegen.exe --help` lists them all, with `--doctor` and `--cleanup`. For example:
+`C:\tools\codex-imagegen.exe --help` lists them all, with `--doctor` and `--cleanup`. For example:
 
 ```powershell
 claude mcp add --scope user codex-imagegen -- C:\tools\codex-imagegen.exe --timeout-seconds 600
@@ -115,9 +123,9 @@ claude mcp add --scope user codex-imagegen -- C:\tools\codex-imagegen.exe --time
 
 ### A dedicated Codex home
 
-By default the server runs Codex with your own Codex home (`%USERPROFILE%\.codex`). Codex then loads your
-`AGENTS.md` into every image turn; the server switches off your MCP servers, plugins, skills and the other
-tools, but it cannot stop that. `--codex-home` gives Codex a home of its own instead. Set it up once: create
+By default the server runs Codex with your own Codex home (`%USERPROFILE%\.codex`). The server switches
+off your MCP servers, plugins, skills, the shell and web search there, but Codex still loads your
+`AGENTS.md` into every image turn, and nothing short of another home stops that. `--codex-home` gives Codex a home of its own instead. Set it up once: create
 the folder, then sign it in (PowerShell):
 
 ```powershell
@@ -134,9 +142,12 @@ path with a backslash: `"C:\x\"` swallows the closing quote.
 
 ## Output files
 
-Each image is saved as a full-resolution PNG, `<session>-v<N>.png`, in `generated-images\` under the
-project Claude Code has open, unless a call's `output_dir` or the server's `--output-dir` names another
-folder. Nothing there is ever overwritten: a taken name moves on to the next version number.
+Each image is saved as a full-resolution PNG, `<session>-v<N>.png`. A new session saves into the call's
+`output_dir`, else the server's `--output-dir`, else `generated-images\` under the project Claude Code
+has open (if Claude Code does not name the project, the `images` folder in the server's state directory).
+A refine saves into its session's folder unless the call names another, so changing `--output-dir` later
+does not move existing sessions. Nothing is ever overwritten: a taken name moves on to the next version
+number.
 
 That folder is scratch space, not a place to keep work: its files expire with their session after
 `--session-ttl-days` idle (7 by default). Move or copy the images worth keeping into the project proper,
@@ -154,9 +165,12 @@ from a terminal:
 C:\tools\codex-imagegen.exe --cleanup
 ```
 
-`--older-than-days 0` removes every session not in use. Cleanup deletes only files it published itself
-and still finds unchanged, and it keeps read-only files. Sessions in use by a running server are skipped
-until next time.
+This covers every project under the state base (`%USERPROFILE%\.codex-imagegen`, or
+`%CODEX_IMAGEGEN_HOME%`), with the default age of 7 days, not the options the MCP registration uses: pass
+`--older-than-days <n>` for another age (0 removes every session not in use), and `--state-dir` if you
+registered one outside the state base. A published file is deleted only while it is still the file that
+was published, unchanged; Codex's copies are deleted only from the session's own folder in the Codex home;
+read-only files are kept. Sessions in use by a running server are skipped until next time.
 
 ## Troubleshooting
 
@@ -171,6 +185,10 @@ until next time.
   with `/mcp` in the terminal.
 
 ## Development
+
+Building needs Rust through [rustup](https://rustup.rs) with the MSVC toolchain (Rust 1.87 or later) and
+the Visual Studio C++ build tools with a Windows SDK, which provide the linker. `rust-toolchain.toml`
+selects the stable toolchain, the target, rustfmt and clippy.
 
 ```powershell
 .\build.ps1
