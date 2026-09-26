@@ -186,6 +186,23 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     plain(a) == plain(b)
 }
 
+/// Whether two final paths, both read with `GetFinalPathNameByHandleW`, are the same file's path:
+/// exactly, apart from the `\\?\` prefix. Both carry the on-disk case, so a real match is
+/// byte-identical, and a case-insensitive compare would let a junction redirect a delete to a
+/// sibling whose name differs only by case (a case-sensitive folder) or by a Unicode case fold NTFS
+/// does not apply, such as U+212A KELVIN SIGN for `k` [verified: scratch test, 2026-09-26]. The cost:
+/// a folder renamed by case alone keeps its file, which fails closed.
+fn same_final_path(a: &Path, b: &Path) -> bool {
+    fn plain(path: &Path) -> String {
+        let text = path.to_string_lossy().into_owned();
+        match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+        }
+    }
+    plain(a) == plain(b)
+}
+
 fn is_plain(meta: &Metadata) -> bool {
     meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
@@ -612,7 +629,7 @@ fn delete_output(
         ));
     }
     let at = file.final_path()?;
-    if !same_path(&at, resolved) {
+    if !same_final_path(&at, resolved) {
         return Ok(Verdict::Kept(format!(
             "it is no longer where it was published: it resolves to {}, not {}",
             at.display(),
@@ -1550,8 +1567,23 @@ mod tests {
             delete_output(&path, 6, fingerprint, &elsewhere).unwrap()
         ));
         assert_eq!(fs::read(&path).unwrap(), b"foobar");
-        // Compared as Windows compares paths: another case, without the `\\?\` prefix.
-        let plain = resolved.to_string_lossy()[4..].to_uppercase();
+        // Compared exactly, apart from the `\\?\` prefix: another case is another path, so the
+        // file is kept...
+        let upper = resolved.to_string_lossy().to_uppercase();
+        assert!(kept(
+            delete_output(&path, 6, fingerprint, Path::new(&upper)).unwrap()
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"foobar");
+        // ...and a Unicode case fold NTFS does not apply (KELVIN SIGN for `k`) is not a match
+        // either, although Rust's to_lowercase would make it one.
+        let folded = resolved.to_string_lossy().replacen('k', "\u{212a}", 1);
+        if folded != resolved.to_string_lossy() {
+            assert!(kept(
+                delete_output(&path, 6, fingerprint, Path::new(&folded)).unwrap()
+            ));
+        }
+        // ...while the same path without the prefix matches.
+        let plain = resolved.to_string_lossy()[4..].to_string();
         assert_eq!(
             delete_output(&path, 6, fingerprint, Path::new(&plain)).unwrap(),
             Verdict::Deleted(6)

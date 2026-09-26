@@ -849,7 +849,9 @@ session can no longer be refined. Expiry is therefore per session [decided].
   6. Delete each file in `outputs` that is still, at its exact path and under the name it was published with
      (`<name>-v<version>.png`), a plain file with the recorded size and `fnv1a64`, both recomputed through the
      handle that deletes it, whose final path through that handle is its recorded `resolved_path` (compared
-     case-insensitively, without the `\\?\` prefix), and that is not read-only. A file that was edited,
+     exactly, apart from the `\\?\` prefix: both come from `GetFinalPathNameByHandleW` with the on-disk case, and a
+     case-insensitive compare would let a junction reach a sibling whose name differs only by case or by a Unicode
+     case fold NTFS does not apply [verified: unit test]), and that is not read-only. A file that was edited,
      replaced (even by one of the same size) or renamed is left alone, and so is one now reached somewhere
      else: an output folder replaced by a junction to an archive holding an identical copy reaches that copy,
      same name, size and content, and its final path gives it away [verified: unit test, with a real
