@@ -253,7 +253,15 @@ mod tests {
         assert_eq!(opened.size(), 6);
         assert_eq!(opened.fingerprint().unwrap(), (0x8594_4171_f739_67e8, 6));
         let at = opened.final_path().unwrap();
-        assert!(crate::cleanup::same_path(&at, &path), "{}", at.display());
+        // Against the canonical path, not the one built from %TEMP%: that can hold an 8.3 short name
+        // (a CI runner's C:\Users\RUNNER~1), while the final path is always the long one.
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert!(
+            crate::cleanup::same_resolved_path(&at, &canonical),
+            "{} vs {}",
+            at.display(),
+            canonical.display()
+        );
         // While it is open, no one else can write or delete it.
         assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
         assert!(fs::remove_file(&path).is_err());
