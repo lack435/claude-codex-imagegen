@@ -8,9 +8,9 @@ An MCP server that lets Claude Code generate images through your local Codex CLI
 
 Windows only. It ships as a single self-contained executable.
 
-**Status: pre-release.** Generating, refining, resuming a session after a restart, cancelling, a dedicated
-Codex home and cleanup have all been checked against the real Codex CLI (0.156 and 0.157). There are no
-tagged releases yet. [`docs/design.md`](docs/design.md) describes how it works and why.
+**Status: 0.1.0**, the first release. Generating, refining, resuming a session after a restart,
+cancelling, a dedicated Codex home and cleanup have all been checked against the real Codex CLI (0.156 and
+0.157). [`docs/design.md`](docs/design.md) describes how it works and why.
 
 ## Requirements
 
