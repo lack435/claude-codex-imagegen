@@ -228,6 +228,12 @@ No arguments and no quota. It reports:
 
 Live reads are bounded to about 10 s each. On timeout, the last value is shown with its age.
 
+If the child exits during a live read, or is gone by the time the report is built, it is not running, whatever
+preflight found. The report then shows the app-server not running and image generation unavailable
+(`APP_SERVER_FAILED`, with the detail), the child is discarded so the next call starts a fresh one, and
+`--doctor` exits 1. A read that fails while the child is still alive (a timeout or an error reply) only makes
+the usage stale.
+
 ### Success result (generate and refine)
 
 ```
@@ -442,6 +448,13 @@ running on it.
 
 **Reading.** One reader thread reads child stdout through `BufReader`, with a 64 MiB cap on line length.
 
+**Writing.** One writer thread owns the child's stdin and writes queued lines in order [decided]. Requests,
+notifications and the refusals of server requests only queue a line. A child that stops reading fills the pipe,
+and the next write then blocks until the child dies. Only the writer thread waits on it: each request still ends
+at its deadline or cancel, the reader keeps routing, and shutdown still reaches the job after its grace. The
+job's kill then fails the stuck write ("the pipe has been ended"), which ends the writer thread [verified: unit
+test against `PING.EXE`, which never reads its stdin].
+
 **Parsing.** Two stages:
 
 1. A borrowed envelope, in which `id`, `method`, `params`, `result` and `error` are each a `&RawValue`.
@@ -483,9 +496,10 @@ threads a server that is not in the disabled map, the turn is interrupted and th
 - **Our stdin closing.** When our stdin closes and we are given time to exit:
   1. interrupt running turns;
   2. let copies already in progress finish;
-  3. close the child's stdin (an idle child exits in 0.05–0.07 s [verified]);
+  3. end the child's input: the writer thread writes what is still queued, then closes the pipe (an idle child
+     exits in 0.05–0.07 s [verified]);
   4. wait up to 5 s in total;
-  5. drop the job.
+  5. drop the job. This step never waits on the pipe, so a child that stopped reading is killed on time.
 
   This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
   straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:

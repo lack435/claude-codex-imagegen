@@ -4,13 +4,16 @@
 //! handling"). This module owns that conversation and nothing about images:
 //!
 //! - spawning the child suspended inside a kill-on-close job, so its whole tree dies with us;
+//! - one writer thread that owns the child's stdin and writes queued lines in order. Callers only
+//!   queue, so a child that stops reading its stdin stalls that thread alone and never a request,
+//!   the reader, or shutdown;
 //! - one reader thread that routes every line: replies to the request waiting for them (they can
 //!   arrive out of order), notifications to an installed handler, and server-to-client requests
 //!   to an immediate refusal, so a turn can never hang waiting for an approval nobody will give;
 //! - a pending-reply table with per-request deadlines and cancellation, where a reply that
 //!   arrives after its request gave up is dropped rather than handed to the next caller;
 //! - a stderr drain that keeps a bounded tail, so a failure can say what Codex printed;
-//! - shutdown: close the child's stdin, give it a grace period, then terminate the job.
+//! - shutdown: end the child's input, give it a grace period, then terminate the job.
 //!
 //! What the calls mean (initialize, preflight, threads) lives in `codex.rs`.
 
@@ -21,7 +24,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -29,7 +32,7 @@ use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
 use crate::cancel::RequestCancel;
-use crate::jsonrpc::{self, Envelope, Kind, LineReader, ReadLine, Writer};
+use crate::jsonrpc::{self, Envelope, Kind, LineReader, ReadLine};
 use crate::winjob::{self, JobObject};
 
 /// How much of the child's stderr is kept for failure details. Codex logs little on stderr
@@ -114,10 +117,9 @@ pub struct AppServer {
 }
 
 struct Shared {
-    /// The child's stdin, as the shared framing's writer type.
-    writer: Writer,
-    /// The same object, concretely, so shutdown can close it.
-    stdin: Arc<Mutex<Closable>>,
+    /// The writer thread's queue: whole lines, serialised and newline-terminated. Taken by
+    /// shutdown, which ends the child's input once the queued lines are written.
+    outbox: Mutex<Option<Sender<Vec<u8>>>>,
     table: Mutex<Table>,
     handler: Mutex<Option<Arc<NotificationHandler>>>,
     stderr: Arc<StderrTail>,
@@ -137,7 +139,7 @@ struct Table {
 
 impl AppServer {
     /// Spawn the child inside a new kill-on-close job, with piped stdio, and start the threads
-    /// that read its stdout and drain its stderr.
+    /// that write its stdin, read its stdout and drain its stderr.
     pub fn spawn(spec: &SpawnSpec) -> io::Result<Self> {
         let mut cmd = command(spec);
         let (job, mut child) = winjob::spawn_in_new_job(&mut cmd)?;
@@ -156,7 +158,7 @@ impl AppServer {
                 .name("codex-stderr".to_string())
                 .spawn(move || drain_stderr(stderr, &tail))?;
         }
-        let shared = Shared::new(Box::new(stdin), tail, Some(child));
+        let shared = Shared::new(start_writer(Box::new(stdin))?, tail, Some(child));
         start_reader(
             &shared,
             BufReader::new(stdout),
@@ -179,7 +181,8 @@ impl AppServer {
     ) -> Self {
         let tail = Arc::new(StderrTail::default());
         tail.finish();
-        let shared = Shared::new(Box::new(writer), tail, None);
+        let outbox = start_writer(Box::new(writer)).expect("start the writer thread");
+        let shared = Shared::new(outbox, tail, None);
         start_reader(&shared, reader, max_line_bytes).expect("start the reader thread");
         Self {
             shared,
@@ -211,6 +214,8 @@ impl AppServer {
     }
 
     /// Send a request and wait for its reply, until `deadline` or until `cancel` is cancelled.
+    /// Sending only queues the line, so the deadline and the cancel bound the whole call, even
+    /// when the child has stopped reading its stdin.
     ///
     /// On a deadline or a cancellation the pending entry is removed before returning, so a reply
     /// that arrives later is dropped by the reader instead of lingering in the table.
@@ -233,13 +238,13 @@ impl AppServer {
                     detail: detail.clone(),
                 });
             }
-            // Registered before the write, so even an instant reply finds its entry.
+            // Registered before the line is queued, so even an instant reply finds its entry.
             table.pending.insert(key.clone(), tx);
         }
 
         // No "jsonrpc" member: Codex documents that it neither sends nor expects one.
         let message = json!({"id": id, "method": method, "params": params});
-        if let Err(e) = jsonrpc::try_send(&self.shared.writer, &message) {
+        if let Err(e) = self.shared.send(&message) {
             let mut table = lock(&self.shared.table);
             table.pending.remove(&key);
             return Err(match &table.exited {
@@ -282,25 +287,34 @@ impl AppServer {
         }
     }
 
-    /// Send a notification. `params` is omitted when `None`.
+    /// Send a notification. `params` is omitted when `None`. Only queues the line, so it never
+    /// blocks.
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<(), RpcError> {
         let message = match params {
             Some(params) => json!({"method": method, "params": params}),
             None => json!({"method": method}),
         };
-        jsonrpc::try_send(&self.shared.writer, &message).map_err(|e| {
-            match lock(&self.shared.table).exited.clone() {
+        // Checked first, as a request does: a queued line fails only later, on the writer thread.
+        if let Some(detail) = lock(&self.shared.table).exited.clone() {
+            return Err(RpcError::ChildExited { detail });
+        }
+        self.shared
+            .send(&message)
+            .map_err(|e| match lock(&self.shared.table).exited.clone() {
                 Some(detail) => RpcError::ChildExited { detail },
                 None => RpcError::Io(format!("could not send {method}: {e}")),
-            }
-        })
+            })
     }
 
-    /// Stop the child: close its stdin (an idle app-server exits within about 0.07 s of that
-    /// [verified]), wait up to `grace` for it to exit, then terminate its job, which takes every
-    /// descendant with it. Safe to call more than once, and from any thread.
+    /// Stop the child: end its input (the writer thread writes what is still queued, then closes
+    /// the pipe; an idle app-server exits within about 0.07 s of that [verified]), wait up to
+    /// `grace` for it to exit, then terminate its job, which takes every descendant with it.
+    ///
+    /// Never waits on the pipe. If a write is stuck because the child stopped reading, the child
+    /// cannot see its input end and the grace runs out; the job kill then fails the stuck write,
+    /// which ends the writer thread. Safe to call more than once, and from any thread.
     pub fn shutdown(&self, grace: Duration) {
-        lock(&self.shared.stdin).close();
+        lock(&self.shared.outbox).take();
         let Some(job) = &self.job else {
             return;
         };
@@ -318,8 +332,8 @@ impl AppServer {
             }
             if Instant::now() >= deadline {
                 eprintln!(
-                    "codex-imagegen: the Codex app-server did not exit within {} ms of its stdin \
-                     closing; terminating it",
+                    "codex-imagegen: the Codex app-server did not exit within {} ms of its input \
+                     ending; terminating it",
                     grace.as_millis()
                 );
                 job.terminate();
@@ -352,29 +366,36 @@ pub fn command(spec: &SpawnSpec) -> Command {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        // Closing stdin first gives the child a chance to exit on its own; dropping the job right
-        // after kills whatever is left either way.
-        lock(&self.shared.stdin).close();
+        // Ending the child's input first gives it a chance to exit on its own; dropping the job
+        // right after kills whatever is left either way. Neither waits.
+        lock(&self.shared.outbox).take();
     }
 }
 
 impl Shared {
-    fn new(
-        writer: Box<dyn Write + Send>,
-        stderr: Arc<StderrTail>,
-        child: Option<Child>,
-    ) -> Arc<Self> {
-        let stdin = Arc::new(Mutex::new(Closable(Some(writer))));
-        let writer: Writer = stdin.clone();
+    fn new(outbox: Sender<Vec<u8>>, stderr: Arc<StderrTail>, child: Option<Child>) -> Arc<Self> {
         Arc::new(Self {
-            writer,
-            stdin,
+            outbox: Mutex::new(Some(outbox)),
             table: Mutex::new(Table::default()),
             handler: Mutex::new(None),
             stderr,
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
         })
+    }
+
+    /// Queue one message for the writer thread. Never blocks: serialised before the lock, and the
+    /// queue is unbounded. `Err` once the child's input has ended, by shutdown or a failed write.
+    fn send(&self, message: &Value) -> io::Result<()> {
+        let mut line = serde_json::to_vec(message).map_err(io::Error::other)?;
+        line.push(b'\n');
+        match lock(&self.outbox).as_ref().map(|queue| queue.send(line)) {
+            Some(Ok(())) => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the app-server's stdin is closed",
+            )),
+        }
     }
 
     /// Route one line from the child.
@@ -446,7 +467,7 @@ impl Shared {
             "id": serde_json::from_str::<Value>(id.get()).unwrap_or(Value::Null),
             "error": {"code": -32601, "message": DECLINED_MESSAGE},
         });
-        if let Err(e) = jsonrpc::try_send(&self.writer, &answer) {
+        if let Err(e) = self.send(&answer) {
             eprintln!("codex-imagegen: could not decline the app-server's request: {e}");
         }
     }
@@ -455,12 +476,13 @@ impl Shared {
     /// best account of why that is available.
     fn mark_exited(&self) {
         self.stderr.wait_finished(STDERR_SETTLE);
-        let status = match lock(&self.child).as_mut() {
-            None => "it closed its output".to_string(),
-            Some(child) => match wait_briefly(child, STDERR_SETTLE) {
+        let status = if lock(&self.child).is_none() {
+            "it closed its output".to_string()
+        } else {
+            match self.exit_code_within(STDERR_SETTLE) {
                 Some(code) => format!("exit code {code}"),
                 None => "it closed its output but is still running".to_string(),
-            },
+            }
         };
         let tail = self.stderr.tail(3000);
         let detail = if tail.is_empty() {
@@ -477,6 +499,57 @@ impl Shared {
             let _ = tx.send(Err(RpcError::ChildExited {
                 detail: detail.clone(),
             }));
+        }
+    }
+
+    /// Poll the child for its exit code for up to `wait`. The lock is taken per poll rather than
+    /// across the sleeps, so `shutdown` and `is_alive` never wait behind this.
+    fn exit_code_within(&self, wait: Duration) -> Option<String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let polled = lock(&self.child).as_mut().map(Child::try_wait);
+            match polled {
+                Some(Ok(Some(status))) => {
+                    return Some(
+                        status
+                            .code()
+                            .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
+                    )
+                }
+                Some(Ok(None)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Start the thread that owns the child's stdin, and return its queue.
+///
+/// A thread of its own because a write to a pipe blocks for as long as the child is not reading:
+/// indefinitely, for a child that has stopped. Only this thread ever waits on the pipe. Callers
+/// queue and return, so a request still ends at its deadline or cancel, and shutdown still reaches
+/// the job.
+fn start_writer(stdin: Box<dyn Write + Send>) -> io::Result<Sender<Vec<u8>>> {
+    let (queue, lines) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("codex-stdin".to_string())
+        .spawn(move || write_loop(stdin, lines))?;
+    Ok(queue)
+}
+
+/// The writer thread: write each queued line in order until the queue's sender is dropped, then
+/// drop `stdin`, which closes the pipe so the child reads end-of-file.
+///
+/// A failed write ends the thread. The pipe breaks when the child exits, and the reader reports
+/// that exit. A write stuck when the job kills the child fails the same way. From then on the
+/// queue has no receiver, so every later send fails at once.
+fn write_loop(mut stdin: Box<dyn Write + Send>, lines: Receiver<Vec<u8>>) {
+    for line in lines {
+        if let Err(e) = stdin.write_all(&line).and_then(|()| stdin.flush()) {
+            eprintln!("codex-imagegen: writing to the app-server failed: {e}");
+            return;
         }
     }
 }
@@ -526,54 +599,6 @@ fn remote_error(error: &RawValue) -> RpcError {
             .and_then(Value::as_str)
             .map(|m| jsonrpc::clamp(m, 2000))
             .unwrap_or_else(|| jsonrpc::clamp(error.get(), 2000)),
-    }
-}
-
-/// Poll a child for its exit code for up to `wait`.
-fn wait_briefly(child: &mut Child, wait: Duration) -> Option<String> {
-    let deadline = Instant::now() + wait;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Some(
-                    status
-                        .code()
-                        .map_or_else(|| "unknown".to_string(), |c| c.to_string()),
-                )
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => return None,
-        }
-    }
-}
-
-/// The child's stdin behind a switch, so shutdown can close it while other threads still hold
-/// the writer: a write after closing fails as a broken pipe would.
-struct Closable(Option<Box<dyn Write + Send>>);
-
-impl Closable {
-    fn close(&mut self) {
-        // Dropping the pipe handle is what closes it; the child then reads end-of-file.
-        self.0 = None;
-    }
-}
-
-impl Write for Closable {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match &mut self.0 {
-            Some(w) => w.write(buf),
-            None => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the app-server's stdin is closed",
-            )),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match &mut self.0 {
-            Some(w) => w.flush(),
-            None => Ok(()),
-        }
     }
 }
 
@@ -1202,19 +1227,200 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_child_that_ignores_its_stdin_closing_is_terminated_after_the_grace() {
-        // PING never reads stdin, so closing it changes nothing: only the job can stop it before
-        // its minute is up.
+    /// A child that runs for a minute and never reads its stdin.
+    fn ping_spec() -> SpawnSpec {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let spec = SpawnSpec {
+        SpawnSpec {
             program: PathBuf::from(format!(r"{root}\System32\PING.EXE")),
             args: vec!["-n".into(), "60".into(), "127.0.0.1".into()],
             env_remove: vec![],
             env_set: vec![],
             cwd: std::env::temp_dir(),
-        };
-        let server = AppServer::spawn(&spec).expect("spawn ping");
+        }
+    }
+
+    /// Run `f` on its own thread and wait at most `limit` for it, so a call that blocks forever
+    /// fails the test instead of hanging the run.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{what} did not return within {limit:?}"))
+    }
+
+    /// Stands in for the stdin of a child that has stopped reading it: every write blocks, as a
+    /// write to a full pipe does, until the test releases it.
+    #[derive(Clone, Default)]
+    struct StuckPipe(Arc<(Mutex<bool>, Condvar)>);
+
+    impl StuckPipe {
+        fn release(&self) {
+            *lock(&self.0 .0) = true;
+            self.0 .1.notify_all();
+        }
+    }
+
+    impl Write for StuckPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            let (released, wake) = &*self.0;
+            drop(
+                wake.wait_while(lock(released), |released| !*released)
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "released"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Releases a [`StuckPipe`] however the test ends, so no thread is left parked on it.
+    struct ReleaseOnDrop(StuckPipe);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[test]
+    fn a_blocked_write_still_ends_at_the_deadline_or_the_cancel_and_never_holds_up_shutdown() {
+        let pipe = StuckPipe::default();
+        // The child's output stays open, so only the deadline or the cancel can end a request.
+        let (_output, from_server) = mpsc::channel::<Vec<u8>>();
+        let server = Arc::new(AppServer::from_transport(
+            BufReader::new(fake::ChannelReader::new(from_server)),
+            pipe.clone(),
+            jsonrpc::APP_SERVER_MAX_LINE_BYTES,
+        ));
+        let _release = ReleaseOnDrop(pipe);
+
+        let s = Arc::clone(&server);
+        let started = Instant::now();
+        let err = within(
+            Duration::from_secs(5),
+            "a request behind a blocked write",
+            move || {
+                s.request(
+                    "first",
+                    json!({}),
+                    Instant::now() + Duration::from_millis(150),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            err,
+            Err(RpcError::Timeout {
+                method: "first".into()
+            })
+        );
+        assert!(started.elapsed() >= Duration::from_millis(150));
+
+        let cancel = Arc::new(RequestCancel::new());
+        {
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                cancel.cancel();
+            });
+        }
+        let s = Arc::clone(&server);
+        let started = Instant::now();
+        let err = within(
+            Duration::from_secs(5),
+            "a cancelled request behind a blocked write",
+            move || s.request("second", json!({}), soon(), Some(&cancel)),
+        );
+        assert_eq!(err, Err(RpcError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let s = Arc::clone(&server);
+        within(
+            Duration::from_secs(2),
+            "a notification behind a blocked write",
+            move || s.notify("initialized", None),
+        )
+        .expect("a notification is only queued");
+        assert!(lock(&server.shared.table).pending.is_empty());
+
+        let s = Arc::clone(&server);
+        within(
+            Duration::from_secs(2),
+            "shutdown with a blocked write",
+            move || s.shutdown(Duration::from_millis(100)),
+        );
+        let s = Arc::clone(&server);
+        let err = within(
+            Duration::from_secs(2),
+            "a request after shutdown",
+            move || s.request("third", json!({}), soon(), None),
+        );
+        assert!(
+            matches!(err, Err(RpcError::ChildExited { .. } | RpcError::Io(_))),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_reaches_the_job_while_a_write_to_the_child_is_blocked() {
+        // PING never reads its stdin, so a write larger than the pipe's buffer blocks until the
+        // process dies.
+        let server = Arc::new(AppServer::spawn(&ping_spec()).expect("spawn ping"));
+        assert!(server.is_alive());
+        let pad = "x".repeat(4 * 1024 * 1024);
+        let s = Arc::clone(&server);
+        let err = within(
+            Duration::from_secs(5),
+            "a request whose write blocks",
+            move || {
+                s.request(
+                    "fill",
+                    json!({"pad": pad}),
+                    Instant::now() + Duration::from_millis(200),
+                    None,
+                )
+            },
+        );
+        assert_eq!(
+            err,
+            Err(RpcError::Timeout {
+                method: "fill".into()
+            })
+        );
+
+        let s = Arc::clone(&server);
+        let started = Instant::now();
+        within(
+            Duration::from_secs(5),
+            "shutdown with a blocked write",
+            move || s.shutdown(Duration::from_millis(200)),
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200),
+            "no grace given: {took:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.is_alive() {
+            assert!(Instant::now() < deadline, "the job was not terminated");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_child_that_ignores_its_stdin_closing_is_terminated_after_the_grace() {
+        // PING never reads stdin, so closing it changes nothing: only the job can stop it before
+        // its minute is up.
+        let server = AppServer::spawn(&ping_spec()).expect("spawn ping");
         assert!(server.is_alive());
         let started = Instant::now();
         server.shutdown(Duration::from_millis(200));

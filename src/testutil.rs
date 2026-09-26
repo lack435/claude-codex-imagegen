@@ -78,7 +78,7 @@ impl Drop for TempDir {
     }
 }
 
-/// Collects what a code path writes, standing in for stdout or a child's stdin.
+/// Collects what a code path writes, standing in for our stdout.
 #[derive(Clone, Default)]
 pub struct Recorder(Arc<Mutex<Vec<u8>>>);
 

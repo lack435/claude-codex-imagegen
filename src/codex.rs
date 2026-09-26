@@ -869,6 +869,9 @@ pub(crate) mod testing {
         /// The `config/read` config object, or the error it answers with.
         pub config: Result<Value, Value>,
         pub rate_limits: Result<Value, Value>,
+        /// A method the fake dies on: it closes its output instead of answering, as a child
+        /// that exits while handling the request does.
+        pub exits_on: Option<&'static str>,
         /// Every message the client sent, in order.
         pub seen: Arc<Mutex<Vec<Value>>>,
     }
@@ -928,6 +931,7 @@ pub(crate) mod testing {
                         {"usedPercent": 44, "windowDurationMins": 10080, "resetsAt": 1790710629},
                         "secondary": null}}
                 })),
+                exits_on: None,
                 seen: Arc::default(),
             }
         }
@@ -970,6 +974,12 @@ pub(crate) mod testing {
         pub fn connect(self) -> AppServer {
             fake::connect(move |message, out| {
                 self.seen.lock().unwrap().push(message.clone());
+                if self
+                    .exits_on
+                    .is_some_and(|method| message["method"] == method)
+                {
+                    return Flow::Exit;
+                }
                 if let Some(reply) = self.answer(message) {
                     out.send(reply);
                 }

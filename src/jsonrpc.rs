@@ -2,8 +2,10 @@
 //!
 //! codex-imagegen is a JSON-RPC *server* to Claude Code (MCP over our stdio) and a JSON-RPC
 //! *client* to `codex app-server` (over the child's stdio). Both are one JSON message per line,
-//! so the pieces that are easy to get subtly wrong live here once: the locked writer, the capped
-//! line reader, the borrowed envelope that classifies a message, request keys and log clamping.
+//! so the pieces that are easy to get subtly wrong live here once: the capped line reader, the
+//! borrowed envelope that classifies a message, request keys and log clamping, plus the locked
+//! writer the MCP side uses. The app-server side writes through its own writer thread instead
+//! (`appserver.rs`), because a child that stops reading must never block a caller.
 //!
 //! Hand-rolled rather than pulled from a crate: the surface is small, and keeping the dependency
 //! list to serde is what lets this ship as one small executable.
@@ -16,9 +18,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
 
-/// Where outgoing messages go. A trait object rather than a concrete stream so a test can read
-/// back exactly what a code path wrote; in production it is our stdout (MCP side) or the child's
-/// stdin (app-server side).
+/// Where outgoing MCP messages go. A trait object rather than a concrete stream so a test can
+/// read back exactly what a code path wrote; in production it is our stdout.
 ///
 /// The mutex is what keeps two threads' messages from interleaving mid-line: every write of a
 /// whole line happens under it.
@@ -35,12 +36,10 @@ pub const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const APP_SERVER_MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Serialise `message`, append the newline and write it as one line, flushing under the lock.
-/// Returns the I/O error rather than logging it, for a caller that must act on it (the app-server
-/// client turns a failed write into a failed request).
 ///
 /// Serialised before the lock is taken, so a large message never holds other writers up for
 /// longer than the write itself.
-pub fn try_send(writer: &Writer, message: &Value) -> io::Result<()> {
+fn try_send(writer: &Writer, message: &Value) -> io::Result<()> {
     let mut line = serde_json::to_vec(message).map_err(io::Error::other)?;
     line.push(b'\n');
     let mut out = writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -48,8 +47,8 @@ pub fn try_send(writer: &Writer, message: &Value) -> io::Result<()> {
     out.flush()
 }
 
-/// [`try_send`] for a caller with nothing better to do with a failure than report it. stdout is
-/// protocol traffic only, so the report goes to stderr.
+/// Write one message, reporting a failure rather than returning it: the MCP side has nothing
+/// better to do with one. stdout is protocol traffic only, so the report goes to stderr.
 pub fn send(writer: &Writer, message: &Value) {
     if let Err(e) = try_send(writer, message) {
         eprintln!("codex-imagegen: could not write a message: {e}");

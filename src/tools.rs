@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
-use crate::appserver::{AppServer, NotificationHandler};
+use crate::appserver::{AppServer, NotificationHandler, RpcError};
 use crate::cancel::RequestCancel;
 use crate::codex::{self, Budget, Facts, Handshake, Rpc, Usage};
 use crate::config::Config;
@@ -362,15 +362,21 @@ impl App {
         progress: Option<&Progress>,
     ) -> (String, bool) {
         let started = self.ensure_child(cancel, progress, None);
+        // Read before the report is built, because a child lost during the read is not running,
+        // whatever its preflight found.
+        let (usage, lost) = match &started {
+            Ok(child) => self.live_usage(child, cancel),
+            Err(_) => (self.cached_usage("Codex is not running"), None),
+        };
         let (child, bin, handshake, facts, failure) = match &started {
             Ok(child) => {
                 let ready = child.ready.get().expect("a returned child is ready");
                 (
-                    Some(child),
+                    lost.is_none().then_some(child),
                     Some(&child.bin),
                     Some(&ready.handshake),
                     &ready.facts,
-                    None,
+                    lost.as_ref(),
                 )
             }
             Err(start) => (
@@ -399,6 +405,9 @@ impl App {
                 Some(pid) => format!("app-server: running (pid {pid})"),
                 None => "app-server: running".to_string(),
             },
+            None if lost.is_some() => "app-server: not running (it stopped after passing \
+                                       preflight; the next call starts a fresh one)"
+                .to_string(),
             None => "app-server: not running".to_string(),
         });
         if let Some(handshake) = handshake {
@@ -430,7 +439,7 @@ impl App {
         if let Some(map) = &facts.mcp_off_map {
             line(format!("user MCP servers: {}", mcp_servers_text(map)));
         }
-        for usage_line in self.usage_lines(child, cancel) {
+        for usage_line in usage {
             line(format!("usage: {usage_line}"));
         }
         line("running turns: none".to_string());
@@ -454,46 +463,70 @@ impl App {
             self.cfg.state_base.display()
         ));
         if let Some(failure) = failure {
-            out.push_str(
+            out.push_str(if lost.is_some() {
+                "\nCodex is not ready to generate images: its app-server stopped during this \
+                 check.\n\n"
+            } else {
                 "\nCodex is not ready to generate images. This is what a generate call would \
-                 return:\n\n",
-            );
+                 return:\n\n"
+            });
             out.push_str(&failure.render_for_agent());
         }
         (out, failure.is_none())
     }
 
-    /// A fresh usage read when Codex is running, else the last one with its age.
-    fn usage_lines(
+    /// A fresh usage read from the running child, else the last value with its age.
+    ///
+    /// Also says whether the child was lost: it exited during the read, or is gone by the time
+    /// the read returns. A lost child is discarded, so the next call starts a fresh one, and the
+    /// failure makes the report not ready. A read that fails with the child still alive (a
+    /// timeout, an error reply) only makes the usage stale.
+    fn live_usage(
         &self,
-        child: Option<&Arc<CodexChild>>,
+        child: &Arc<CodexChild>,
         cancel: Option<&RequestCancel>,
-    ) -> Vec<String> {
-        let mut why_stale = String::from("Codex is not running");
-        if let Some(child) = child {
-            let rpc = Rpc {
-                server: &child.server,
-                cancel,
-                per_call: STATUS_READ_DEADLINE,
-                budget: None,
-            };
-            match rpc.call_raw("account/rateLimits/read", json!({})) {
-                Ok(reply) => {
-                    // Merged per bucket, not swapped in whole. A read is a full snapshot of each
-                    // bucket it reports, so those are replaced; one it does not report, such as an
-                    // image_gen bucket learned from an update (reads have returned only the codex
-                    // bucket [verified]), is kept.
-                    let fresh = Usage::from_read(&reply);
-                    let mut cache = lock(&self.usage);
-                    let merged = cache.usage.get_or_insert_with(Usage::default);
-                    merged.buckets.extend(fresh.buckets);
-                    let lines = merged.lines();
-                    cache.updated = Some(Instant::now());
-                    return lines;
-                }
-                Err(e) => why_stale = format!("the live read failed: {e}"),
-            }
+    ) -> (Vec<String>, Option<Failure>) {
+        const METHOD: &str = "account/rateLimits/read";
+        let rpc = Rpc {
+            server: &child.server,
+            cancel,
+            per_call: STATUS_READ_DEADLINE,
+            budget: None,
+        };
+        let read = rpc.call_raw(METHOD, json!({}));
+        let lost = match &read {
+            Err(e @ RpcError::ChildExited { .. }) => Some(rpc.failure(METHOD, e.clone())),
+            _ if !child.server.is_alive() => Some(errors::app_server_failed(
+                METHOD,
+                "The Codex app-server exited after answering.",
+            )),
+            _ => None,
+        };
+        if lost.is_some() {
+            self.retire(child);
         }
+        let lines = match read {
+            Ok(reply) => {
+                // Merged per bucket, not swapped in whole. A read is a full snapshot of each
+                // bucket it reports, so those are replaced; one it does not report, such as an
+                // image_gen bucket learned from an update (reads have returned only the codex
+                // bucket [verified]), is kept.
+                let fresh = Usage::from_read(&reply);
+                let mut cache = lock(&self.usage);
+                let merged = cache.usage.get_or_insert_with(Usage::default);
+                merged.buckets.extend(fresh.buckets);
+                let lines = merged.lines();
+                cache.updated = Some(Instant::now());
+                lines
+            }
+            Err(_) if lost.is_some() => self.cached_usage("the Codex app-server exited"),
+            Err(e) => self.cached_usage(&format!("the live read failed: {e}")),
+        };
+        (lines, lost)
+    }
+
+    /// The last usage seen, each line with its age and why it is not fresh.
+    fn cached_usage(&self, why_stale: &str) -> Vec<String> {
         let cache = lock(&self.usage);
         match (&cache.usage, cache.updated) {
             (Some(usage), Some(at)) => {
@@ -1529,6 +1562,76 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("backend unavailable"), "{report}");
+    }
+
+    #[test]
+    fn a_child_that_dies_during_the_usage_read_is_reported_not_ready_and_discarded() {
+        let f = fixture(FakeCodex {
+            exits_on: Some("account/rateLimits/read"),
+            ..FakeCodex::default()
+        });
+        let (is_error, report) = call(&f.app, STATUS, json!({}));
+        assert!(!is_error, "status is not itself an error");
+        for expected in [
+            "app-server: not running",
+            "image generation: unavailable (APP_SERVER_FAILED)",
+            "usage: unavailable (the Codex app-server exited)",
+            "IMAGE GENERATION FAILED\ncode: APP_SERVER_FAILED",
+            "account/rateLimits/read",
+            "stopped before answering",
+            "ACTION REQUIRED",
+        ] {
+            assert!(
+                report.contains(expected),
+                "missing {expected:?} in:\n{report}"
+            );
+        }
+        assert!(!report.contains("app-server: running"), "{report}");
+        assert!(!report.contains("image generation: available"), "{report}");
+        // What preflight learned before the child died is still shown.
+        assert!(report.contains("account: chatgpt, plan pro"), "{report}");
+        assert!(lock(&f.app.child).is_none(), "the dead child was kept");
+        // The next call starts a fresh Codex rather than reusing the dead one.
+        call(&f.app, STATUS, json!({}));
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn doctor_is_not_ready_when_the_child_dies_during_the_usage_read() {
+        let f = fixture(FakeCodex {
+            exits_on: Some("account/rateLimits/read"),
+            ..FakeCodex::default()
+        });
+        // main.rs exits 1 on this flag.
+        let (report, ready) = f.app.doctor();
+        assert!(!ready, "{report}");
+        assert!(report.contains("app-server: not running"), "{report}");
+        assert!(report.contains("APP_SERVER_FAILED"), "{report}");
+    }
+
+    #[test]
+    fn a_usage_read_that_fails_with_the_child_alive_keeps_codex_ready() {
+        let f = fixture(FakeCodex {
+            rate_limits: Err(json!({"code": -32603, "message": "backend unavailable"})),
+            ..FakeCodex::default()
+        });
+        let (report, ready) = f.app.status_report(None, None);
+        assert!(ready, "{report}");
+        for expected in [
+            "app-server: running",
+            "image generation: available",
+            "usage: unavailable (the live read failed: error -32603: backend unavailable)",
+        ] {
+            assert!(
+                report.contains(expected),
+                "missing {expected:?} in:\n{report}"
+            );
+        }
+        assert!(!report.contains("ACTION REQUIRED"), "{report}");
+        assert!(lock(&f.app.child).is_some(), "a live child was discarded");
+        let (report, ready) = f.app.doctor();
+        assert!(ready, "{report}");
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 1);
     }
 
     #[test]
