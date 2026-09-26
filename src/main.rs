@@ -9,19 +9,26 @@ compile_error!(
     "codex-imagegen targets Windows only: it depends on job objects and LockFileEx file locking."
 );
 
+mod appserver;
+mod cancel;
+mod codex;
+mod config;
+mod errors;
+mod jsonrpc;
+mod mcp;
+#[cfg(test)]
+mod testutil;
+mod tools;
+mod winjob;
+
+use std::sync::Arc;
+
+use config::{Config, Mode, USAGE};
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The commit this binary was built from. CI sets `CODEX_IMAGEGEN_BUILD`; a local build has none.
 const BUILD: Option<&str> = option_env!("CODEX_IMAGEGEN_BUILD");
-
-const USAGE: &str = "\
-codex-imagegen - MCP server that lets Claude Code generate images through a local Codex CLI
-
-USAGE:
-    codex-imagegen [--help | --version]
-
-The MCP server is not implemented yet; docs/design.md describes the plan.
-";
 
 fn version_line() -> String {
     match BUILD {
@@ -33,6 +40,7 @@ fn version_line() -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // Before parsing, so help and the version are available even alongside a bad flag.
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
         return;
@@ -41,14 +49,40 @@ fn main() {
         println!("{}", version_line());
         return;
     }
-    if let Some(arg) = args.first() {
-        eprintln!("codex-imagegen: unknown argument '{arg}'\n");
-        eprintln!("Run with --help for usage.");
-        std::process::exit(2);
+
+    let cfg = match Config::from_args(&args) {
+        Ok(cfg) => cfg,
+        Err(message) => {
+            eprintln!("codex-imagegen: {message}\n");
+            eprintln!("Run with --help for usage.");
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&cfg.state_dir) {
+        // Not fatal here: whatever needs the directory reports its own error when it runs.
+        eprintln!(
+            "codex-imagegen: warning: could not create the state directory {}: {e}",
+            cfg.state_dir.display()
+        );
     }
 
-    eprintln!("codex-imagegen: the MCP server is not implemented yet.");
-    std::process::exit(1);
+    match cfg.mode {
+        Mode::Help => print!("{USAGE}"),
+        Mode::Version => println!("{}", version_line()),
+        Mode::Doctor => {
+            // The same report as the status tool, from a terminal. Free: no image is generated.
+            // Exits 1 when Codex is not ready, so a script can tell.
+            let (report, ready) = tools::App::new(cfg).doctor();
+            print!("{report}");
+            std::process::exit(if ready { 0 } else { 1 });
+        }
+        Mode::Cleanup { .. } => {
+            eprintln!("codex-imagegen: --cleanup is not implemented yet.");
+            std::process::exit(1);
+        }
+        Mode::Serve => mcp::serve(Arc::new(tools::App::new(cfg))),
+    }
 }
 
 #[cfg(test)]

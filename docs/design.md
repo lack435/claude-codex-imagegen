@@ -1,7 +1,9 @@
 # codex-imagegen v1 design
 
 Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applied; cleanup added). M0 (repo
-scaffold) is in place; no server behaviour is implemented yet.
+scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
+and the CI contract check. `generate` and `refine` validate their arguments and run preflight, then return
+`INTERNAL_ERROR` until M2. V0, V7 and V8 are not yet run.
 
 Claims carry one of three tags:
 
@@ -107,8 +109,9 @@ These facts constrain the design.
   `<CODEX_HOME>\thread-writer-locks\<id>.lock`. The lock is held until the thread unloads.
 - A thread unloads only when no connection is subscribed to it and it has been idle for
   `thread_unload_delay_secs` (60 s by default). The caller of start or resume is subscribed automatically.
-- A second process's `thread/resume` fails with `-32600 "thread <id> already has an active writer"`
-  [verified: source and Codex's own test; not yet live, see V7].
+- A second process's `thread/resume` fails with `-32600 "thread <id> already has an active writer"`.
+  After the holder unsubscribes, `thread/closed` arrives once the unload delay has passed (5.0 s with
+  `thread_unload_delay_secs=5`), and the second resume then succeeds [verified: live, V7].
 - `turn/start` on a thread whose turn is still running is merged into that turn, not queued
   [verified: source].
 
@@ -195,7 +198,7 @@ Starts a new session and generates one image.
 | --- | --- | --- |
 | `prompt` | string, required | Passed to the image tool verbatim. |
 | `session` | string, optional | The new session's name. If omitted, the server picks `img-<yyyyMMdd-HHmmss>-<4 hex>`, and picks again if that collides. If an explicit name exists: `SESSION_EXISTS` (agent-correctable). |
-| `reference_images` | string[], optional | Up to 5 paths. Each must open and start with a PNG, JPEG or WebP signature, or the call gets `BAD_REQUEST`. They become the tool's `referenced_image_paths`. |
+| `reference_images` | string[], optional | Up to 5 paths. Each must open and start with a PNG, JPEG or WebP signature, or the call gets `BAD_REQUEST`. Relative paths resolve like output paths: against `CLAUDE_PROJECT_DIR` when it is set, else the server's working directory. They reach Codex as absolute paths, and become the tool's `referenced_image_paths`. |
 | `output_dir` | string, optional | See [Output files](#output-files). |
 
 ### `codex_imagegen_refine`
@@ -224,6 +227,12 @@ No arguments and no quota. It reports:
 - sessions in this project: name, turns, latest output path, last update
 
 Live reads are bounded to about 10 s each. On timeout, the last value is shown with its age.
+
+If the child exits during a live read, or is gone by the time the report is built, it is not running, whatever
+preflight found. The report then shows the app-server not running and image generation unavailable
+(`APP_SERVER_FAILED`, with the detail), the child is discarded so the next call starts a fresh one, and
+`--doctor` exits 1. A read that fails while the child is still alive (a timeout or an error reply) only makes
+the usage stale.
 
 ### Success result (generate and refine)
 
@@ -391,9 +400,19 @@ Preflight runs **once per child instance**, and again after every spawn or respa
 3. **`model/list`** with `includeHidden: true`, following `nextCursor`. If the pinned model is absent:
    `MODEL_UNAVAILABLE`. If it is present but hidden, `status` notes it, since a hidden model is often being
    retired.
-4. **`config/read`.** If the active profile (`profiles.<name>.features`) re-disables `image_generation` or
-   re-enables any switched-off feature, the call fails with `IMAGEGEN_UNAVAILABLE`, naming the setting.
-   Profile features override `-c`.
+4. **`config/read`**, with `cwd` set to the work directory. The effective config must show every spawn switch
+   in effect: `features.image_generation` true, each switched-off feature false, `web_search`, `notify`,
+   `skills.*`, `approvals_reviewer` and `windows.sandbox` as set. A legacy alias of a switched-off feature
+   (`connectors`, `memory_tool`, `collab`, `codex_hooks`) must not be true. Anything else fails with
+   `IMAGEGEN_UNAVAILABLE`, naming the setting. Our switches outrank every layer except legacy managed config
+   (`managed_config.toml`) [verified: source, `config/src/config_layer_source.rs`]. So this catches that
+   layer, managed requirements, and a legacy alias in the user's config: `memory_tool = true` turned
+   `memories` back on despite `--disable memories` [verified: `config/read` on a test home], and `connectors`
+   is applied after `apps` [verified: source, `features/src/lib.rs` `apply_map`]. A `config/read` error also
+   fails with `IMAGEGEN_UNAVAILABLE`, quoting Codex. A legacy top-level `profile = "..."` key causes one
+   ("legacy `profile` config is no longer supported"), while the app-server logs "Invalid configuration;
+   using defaults" and keeps serving [verified: live]. Profiles never apply to `app-server`: 0.156.0 passes no
+   profile features, and profiles v2 need `--profile` [verified: source, `core/src/config/mod.rs`].
 5. **Version.** Taken from the child's `userAgent` and checked against the tested range.
 
 **When preflight fails.** The child is closed at once. It never ran a turn, so nothing is lost. The next call
@@ -428,6 +447,13 @@ running on it.
 ### Message handling
 
 **Reading.** One reader thread reads child stdout through `BufReader`, with a 64 MiB cap on line length.
+
+**Writing.** One writer thread owns the child's stdin and writes queued lines in order [decided]. Requests,
+notifications and the refusals of server requests only queue a line. A child that stops reading fills the pipe,
+and the next write then blocks until the child dies. Only the writer thread waits on it: each request still ends
+at its deadline or cancel, the reader keeps routing, and shutdown still reaches the job after its grace. The
+job's kill then fails the stuck write ("the pipe has been ended"), which ends the writer thread [verified: unit
+test against `PING.EXE`, which never reads its stdin].
 
 **Parsing.** Two stages:
 
@@ -467,12 +493,19 @@ threads a server that is not in the disabled map, the turn is interrupted and th
 
 - **Child death.** In-flight turns fail with `APP_SERVER_FAILED`, unless an image already completed (see the
   success rule). The next call respawns the child and re-runs preflight.
-- **Our stdin closing.** When Claude Code closes our stdin:
+- **Our stdin closing.** When our stdin closes and we are given time to exit:
   1. interrupt running turns;
   2. let copies already in progress finish;
-  3. close the child's stdin (an idle child exits in 0.05–0.07 s [verified]);
+  3. end the child's input: the writer thread writes what is still queued, then closes the pipe (an idle child
+     exits in 0.05–0.07 s [verified]);
   4. wait up to 5 s in total;
-  5. drop the job.
+  5. drop the job. This step never waits on the pipe, so a child that stopped reading is killed on time.
+
+  This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
+  straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:
+  - the job object reaps the Codex tree however we die;
+  - session records are written atomically as each image completes;
+  - cleanup is safe to retry after a crash.
 
 ### Codex version pinning
 
@@ -622,8 +655,9 @@ codex-imagegen.exe --cleanup [--older-than-days N]
 - It never deletes by wildcard in an output directory, never deletes a folder in the project, and never
   touches a thread that is not in one of its session records.
 
-`thread/delete` on a thread that has turns and has already unloaded is expected to work, because it deletes
-by rollout lookup [assumed: V8].
+`thread/delete` works on a thread that has turns and has already unloaded. It removes the rollout, and a
+later `thread/resume` then fails with `no rollout found for thread id <id>`. Codex's
+`generated_images\<threadId>` folder is left behind, which is why we remove it ourselves [verified: live, V8].
 
 ## Progress and cancellation
 
@@ -748,6 +782,9 @@ case is always a success with warnings.
 - **Threads.** Each `tools/call` runs on its own thread, so `ping` and cancellation keep flowing.
 - **Protocol versions.** Supported: `["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]`. The server
   echoes a supported client version, and otherwise answers with the **newest**, as the MCP spec recommends.
+  JSON-RPC batches, which 2025-03-26 allows, are not supported: a line holding a JSON array gets one `-32600`
+  error with a null id, and none of its elements is dispatched. Only a JSON object is read as a message, on
+  both the MCP side and the `app-server` side.
 - **`initialize` result.** Capabilities `{tools:{}}` and short `instructions`, under 2,048 characters. Tool
   descriptions are also under 2,048 characters. No tool declares `execution.taskSupport`.
 - **Shared framing.** The same framing code (send, line reader, message classification, request keys) serves
@@ -758,7 +795,7 @@ case is always a success with warnings.
 Everything is a command-line argument on the MCP entry. There is no config file of our own.
 
 ```
---codex-bin <path>         Codex CLI; default: PATH, then %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
+--codex-bin <abs path>     Codex CLI; default: PATH, then %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
 --codex-home <abs dir>     Set CODEX_HOME for the child (dedicated home; isolates ~/.codex, see Security posture)
 --model <id>               Agent model, full id. Default gpt-6-astra
 --effort <level>           Agent reasoning effort. Default low
@@ -767,7 +804,8 @@ Everything is a command-line argument on the MCP entry. There is no config file 
 --timeout-seconds <n>      Whole-call limit for generate/refine. Default 300
 --max-concurrent <n>       Concurrent turns across sessions. Default 4
 --session-ttl-days <n>     Expire sessions idle this long (see Cleanup). Default 7; 0 disables
---doctor                   Check CLI, login, plan, capability and model from a terminal (free), then exit
+--doctor                   Check CLI, login, plan, capability and model from a terminal (free), then exit:
+                           0 when ready, 1 otherwise
 --cleanup                  Sweep expired sessions across all projects, then exit
 --older-than-days <n>      With --cleanup: override the TTL (0 = every session not in use)
 --help, --version
@@ -884,9 +922,9 @@ Each item must pass before the code that depends on it is considered done.
 
 | # | Check | Cost | When |
 | --- | --- | --- | --- |
-| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. | Claude usage only | M1 |
-| V7 | Two app-server children on one home: B's `thread/resume` of the existing smoke thread fails with "active writer" while A holds it, and succeeds after A unsubscribes and `thread/closed` arrives. Both children can also start threads at the same time. | free (no turn) | M1 |
-| V8 | After V7, `thread/delete` on the unloaded smoke thread, which has turns: the rollout and thread-history rows are gone, and `generated_images\<threadId>` remains for us to remove. | free | M1 |
+| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
+| V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
+| V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
 | V1 | The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, multi-agent, skill and tool-suggest tools. The item is reported and `savedPath` is populated. | 1 image (part of smoke) | M2 |
 | V2 | Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. | part of smoke | M2 |
 | V3 | `reference_images` on generate reach `referenced_image_paths` and influence the output. | 1 image | M2 |
@@ -899,8 +937,8 @@ Each item must pass before the code that depends on it is considered done.
 | # | Scope |
 | --- | --- |
 | M0 | Repo scaffold: Cargo, toolchain, `.gitattributes`/`.gitignore`, `AGENTS.md` + `CLAUDE.md`, `build.ps1`, CI. |
-| M1 | MCP layer, `status`, spawn, handshake and preflight (all free), the CI contract check, V0, V7, V8. |
-| M2 | `generate` end to end: pre-check, copy on item, preview, progress, errors. `smoke.ps1` first version (V1, V2), V3. |
+| M1 | MCP layer, `status`, spawn, handshake and preflight (all free), the CI contract check, V7, V8. |
+| M2 | `generate` end to end: pre-check, copy on item, preview, progress, errors. V0, `smoke.ps1` first version (V1, V2), V3. |
 | M3 | Sessions: store, leases, `refine`, resume and unsubscribe, writer-lock handling, the full smoke, V9. Cleanup: expiry and `--cleanup`. |
 | M4 | Cancel and timeout (V4), `--codex-home` (V5). |
 | M5 | README: setup, a "verify it works" checklist in Claude Code, the IJG notice, the `.gitignore` tip. Release workflow when wanted. |

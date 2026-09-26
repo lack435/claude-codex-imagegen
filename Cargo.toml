@@ -12,6 +12,10 @@ name = "codex-imagegen"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+# raw_value: the app-server reader parses a borrowed envelope, so a multi-megabyte image line is
+# routed without being copied into a serde_json::Value (see docs/design.md, "Message handling").
+serde_json = { version = "1", features = ["raw_value"] }
 
 [profile.release]
 opt-level = "z"
