@@ -338,15 +338,22 @@ impl AppServer {
         }
     }
 
-    /// Stop the child: end its input (the writer thread writes what is still queued, then closes
-    /// the pipe; an idle app-server exits within about 0.07 s of that [verified]), wait up to
-    /// `grace` for it to exit, then terminate its job, which takes every descendant with it.
+    /// End the child's input: the writer thread writes what is still queued, then closes the pipe.
+    /// Never waits. The first step of [`shutdown`](Self::shutdown), for a caller that ends several
+    /// children's input before waiting on any of them.
+    pub fn end_input(&self) {
+        lock(&self.shared.outbox).take();
+    }
+
+    /// Stop the child: end its input (an idle app-server exits within about 0.07 s of that
+    /// [verified]), wait up to `grace` for it to exit, then terminate its job, which takes every
+    /// descendant with it.
     ///
     /// Never waits on the pipe. If a write is stuck because the child stopped reading, the child
     /// cannot see its input end and the grace runs out; the job kill then fails the stuck write,
     /// which ends the writer thread. Safe to call more than once, and from any thread.
     pub fn shutdown(&self, grace: Duration) {
-        lock(&self.shared.outbox).take();
+        self.end_input();
         let Some(job) = &self.job else {
             return;
         };
@@ -364,8 +371,8 @@ impl AppServer {
             }
             if Instant::now() >= deadline {
                 eprintln!(
-                    "codex-imagegen: the Codex app-server did not exit within {} ms of its input \
-                     ending; terminating it",
+                    "codex-imagegen: the Codex app-server did not exit within its {} ms grace \
+                     after its input ended; terminating it",
                     grace.as_millis()
                 );
                 job.terminate();
@@ -418,7 +425,7 @@ impl Drop for AppServer {
     fn drop(&mut self) {
         // Ending the child's input first gives it a chance to exit on its own; dropping the job
         // right after kills whatever is left either way. Neither waits.
-        lock(&self.shared.outbox).take();
+        self.end_input();
     }
 }
 

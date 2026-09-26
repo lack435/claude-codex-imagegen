@@ -15,7 +15,9 @@
 //!
 //! A call that gives up on its turn before `turn/completed` (a cancel, or the budget running out)
 //! *lingers*: it returns, but the session stays busy until that `turn/completed` arrives or the
-//! child dies (docs/design.md, "After `turn/interrupt`"). The registry also makes sure the turn is
+//! child dies (docs/design.md, "After `turn/interrupt`"). A `turn/completed` routed into the
+//! call's channel just before it gives up is recorded here, so the call frees the session rather
+//! than lingering on a turn that has already ended. The registry also makes sure the turn is
 //! interrupted exactly once, whoever asks first and whenever its id becomes known: a cancel that
 //! arrives before `turn/start` has answered is remembered, and the interrupt comes due the moment
 //! the turn id turns up.
@@ -56,6 +58,15 @@ const MAX_UNROUTED: usize = 32;
 /// can never complete, so it frees its session instead. Asked with no registry lock held, but on
 /// the path of every new call and of `status`, so it must answer at once.
 pub type Liveness = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The Codex child a thread lives on.
+#[derive(Clone)]
+pub struct ChildRef {
+    /// Tells children apart. Shutdown sends each turn's interrupt to the child running it, which
+    /// need not be the current one: a retired child keeps the turns its calls are still running.
+    pub id: u64,
+    pub alive: Liveness,
+}
 
 /// A `turn/interrupt` to send now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,10 +120,13 @@ struct Entry<E> {
     phase: String,
     thread_id: Option<String>,
     turn_id: Option<String>,
-    /// Whether the child the thread lives on is alive.
-    child: Option<Liveness>,
+    /// The child the thread lives on.
+    child: Option<ChildRef>,
     /// The call's channel. `None` until attached, and again once the call has given up.
     events: Option<Sender<E>>,
+    /// `turn/completed` has been routed into the call's channel, read or not. A call that gives up
+    /// after that must not linger: no second `turn/completed` will come to free the session.
+    completed: bool,
     /// The call has returned without seeing `turn/completed`.
     lingering: bool,
     /// Someone asked for the turn to be interrupted.
@@ -188,6 +202,7 @@ impl<E: TurnEvent> Registry<E> {
             turn_id: None,
             child: None,
             events: None,
+            completed: false,
             lingering: false,
             interrupt_wanted: false,
             interrupt_sent: false,
@@ -228,6 +243,9 @@ impl<E: TurnEvent> Registry<E> {
                 thread_id: thread_id.to_string(),
             });
         }
+        // Recorded under the lock `linger` takes, so a call that gives up after this line knows
+        // the turn is over even though it never read the event.
+        entry.completed |= event.ends_turn();
         entry.learn_turn(event.turn_id());
         let follow_up = entry.due_interrupt().map(FollowUp::Interrupt);
         if let Some(events) = &entry.events {
@@ -239,8 +257,9 @@ impl<E: TurnEvent> Registry<E> {
 
     /// Refuse new calls from now on, and interrupt every turn: the ones whose id is known now,
     /// by the returned interrupts, and the others as soon as their id turns up, through `route`
-    /// or `set_turn` (docs/design.md, "Lifecycle").
-    pub fn begin_shutdown(&self) -> Vec<Interrupt> {
+    /// or `set_turn` (docs/design.md, "Lifecycle"). Each returned interrupt comes with the id of
+    /// the child running its turn, which is the one to send it.
+    pub fn begin_shutdown(&self) -> Vec<(u64, Interrupt)> {
         let mut state = self.lock();
         state.shutting_down = true;
         state
@@ -248,7 +267,9 @@ impl<E: TurnEvent> Registry<E> {
             .iter_mut()
             .filter_map(|entry| {
                 entry.interrupt_wanted = true;
-                entry.due_interrupt()
+                // An entry with a thread always has its child: `attach` sets both.
+                let child = entry.child.as_ref()?.id;
+                entry.due_interrupt().map(|interrupt| (child, interrupt))
             })
             .collect()
     }
@@ -277,7 +298,7 @@ impl<E: TurnEvent> Registry<E> {
             .entries
             .iter()
             .filter(|e| e.lingering)
-            .filter_map(|e| e.child.as_ref().map(|alive| (e.id, Arc::clone(alive))))
+            .filter_map(|e| e.child.as_ref().map(|c| (e.id, Arc::clone(&c.alive))))
             .collect();
         let dead: Vec<u64> = lingering
             .into_iter()
@@ -321,14 +342,14 @@ impl<E: TurnEvent> TurnSlot<E> {
             .with_entry(self.id, |e| e.phase = phase.to_string());
     }
 
-    /// Route `thread_id`'s notifications to this call from now on, and say how to tell whether the
-    /// child the thread lives on is alive. Call it as soon as `thread/start` answers, before `turn/start`, so that no
+    /// Route `thread_id`'s notifications to this call from now on, and name the child the thread
+    /// lives on. Call it as soon as `thread/start` answers, before `turn/start`, so that no
     /// notification of the turn can arrive unrouted.
     ///
     /// Events kept for this thread before it was attached (see [`TurnEvent::keep_unrouted`]) are
     /// delivered first, in the order they arrived. That happens under the same lock `route` takes,
     /// so every event reaches the call exactly once, whichever side of the attach it arrived on.
-    pub fn attach(&self, thread_id: &str, alive: Liveness) -> Receiver<E> {
+    pub fn attach(&self, thread_id: &str, child: ChildRef) -> Receiver<E> {
         let (events, receiver) = mpsc::channel();
         let mut guard = self.registry.lock();
         let state = &mut *guard;
@@ -346,7 +367,7 @@ impl<E: TurnEvent> TurnSlot<E> {
         }
         state.unrouted = kept;
         entry.thread_id = Some(thread_id.to_string());
-        entry.child = Some(alive);
+        entry.child = Some(child);
         entry.events = Some(events);
         receiver
     }
@@ -379,23 +400,30 @@ impl<E: TurnEvent> TurnSlot<E> {
     /// until that `turn/completed` arrives (routed here, it comes back as
     /// [`FollowUp::Unsubscribe`]) or the child dies. Call it only once `turn/start` has been sent.
     ///
-    /// The turn is interrupted: the returned interrupt, if its id is known and none was sent yet,
-    /// is for the caller to send; otherwise it comes due through `route` as soon as the id turns
-    /// up. A call that never attached a thread has no turn to wait for, so its session is freed at
-    /// once.
-    pub fn linger(mut self) -> Option<Interrupt> {
+    /// The turn is interrupted: the returned [`FollowUp::Interrupt`], if its id is known and none
+    /// was sent yet, is for the caller to send; otherwise it comes due through `route` as soon as
+    /// the id turns up. A call that never attached a thread has no turn to wait for, so its
+    /// session is freed at once. So is one whose `turn/completed` was routed to it after its last
+    /// look and before this: the turn is over, and the returned [`FollowUp::Unsubscribe`] is for
+    /// the caller to send.
+    pub fn linger(mut self) -> Option<FollowUp> {
         self.released = true;
         let mut state = self.registry.lock();
         let index = state.entries.iter().position(|e| e.id == self.id)?;
-        if state.entries[index].thread_id.is_none() {
+        let entry = &state.entries[index];
+        let Some(thread_id) = entry.thread_id.clone() else {
             state.entries.remove(index);
             return None;
+        };
+        if entry.completed {
+            state.entries.remove(index);
+            return Some(FollowUp::Unsubscribe { thread_id });
         }
         let entry = &mut state.entries[index];
         entry.lingering = true;
         entry.events = None;
         entry.interrupt_wanted = true;
-        entry.due_interrupt()
+        entry.due_interrupt().map(FollowUp::Interrupt)
     }
 }
 
@@ -482,15 +510,24 @@ mod tests {
         Arc::new(Registry::new(max))
     }
 
-    fn alive() -> Liveness {
-        Arc::new(|| true)
+    /// A live child with this id.
+    fn child(id: u64) -> ChildRef {
+        ChildRef {
+            id,
+            alive: Arc::new(|| true),
+        }
     }
 
-    /// A liveness the test can flip.
-    fn switch() -> (Arc<AtomicBool>, Liveness) {
+    fn alive() -> ChildRef {
+        child(1)
+    }
+
+    /// A child whose liveness the test can flip.
+    fn switch() -> (Arc<AtomicBool>, ChildRef) {
         let flag = Arc::new(AtomicBool::new(true));
         let probe = Arc::clone(&flag);
-        (flag, Arc::new(move || probe.load(Ordering::SeqCst)))
+        let alive: Liveness = Arc::new(move || probe.load(Ordering::SeqCst));
+        (flag, ChildRef { id: 1, alive })
     }
 
     fn interrupt(thread: &str, turn: &str) -> Interrupt {
@@ -571,11 +608,19 @@ mod tests {
     fn shutdown_refuses_new_calls_and_interrupts_every_turn() {
         let r = registry(4);
         let known = r.try_start("known").unwrap();
-        let _rx = known.attach("t1", alive());
+        let _rx = known.attach("t1", child(7));
         known.set_turn("u1");
         let pending = r.try_start("pending").unwrap();
-        let rx = pending.attach("t2", alive());
-        assert_eq!(r.begin_shutdown(), vec![interrupt("t1", "u1")]);
+        let rx = pending.attach("t2", child(7));
+        // A turn on another child, such as a retired one that a call still holds.
+        let elsewhere = r.try_start("elsewhere").unwrap();
+        let _rx3 = elsewhere.attach("t3", child(8));
+        elsewhere.set_turn("u3");
+        // Each interrupt names the child that must send it.
+        assert_eq!(
+            r.begin_shutdown(),
+            vec![(7, interrupt("t1", "u1")), (8, interrupt("t3", "u3"))]
+        );
         assert_eq!(code(r.try_start("new")), "SERVER_SHUTTING_DOWN");
         // The turn whose id was not known yet is interrupted as soon as it turns up, once.
         assert_eq!(
@@ -690,7 +735,10 @@ mod tests {
         let rx = slot.attach("t", alive());
         slot.set_turn("u");
         slot.set_phase("generating image");
-        assert_eq!(slot.linger(), Some(interrupt("t", "u")));
+        assert_eq!(
+            slot.linger(),
+            Some(FollowUp::Interrupt(interrupt("t", "u")))
+        );
         // The call's channel is closed; the session is still taken, and still counts.
         assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
         let err = r.try_start("FOX").err().unwrap();
@@ -715,6 +763,31 @@ mod tests {
             })
         );
         assert_eq!(code(r.try_start("fox")), "OK");
+    }
+
+    #[test]
+    fn a_turn_completed_routed_as_the_call_gives_up_frees_the_session() {
+        let r = registry(1);
+        let slot = r.try_start("s").unwrap();
+        let rx = slot.attach("t", alive());
+        slot.set_turn("u");
+        // The call interrupts its turn, waits, and gives up: its last look found nothing.
+        assert_eq!(slot.handle().request_interrupt(), Some(interrupt("t", "u")));
+        assert!(rx.try_recv().is_err());
+        // turn/completed is routed after that look but before the call lingers, so it lands in
+        // the call's channel, which the call will never read again.
+        assert_eq!(r.route("t", completed("u")), None);
+        // So the call does not linger: the session is freed, and the unsubscribe is the call's.
+        assert_eq!(
+            slot.linger(),
+            Some(FollowUp::Unsubscribe {
+                thread_id: "t".to_string()
+            })
+        );
+        drop(rx);
+        // No second turn/completed will come: the session and the slot must be free now.
+        assert!(r.running().is_empty(), "{:?}", r.running());
+        assert_eq!(code(r.try_start("s")), "OK");
     }
 
     #[test]

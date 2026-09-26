@@ -40,7 +40,7 @@ use crate::errors::{self, Failure};
 use crate::mcp::Progress;
 use crate::output;
 use crate::preview::{self, Preview};
-use crate::registry::{FollowUp, Interrupt, Liveness, Registry, TurnEvent, TurnSlot};
+use crate::registry::{ChildRef, FollowUp, Interrupt, Registry, TurnEvent, TurnSlot};
 
 /// How long a call waits for `turn/completed` after interrupting its turn, before it returns and
 /// leaves the session lingering (docs/design.md, "After `turn/interrupt`").
@@ -423,7 +423,12 @@ pub fn route_notification(
     let Some((thread_id, event)) = parse_notification(method, params) else {
         return;
     };
-    match registry.route(&thread_id, event) {
+    send_follow_up(sender, registry.route(&thread_id, event));
+}
+
+/// Queue whatever the registry says must be sent now.
+fn send_follow_up(sender: &DetachedSender, follow_up: Option<FollowUp>) {
+    match follow_up {
         Some(FollowUp::Interrupt(interrupt)) => send_interrupt(sender, &interrupt),
         Some(FollowUp::Unsubscribe { thread_id }) => send_unsubscribe(sender, &thread_id),
         None => {}
@@ -459,8 +464,8 @@ fn send_unsubscribe(sender: &DetachedSender, thread_id: &str) {
 pub struct Call<'a> {
     pub cfg: &'a Config,
     pub server: &'a AppServer,
-    /// Whether the child is alive (see [`TurnSlot::attach`]).
-    pub liveness: Liveness,
+    /// Which child `server` is, and whether it is alive (see [`TurnSlot::attach`]).
+    pub child: ChildRef,
     /// For protocol-anomaly messages.
     pub codex_version: Option<&'a str>,
     pub cancel: &'a Arc<RequestCancel>,
@@ -566,7 +571,7 @@ pub fn generate(call: &Call<'_>, slot: TurnSlot<Event>, request: &Request<'_>) -
         Ok(id) => id,
         Err(failure) => return Finished::failed(failure),
     };
-    let events = slot.attach(&thread_id, Arc::clone(&call.liveness));
+    let events = slot.attach(&thread_id, call.child.clone());
 
     // Installed once there is a thread, so a cancellation from here on interrupts the turn straight
     // from the MCP reader thread: the hook only asks the registry (one short lock) and queues a
@@ -637,9 +642,7 @@ pub fn generate(call: &Call<'_>, slot: TurnSlot<Event>, request: &Request<'_>) -
         Err(error) => {
             let failure = rpc.failure("turn/start", error);
             call.cancel.clear_hook();
-            if let Some(interrupt) = slot.linger() {
-                send_interrupt(&sender, &interrupt);
-            }
+            send_follow_up(&sender, slot.linger());
             return Finished::failed(failure);
         }
     }
@@ -656,12 +659,9 @@ pub fn generate(call: &Call<'_>, slot: TurnSlot<Event>, request: &Request<'_>) -
         }
         // Codex has closed the thread, or the child is gone: there is nothing to unsubscribe from.
         Ended::ThreadClosed | Ended::ChildDied(_) => slot.finish(),
-        // The unsubscribe waits for the turn/completed that frees the session.
-        Ended::GaveUp => {
-            if let Some(interrupt) = slot.linger() {
-                send_interrupt(&sender, &interrupt);
-            }
-        }
+        // The unsubscribe waits for the turn/completed that frees the session, unless that came
+        // in just as this call gave up: then it is due now.
+        Ended::GaveUp => send_follow_up(&sender, slot.linger()),
     }
     let auth_expired = turn
         .error

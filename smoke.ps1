@@ -180,7 +180,9 @@ function Get-JsReferencedPaths([string]$Source) {
 }
 
 # Every tool offered to the agent model, across every model request in every trace folder under
-# $Root: top-level and namespaced tools, and the tools nested in code-mode exec.
+# $Root: top-level and namespaced tools, and the tools nested in code-mode exec. A request whose
+# payload is missing or cannot be read is listed in Problems, which fails V1: the tools it
+# carried were never checked.
 function Read-OfferedTools([string]$Root) {
     $result = [pscustomobject]@{ Requests = 0; WithTools = 0; Incremental = 0; Tools = [ordered]@{}; Problems = @() }
     foreach ($log in Get-TraceLogs $Root) {
@@ -190,15 +192,24 @@ function Read-OfferedTools([string]$Root) {
             $file = Join-Path $log.DirectoryName $relative
             if (-not (Test-Path -LiteralPath $file)) { $result.Problems += "missing $file"; continue }
             $result.Requests++
-            # A follow-up request is mostly the image's base64 and carries no tools: it is not
-            # parsed.
-            $text = [IO.File]::ReadAllText($file, $utf8)
-            if ($text.IndexOf('"additional_tools"', [StringComparison]::Ordinal) -lt 0 -and
-                $text.IndexOf('"tools"', [StringComparison]::Ordinal) -lt 0) {
-                $result.Incremental++
+            try {
+                # A follow-up request is mostly the image's base64 and carries no tools: it is not
+                # parsed.
+                $text = [IO.File]::ReadAllText($file, $utf8)
+                if ($text.IndexOf('"additional_tools"', [StringComparison]::Ordinal) -lt 0 -and
+                    $text.IndexOf('"tools"', [StringComparison]::Ordinal) -lt 0) {
+                    $result.Incremental++
+                    continue
+                }
+                $request = ConvertFrom-JsonText $text
+            }
+            catch {
+                # The parser's message quotes the document it failed on: only its first line.
+                $why = ($_.Exception.Message -split '\r?\n')[0]
+                if ($why.Length -gt 200) { $why = $why.Substring(0, 200) + '...' }
+                $result.Problems += "unreadable ${file}: $why"
                 continue
             }
-            $request = ConvertFrom-JsonText $text
             $text = $null
             $lists = @()
             $top = Get-Field $request 'tools'
@@ -387,10 +398,15 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
         Write-Host "      saved to $ReportPath" -ForegroundColor DarkGray
     }
 
-    if ($offered.WithTools -eq 0) {
+    # Checked first: the tool lists that were read say nothing about a request that was not, so
+    # the tool-surface checks would pass on part of the evidence. They are not run then.
+    $unread = @($offered.Problems)
+    $readDetail = if ($unread.Count) { ($unread -join '; ') + '; the tool-surface checks were not run' } else { "$($offered.Requests) request(s)" }
+    Test-Check 'V1: every model request''s payload is readable' ($unread.Count -eq 0) $readDetail
+    if ($unread.Count -eq 0 -and $offered.WithTools -eq 0) {
         Add-Check 'V1: tool list' 'MANUAL' "no model request with a tool list found under $TraceRoot; inspect it by hand"
     }
-    else {
+    elseif ($unread.Count -eq 0) {
         Test-Check 'V1: exec is offered' (@($offered.Tools.Values | Where-Object { -not $_.Nested -and $_.Name -eq 'exec' }).Count -gt 0) ''
         Test-Check 'V1: image_gen__imagegen is nested in exec' ($nested -contains 'image_gen__imagegen') ''
         Test-Check 'V1: no shell, stdin, web search, browser, computer-use, sub-agent, user-input, skill, tool-suggest or MCP tool' ($byVerdict.Forbidden.Count -eq 0) (& $none $byVerdict.Forbidden)

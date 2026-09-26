@@ -15,8 +15,8 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
@@ -29,7 +29,7 @@ use crate::config::Config;
 use crate::errors::{self, Failure};
 use crate::mcp::{self, CallContext, Progress, ToolHost};
 use crate::output;
-use crate::registry::{Liveness, Registry, TurnSlot};
+use crate::registry::{ChildRef, Liveness, Registry, TurnSlot};
 use crate::turn::{self, Event};
 
 pub const GENERATE: &str = "codex_imagegen_generate";
@@ -53,6 +53,9 @@ const START_LOCK_POLL: Duration = Duration::from_millis(50);
 /// How many automatic session names a call tries before giving up. Each try draws a new random
 /// suffix, so a second collision in one process is already all but impossible.
 const AUTO_NAME_TRIES: usize = 8;
+
+/// Each child's id (see [`ChildRef`]), unique for the life of the process.
+static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How the tool layer gets a Codex child. A trait so tests can hand it a scripted fake; the real
 /// one resolves the CLI and spawns it.
@@ -95,6 +98,10 @@ pub struct App {
     /// The child that exists now, starting or ready. Shutdown takes it from here, so a child is
     /// placed here as soon as it is spawned, before its handshake.
     child: Mutex<Option<Arc<CodexChild>>>,
+    /// Children taken out of use while calls were still running turns on them, held weakly: the
+    /// last of those calls closes one by letting go of it. Shutdown closes those still alive, so
+    /// their turns are stopped too. Locked before `child` wherever both are taken.
+    retired: Mutex<Vec<Weak<CodexChild>>>,
     /// The latest usage, from `status` reads and `account/rateLimits/updated` notifications.
     usage: Arc<Mutex<UsageCache>>,
     /// The image turns running in this process, and the routing of their notifications.
@@ -104,6 +111,8 @@ pub struct App {
 }
 
 struct CodexChild {
+    /// From [`NEXT_CHILD_ID`].
+    id: u64,
     server: AppServer,
     bin: PathBuf,
     /// Set once the handshake and preflight have passed.
@@ -167,6 +176,7 @@ impl App {
             shutting_down: AtomicBool::new(false),
             start_lock: Mutex::new(()),
             child: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
             usage: Arc::default(),
             registry,
             interrupt_wait: turn::INTERRUPT_WAIT,
@@ -245,6 +255,7 @@ impl App {
             server.detached_sender(),
         ));
         let child = Arc::new(CodexChild {
+            id: NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed),
             server,
             bin: bin.clone(),
             ready: OnceLock::new(),
@@ -348,11 +359,20 @@ impl App {
     /// the last reference, and otherwise when the last call running a turn on it lets go, since
     /// dropping it drops its job, which kills its tree (docs/design.md, "When a turn fails with
     /// `AUTH_EXPIRED`"). Out of the slot, nothing new can pick it up, so a count of one cannot grow.
+    ///
+    /// Until then it is listed as retired, for shutdown. Both steps happen under the list's lock,
+    /// which shutdown also takes, so shutdown finds the child in the slot or in the list.
     fn retire_when_idle(&self, child: Arc<CodexChild>) {
+        let mut retired = lock(&self.retired);
         self.take_out_of_use(&child);
         if Arc::strong_count(&child) == 1 {
+            drop(retired);
             child.server.shutdown(RETIRE_GRACE);
+            return;
         }
+        let weak = Arc::downgrade(&child);
+        retired.retain(|c| c.strong_count() > 0 && !c.ptr_eq(&weak));
+        retired.push(weak);
     }
 
     fn take_out_of_use(&self, child: &Arc<CodexChild>) {
@@ -400,14 +420,16 @@ impl App {
         let session = slot.session().to_string();
         let ready = child.ready.get().expect("a returned child is ready");
         let weak = Arc::downgrade(&child);
-        let liveness: Liveness =
-            Arc::new(move || weak.upgrade().is_some_and(|c| c.server.is_alive()));
+        let alive: Liveness = Arc::new(move || weak.upgrade().is_some_and(|c| c.server.is_alive()));
         let usage = || self.usage_summary();
         let finished = turn::generate(
             &turn::Call {
                 cfg: &self.cfg,
                 server: &child.server,
-                liveness,
+                child: ChildRef {
+                    id: child.id,
+                    alive,
+                },
                 codex_version: ready.handshake.codex_version.as_deref(),
                 cancel: ctx.cancel(),
                 progress: &progress,
@@ -834,13 +856,29 @@ impl ToolHost for App {
         // it turns up. Queued before the child's input ends, so they are written first
         // (docs/design.md, "Lifecycle").
         let interrupts = self.registry.begin_shutdown();
-        let child = lock(&self.child).take();
-        if let Some(child) = child {
-            let sender = child.server.detached_sender();
-            for interrupt in &interrupts {
-                turn::send_interrupt(&sender, interrupt);
+        // Every live child: the current one, and each retired one that a call still holds, whose
+        // turn would otherwise run on to its deadline and hold up the exit.
+        let children: Vec<Arc<CodexChild>> = {
+            let mut retired = lock(&self.retired);
+            let mut children: Vec<_> = retired.drain(..).filter_map(|c| c.upgrade()).collect();
+            children.extend(lock(&self.child).take());
+            children
+        };
+        for (child_id, interrupt) in &interrupts {
+            // Sent by the child running the turn. One that is gone has no turn left to stop.
+            if let Some(child) = children.iter().find(|c| c.id == *child_id) {
+                turn::send_interrupt(&child.server.detached_sender(), interrupt);
             }
-            child.server.shutdown(SHUTDOWN_GRACE);
+        }
+        // Every child's input ends now, and they share one grace.
+        for child in &children {
+            child.server.end_input();
+        }
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        for child in &children {
+            child
+                .server
+                .shutdown(deadline.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -1792,6 +1830,7 @@ mod tests {
         {
             let child = lock(&f.app.child).clone().unwrap();
             let replacement = Arc::new(CodexChild {
+                id: NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed),
                 server: failing.connect(),
                 bin: child.bin.clone(),
                 ready: OnceLock::new(),
@@ -1948,6 +1987,108 @@ mod tests {
             1,
             "nothing new was started"
         );
+    }
+
+    #[test]
+    fn shutdown_interrupts_and_closes_a_retired_child_that_still_runs_a_turn() {
+        use crate::codex::testing::{image_started, turn_started, Step, TurnScript};
+        use crate::codex::testing::{THREAD_ID, TURN_ID};
+        // The call's turn runs on the first child. Mid-turn Codex reports a login that is no
+        // longer ChatGPT, so the child goes stale, and it is retired while the call still holds
+        // it. A fresh child then takes the slot, as the next call would start one.
+        let fake = FakeCodex {
+            turn: TurnScript {
+                steps: vec![
+                    Step::Send(turn_started()),
+                    Step::Send(image_started("exec-1")),
+                    Step::Send(json!({"method": "account/updated",
+                                      "params": {"authMode": "apikey", "planType": null}})),
+                ],
+                // Acknowledged, and the turn never completes on its own.
+                on_interrupt: vec![],
+                ..TurnScript::default()
+            },
+            ..FakeCodex::default()
+        };
+        let first_seen = Arc::clone(&fake.seen);
+        // A budget the call would sit out if nothing stopped it, short enough to end the test.
+        let f = fixture_with(fake, &[], |cfg, wait| {
+            cfg.timeout = Duration::from_secs(5);
+            *wait = Duration::from_millis(200);
+        });
+        let replacement_fake = FakeCodex {
+            turn: TurnScript {
+                on_interrupt: vec![],
+                ..TurnScript::default()
+            },
+            ..FakeCodex::default()
+        };
+        let replacement_seen = Arc::clone(&replacement_fake.seen);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = tx.send(call(
+                    &f.app,
+                    GENERATE,
+                    json!({"prompt": "p", "session": "fox"}),
+                ));
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let first = loop {
+                let child = lock(&f.app.child).clone();
+                let generating = f
+                    .running()
+                    .first()
+                    .is_some_and(|t| t.phase == "generating image");
+                match child {
+                    Some(child) if generating && child.stale.load(Ordering::SeqCst) => break child,
+                    _ => {}
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the turn never ran on a stale child"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let first_weak = Arc::downgrade(&first);
+            f.app.retire_when_idle(first);
+            assert!(!f.has_child());
+            assert!(
+                first_weak.upgrade().is_some_and(|c| c.server.is_alive()),
+                "the call's child was closed under it"
+            );
+            let replacement = Arc::new(CodexChild {
+                id: NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed),
+                server: replacement_fake.connect(),
+                bin: PathBuf::from(r"C:\fake\codex.exe"),
+                ready: OnceLock::new(),
+                stale: Arc::default(),
+            });
+            *lock(&f.app.child) = Some(replacement);
+
+            let started = Instant::now();
+            f.app.begin_shutdown();
+            assert!(
+                started.elapsed() < SHUTDOWN_GRACE,
+                "{:?}",
+                started.elapsed()
+            );
+            let (is_error, text) = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("the call on the retired child was left running");
+            assert!(is_error, "{text}");
+            assert!(text.contains("code: SERVER_SHUTTING_DOWN"), "{text}");
+            assert_eq!(
+                FakeCodex::sent(&first_seen, "turn/interrupt"),
+                vec![json!({"threadId": THREAD_ID, "turnId": TURN_ID})],
+                "the interrupt did not reach the child running the turn"
+            );
+            assert!(
+                FakeCodex::sent(&replacement_seen, "turn/interrupt").is_empty(),
+                "the interrupt went to a child that does not run the turn"
+            );
+            assert!(first_weak.upgrade().is_none_or(|c| !c.server.is_alive()));
+        });
     }
 
     #[test]

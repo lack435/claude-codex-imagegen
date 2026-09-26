@@ -475,7 +475,9 @@ restarting Claude Code [decided].
 **When a turn fails with `AUTH_EXPIRED`.** The child is marked for recycling: the next call starts a fresh one,
 and this one is closed once no call is using it. Each call running a turn holds the child, so it is closed at
 once when nothing else holds it, and otherwise when the last such call finishes, which drops it and with it the
-job [decided]. A lingering turn on it cannot complete once it is closed, so its session is freed.
+job [decided]. A lingering turn on it cannot complete once it is closed, so its session is freed. Until it is
+closed, the server keeps a weak reference to it, so shutdown still reaches it and its turns (see
+[Lifecycle](#lifecycle)). The same holds for a child replaced because `account/updated` reported another login.
 
 **`account/updated`.** An `authMode` other than `chatgpt` invalidates the cached preflight.
 
@@ -571,12 +573,15 @@ sees the server's tools. A report that comes later interrupts the turn.
   child dead first waits, bounded to about 2.5 s, for the reader to reach the end of the output (it marks
   that only after routing every line), then handles every event already routed to it [decided].
 - **Our stdin closing.** When our stdin closes and we are given time to exit:
-  1. interrupt running turns;
+  1. interrupt running turns, each through the child running it. Besides the current child, that can be a
+     retired one (see [When a turn fails with `AUTH_EXPIRED`](#handshake-and-preflight)) that a call still
+     holds; each child carries an id, and the registry records which child each turn runs on;
   2. let copies already in progress finish;
-  3. end the child's input: the writer thread writes what is still queued, then closes the pipe (an idle child
-     exits in 0.05–0.07 s [verified]);
-  4. wait up to 5 s in total;
-  5. drop the job. This step never waits on the pipe, so a child that stopped reading is killed on time.
+  3. end the input of every live child, the current one and each retired one: the writer thread writes what is
+     still queued, then closes the pipe (an idle child exits in 0.05–0.07 s [verified]);
+  4. wait up to 5 s in total, one grace shared by all of them;
+  5. drop the jobs. This step never waits on the pipe, so a child that stopped reading is killed on time. A call
+     whose child is gone returns at once, so the calls still running end within the grace too.
 
   This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
   straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:
@@ -783,6 +788,10 @@ later `thread/resume` then fails with `no rollout found for thread id <id>`. Cod
   counts against `--max-concurrent`, since Codex may still be generating it.
 - That thread's `thread/unsubscribe` is sent when its `turn/completed` arrives, not when the call returns:
   unsubscribing earlier would also stop the notification that frees the session.
+- `turn/completed` can arrive just as the call gives up, after its last look at its events but before it leaves
+  the session lingering. No second one would come, so the registry records a `turn/completed` whenever it routes
+  one, and a call giving up on a turn that has already completed frees the session at once and sends the
+  unsubscribe itself.
 - If the turn starts after the call gave up (its `turn/start` reply came too late), interrupt that turn as soon
   as its id is known. A late reply is dropped, but the `turn/started` notification that follows it names the
   turn [verified: smoke log]. The same holds for a cancel that arrives while `turn/start` is still unanswered.
@@ -1018,8 +1027,9 @@ trace. Each thread writes a `trace-*` folder holding `trace.jsonl` and the paylo
   `exec` is offered with `image_gen__imagegen` nested in it, and no shell, stdin, web-search, browser,
   computer-use, sub-agent (the `collaboration` namespace or its tool names), `request_user_input`, skill,
   tool-suggest or MCP tool is offered. `apply_patch`, `view_image`, `wait`, the clock tools and
-  `request_user_input_async` are listed as allowed (documented; see [Spawn](#spawn)), and anything else is flagged
-  for review.
+  `request_user_input_async` are listed as allowed (documented; see [Spawn](#spawn)), and anything else fails
+  V1 until it is classified. A model request whose payload is missing or cannot be parsed also fails V1, and the
+  tool-surface checks are then not run: the tools that request carried were never checked. V3 is still run.
 - V3: an image call is a `tool_call_started` event of kind `image_generation`. Its `referenced_image_paths` come
   from its invocation payload, or, if the trace has none, from the JavaScript of the `exec` cell that made it
   (the matching `code_cell_started` event's `source_js`, JavaScript string escapes decoded). Some call must list
