@@ -52,6 +52,31 @@ jobs:
         shell: pwsh
         run: '& ''.\dist\codex-imagegen.exe'' --version'
 
+      # Guards the failure contract the calling agent depends on: when the Codex CLI is
+      # missing, a generate call must fail loudly, with the stop-and-escalate block, rather
+      # than leave the agent free to make an image some other way. Spends no quota: the
+      # binary is never found, so nothing is started.
+      - name: Missing Codex CLI fails loudly
+        shell: pwsh
+        run: |
+          $lines = @(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"codex_imagegen_generate","arguments":{"prompt":"x"}}}'
+          )
+          $inFile = Join-Path $env:RUNNER_TEMP 'mcp-in.txt'
+          [System.IO.File]::WriteAllLines($inFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
+          $out = @(Get-Content $inFile | & '.\dist\codex-imagegen.exe' --codex-bin 'C:\nope\codex.exe' 2>$null)
+          if ($out.Count -ne 2) { throw "expected two responses, got $($out.Count): $($out -join ' | ')" }
+          $init = $out[0] | ConvertFrom-Json
+          if ($init.result.protocolVersion -ne '2025-11-25') { throw "expected protocol 2025-11-25, got: $($out[0])" }
+          $call = $out[1] | ConvertFrom-Json
+          if ($call.id -ne 2) { throw "expected the tools/call response, got: $($out[1])" }
+          if ($call.result.isError -ne $true) { throw 'expected isError=true' }
+          $text = $call.result.content[0].text
+          if ($text -notmatch 'CLI_NOT_FOUND') { throw "expected CLI_NOT_FOUND, got: $text" }
+          if ($text -notmatch 'ACTION REQUIRED') { throw 'expected the stop-and-escalate instruction' }
+          Write-Host 'failure contract holds'
+
       # Every run leaves a downloadable binary, so the executable is obtainable from any
       # commit without building locally.
       - name: Upload binary

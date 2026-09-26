@@ -1,7 +1,9 @@
 # codex-imagegen v1 design
 
 Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applied; cleanup added). M0 (repo
-scaffold) is in place; no server behaviour is implemented yet.
+scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
+and the CI contract check. `generate` and `refine` validate their arguments and run preflight, then return
+`INTERNAL_ERROR` until M2. V0, V7 and V8 are not yet run.
 
 Claims carry one of three tags:
 
@@ -391,9 +393,19 @@ Preflight runs **once per child instance**, and again after every spawn or respa
 3. **`model/list`** with `includeHidden: true`, following `nextCursor`. If the pinned model is absent:
    `MODEL_UNAVAILABLE`. If it is present but hidden, `status` notes it, since a hidden model is often being
    retired.
-4. **`config/read`.** If the active profile (`profiles.<name>.features`) re-disables `image_generation` or
-   re-enables any switched-off feature, the call fails with `IMAGEGEN_UNAVAILABLE`, naming the setting.
-   Profile features override `-c`.
+4. **`config/read`**, with `cwd` set to the work directory. The effective config must show every spawn switch
+   in effect: `features.image_generation` true, each switched-off feature false, `web_search`, `notify`,
+   `skills.*`, `approvals_reviewer` and `windows.sandbox` as set. A legacy alias of a switched-off feature
+   (`connectors`, `memory_tool`, `collab`, `codex_hooks`) must not be true. Anything else fails with
+   `IMAGEGEN_UNAVAILABLE`, naming the setting. Our switches outrank every layer except legacy managed config
+   (`managed_config.toml`) [verified: source, `config/src/config_layer_source.rs`]. So this catches that
+   layer, managed requirements, and a legacy alias in the user's config: `memory_tool = true` turned
+   `memories` back on despite `--disable memories` [verified: `config/read` on a test home], and `connectors`
+   is applied after `apps` [verified: source, `features/src/lib.rs` `apply_map`]. A `config/read` error also
+   fails with `IMAGEGEN_UNAVAILABLE`, quoting Codex. A legacy top-level `profile = "..."` key causes one
+   ("legacy `profile` config is no longer supported"), while the app-server logs "Invalid configuration;
+   using defaults" and keeps serving [verified: live]. Profiles never apply to `app-server`: 0.156.0 passes no
+   profile features, and profiles v2 need `--profile` [verified: source, `core/src/config/mod.rs`].
 5. **Version.** Taken from the child's `userAgent` and checked against the tested range.
 
 **When preflight fails.** The child is closed at once. It never ran a turn, so nothing is lost. The next call

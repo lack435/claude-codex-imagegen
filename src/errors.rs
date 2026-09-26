@@ -22,6 +22,8 @@
 use std::path::Path;
 
 /// Codes that stop the agent and send the user a remediation, exactly as the design's table.
+/// Rendering keys off [`AGENT_CORRECTABLE_CODES`] alone, so only the tests read this list.
+#[cfg(test)]
 pub const STOP_AND_ESCALATE_CODES: &[&str] = &[
     "CLI_NOT_FOUND",
     "SPAWN_FAILED",
@@ -301,21 +303,42 @@ pub fn imagegen_unavailable_capability() -> Failure {
     )
 }
 
-/// The active Codex profile overrides one of the feature switches codex-imagegen starts Codex
-/// with. Profile features take precedence over `-c`, so the switch cannot be forced back on.
-/// `setting` names it, for example `profiles.work.features.image_generation = false`.
+/// The effective Codex configuration does not show one of the switches codex-imagegen starts
+/// Codex with: managed configuration overrides it, or a legacy alias such as
+/// `features.connectors = true` re-enables a feature the child switches off. The switch cannot be
+/// forced back from here, so nothing is started. `setting` names what Codex reported, for example
+/// `features.image_generation = false`.
 pub fn imagegen_unavailable_setting(setting: &str) -> Failure {
     Failure::new(
         "IMAGEGEN_UNAVAILABLE",
         format!(
-            "Your Codex configuration's active profile sets `{setting}`, which overrides the \
-             settings codex-imagegen starts Codex with."
+            "Codex's effective configuration shows `{setting}`, overriding a setting \
+             codex-imagegen starts Codex with, so codex-imagegen will not run it."
         ),
-        format!(
-            "Remove `{setting}` from the profile in your Codex config.toml, or run codex-imagegen \
-             with --codex-home pointing at a dedicated Codex home. Then retry."
-        ),
+        "Remove that setting from your Codex config.toml (%USERPROFILE%\\.codex\\config.toml, or \
+         the file in CODEX_HOME), or run codex-imagegen with --codex-home pointing at a dedicated \
+         Codex home. If it comes from a managed Codex configuration (managed_config.toml, or \
+         requirements set by an administrator), whoever manages that has to change it. Then \
+         retry.",
     )
+}
+
+/// Codex could not resolve its own configuration (`config/read` answered with an error), so
+/// codex-imagegen cannot confirm that the child runs with the settings it was started with.
+/// codex-cli 0.156.0 answers this way for a legacy top-level `profile = "..."` key, while its
+/// app-server logs "Invalid configuration; using defaults" and keeps serving [verified]: a child
+/// whose settings cannot be confirmed must not run.
+pub fn codex_config_unreadable(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "IMAGEGEN_UNAVAILABLE",
+        "Codex reports that it cannot read its configuration, so codex-imagegen cannot confirm \
+         the settings it runs Codex with and will not run it.",
+        "Fix the problem Codex reports below in your Codex config.toml (%USERPROFILE%\\.codex\\\
+         config.toml, or the file in CODEX_HOME), or run codex-imagegen with --codex-home \
+         pointing at a dedicated Codex home. A legacy top-level `profile = \"...\"` line is a \
+         common cause: current Codex versions no longer accept it. Then retry.",
+    )
+    .with_detail(detail)
 }
 
 /// The pinned agent model is not in this Codex's `model/list`.
@@ -440,7 +463,8 @@ mod tests {
             not_chatgpt_account("apiKey", None),
             imagegen_unavailable_on_plan("free"),
             imagegen_unavailable_capability(),
-            imagegen_unavailable_setting("profiles.work.features.image_generation = false"),
+            imagegen_unavailable_setting("features.image_generation = false"),
+            codex_config_unreadable("legacy `profile = \"x\"` config is no longer supported"),
             model_unavailable("gpt-6-astra", ""),
             bad_request("'prompt' must not be empty."),
             internal_error("boom"),

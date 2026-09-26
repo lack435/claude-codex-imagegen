@@ -71,16 +71,8 @@ impl CallContext {
         &self.cancel
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
-    }
-
-    /// Report the phase the call is in; see [`Progress::set_phase`].
-    pub fn set_phase(&self, phase: &str) {
-        self.progress.set_phase(phase);
-    }
-
-    /// A handle to this call's progress that can be moved to another thread.
+    /// This call's progress: [`Progress::set_phase`] reports the phase it is in. A clone, so it
+    /// can be moved to another thread.
     pub fn progress(&self) -> Progress {
         self.progress.clone()
     }
@@ -776,7 +768,7 @@ mod tests {
                 "phases" => {
                     let pause = args["pause_ms"].as_u64().unwrap_or(0);
                     for phase in args["phases"].as_array().unwrap() {
-                        ctx.set_phase(phase.as_str().unwrap());
+                        ctx.progress().set_phase(phase.as_str().unwrap());
                         std::thread::sleep(Duration::from_millis(pause));
                     }
                     text_result("done", false)

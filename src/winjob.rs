@@ -27,6 +27,7 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 // JOBOBJECTINFOCLASS::JobObjectExtendedLimitInformation
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
 // JOBOBJECTINFOCLASS::JobObjectBasicAccountingInformation
+#[cfg(test)]
 const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: u32 = 1;
 // CreateProcess creation flag: start the primary thread suspended, so the process can be assigned
 // to the job before it runs anything.
@@ -73,7 +74,8 @@ struct ExtendedLimitInformation {
     peak_job_memory_used: usize,
 }
 
-// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION: only `active_processes` is read.
+// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION: only `active_processes` is read, and only by tests.
+#[cfg(test)]
 #[repr(C)]
 #[derive(Default)]
 struct BasicAccountingInformation {
@@ -108,6 +110,7 @@ extern "system" {
         info: *mut c_void,
         info_len: u32,
     ) -> i32;
+    #[cfg(test)]
     fn QueryInformationJobObject(
         job: Handle,
         info_class: u32,
@@ -213,7 +216,9 @@ impl JobObject {
         Ok(child)
     }
 
-    /// How many processes are still live in the job. `Err` if the job cannot be queried.
+    /// How many processes are still live in the job. `Err` if the job cannot be queried. Only
+    /// the tests ask: production relies on kill-on-close rather than counting.
+    #[cfg(test)]
     pub fn active_processes(&self) -> io::Result<u32> {
         let mut info = BasicAccountingInformation::default();
         let mut ret_len: u32 = 0;
