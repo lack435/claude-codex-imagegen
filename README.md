@@ -28,6 +28,7 @@ This runs the checks and tests, builds the release binary, and stages it at
 
 `.\smoke.ps1` then checks the staged binary against your real Codex CLI. On its own it runs only free
 steps; `.\smoke.ps1 -SpendQuota` also generates about two images, billed to your ChatGPT plan.
+`.\smoke.ps1 -CheckTrace <folder>` re-reads the Codex trace a paid run left behind, and spends nothing.
 
 ## Output files
 

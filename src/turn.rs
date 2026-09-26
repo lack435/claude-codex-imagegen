@@ -690,7 +690,7 @@ fn start_thread(call: &Call<'_>, rpc: &Rpc<'_>) -> Result<String, Failure> {
         if let Some(setting) = codex::overridden_switch(&config) {
             return Err(errors::imagegen_unavailable_setting(&setting));
         }
-        let params = codex::thread_start_params(call.cfg, &codex::mcp_off_map(&config));
+        let params = codex::thread_start_params(call.cfg, &codex::mcp_off_map(&config.config));
         match rpc.call_raw("thread/start", params) {
             Ok(reply) => {
                 return match reply

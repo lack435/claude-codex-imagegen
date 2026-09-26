@@ -19,8 +19,14 @@
   image tool's referenced_image_paths (V3), and the server's stderr for the savedPath Codex
   reported for each image (V1).
 
+  With -CheckTrace it runs only the V1 and V3 trace checks, against the trace folder of an earlier
+  run (its "trace" folder, or one trace-* folder in it). It starts nothing and spends nothing.
+
   Run it after .\build.ps1, when a change touches the protocol, spawning or turn handling. Tell
   the owner the cost before running it with -SpendQuota.
+
+.EXAMPLE
+  .\smoke.ps1 -CheckTrace $env:TEMP\codex-imagegen-smoke-<stamp>\trace -ReferencePath $env:TEMP\codex-imagegen-smoke-<stamp>\images\smoke-<stamp>-v1.png
 #>
 [CmdletBinding()]
 param(
@@ -29,7 +35,11 @@ param(
     # The server to test. Default: dist\codex-imagegen.exe next to this script.
     [string]$Exe,
     # Passed to the server as --codex-bin when given.
-    [string]$CodexBin
+    [string]$CodexBin,
+    # Offline: run only the V1 and V3 trace checks against this existing trace folder.
+    [string]$CheckTrace,
+    # With -CheckTrace: the reference image V3 looks for in referenced_image_paths.
+    [string]$ReferencePath
 )
 
 # Not 'Stop': failures are collected as checks and summarised at the end.
@@ -39,6 +49,8 @@ Set-StrictMode -Version 2.0
 # Resolved here rather than as the parameter's default: Windows PowerShell 5.1 leaves
 # $PSScriptRoot empty while it binds parameters.
 if (-not $Exe) { $Exe = Join-Path $PSScriptRoot 'dist\codex-imagegen.exe' }
+
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 
 $script:checks = New-Object System.Collections.Generic.List[object]
 function Add-Check([string]$Name, [string]$Outcome, [string]$Detail = '') {
@@ -51,6 +63,385 @@ function Add-Check([string]$Name, [string]$Outcome, [string]$Detail = '') {
 function Test-Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
     Add-Check $Name $(if ($Ok) { 'PASS' } else { 'FAIL' }) $Detail
 }
+
+# The summary, and the exit code: 1 when any check failed.
+function Complete-Smoke([string]$PassLabel, [string]$Footer = '', [string]$FailLabel = 'SMOKE FAIL') {
+    $failed = @($script:checks | Where-Object { $_.Outcome -eq 'FAIL' })
+    $manual = @($script:checks | Where-Object { $_.Outcome -eq 'MANUAL' })
+    Write-Host ''
+    Write-Host ("{0} checks: {1} passed, {2} failed, {3} to inspect by hand, {4} skipped" -f $script:checks.Count,
+        @($script:checks | Where-Object { $_.Outcome -eq 'PASS' }).Count, $failed.Count, $manual.Count,
+        @($script:checks | Where-Object { $_.Outcome -eq 'SKIP' }).Count)
+    if ($failed.Count -gt 0) {
+        Write-Host $FailLabel -ForegroundColor Red
+        foreach ($f in $failed) { Write-Host "  $($f.Name): $($f.Detail)" -ForegroundColor Red }
+        exit 1
+    }
+    Write-Host $PassLabel -ForegroundColor Green
+    if ($Footer) { Write-Host $Footer }
+    exit 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# Reading Codex's rollout trace (V1 and V3)
+# ---------------------------------------------------------------------------------------------
+#
+# Each thread writes <root>\trace-<trace id>-<thread id>\ with trace.jsonl (one event per line)
+# and payloads\<n>.json, which the events name by a path relative to that folder (codex-cli
+# 0.156.0, verified on a real trace):
+# - inference_started names the model request. A full request carries the tools in its first
+#   input item, {type: "additional_tools", tools: [...]}, as namespaces {type: "namespace", name,
+#   tools}; a follow-up request in the same turn has previous_response_id, carries only the new
+#   input (the multi-MB image result among it) and no tools. The tools code-mode `exec` can call
+#   are listed in exec's description as "### `name`" headings; the calls it shows as examples
+#   are not.
+# - tool_call_started with kind {type: "image_generation"} is an image call. Its
+#   invocation_payload holds {tool_name, tool_namespace, payload: {type: "function", arguments:
+#   "<JSON>"}}; the code_cell_started event of its runtime cell holds the JavaScript the agent
+#   ran (source_js). summary.input_preview is truncated, so it is never used.
+# - tool_call_ended and the code_cell_* responses name the tool results, which carry the image's
+#   base64 (about 4 MB each). They are never read.
+#
+# JSON is parsed with JavaScriptSerializer rather than ConvertFrom-Json: it takes a multi-MB
+# document in a fraction of a second, and a missing key reads as $null under Set-StrictMode.
+
+Add-Type -AssemblyName System.Web.Extensions
+$script:serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+$script:serializer.MaxJsonLength = [int]::MaxValue
+$script:serializer.RecursionLimit = 1000
+
+# Parsed JSON: dictionaries and object arrays.
+function ConvertFrom-JsonText([string]$Text) {
+    return , $script:serializer.DeserializeObject($Text)
+}
+
+# The value at $Path (a list of keys) under $Object, or $null where any step is missing.
+function Get-Field($Object, [string[]]$Path) {
+    foreach ($key in $Path) {
+        if ($Object -isnot [Collections.IDictionary]) { return $null }
+        $Object = $Object[$key]
+    }
+    return , $Object
+}
+
+function Get-TraceLogs([string]$Root) {
+    return @(Get-ChildItem -LiteralPath $Root -Recurse -Filter 'trace.jsonl' -File -ErrorAction SilentlyContinue | Sort-Object FullName)
+}
+
+# The trace events of the given types in one trace.jsonl, parsed, in order, one per pipeline
+# item. Other lines are skipped unparsed.
+function Get-TraceEvents($Log, [string[]]$Types) {
+    $pattern = '"type"\s*:\s*"(' + ($Types -join '|') + ')"'
+    foreach ($line in [IO.File]::ReadLines($Log.FullName, $utf8)) {
+        if ($line -notmatch $pattern) { continue }
+        $traceEvent = ConvertFrom-JsonText $line
+        if ($Types -contains [string](Get-Field $traceEvent 'payload', 'type')) { $traceEvent }
+    }
+}
+
+# One JavaScript string literal (quotes included) as the string it denotes.
+function ConvertFrom-JsString([string]$Literal) {
+    $body = $Literal.Substring(1, $Literal.Length - 2)
+    $decode = [Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $e = $m.Groups[1].Value
+        if ($e.StartsWith('u{')) { return [char]::ConvertFromUtf32([Convert]::ToInt32($e.Substring(2, $e.Length - 3), 16)) }
+        if ($e.Length -eq 5 -and $e.StartsWith('u')) { return [string][char][Convert]::ToInt32($e.Substring(1), 16) }
+        if ($e.Length -eq 3 -and $e.StartsWith('x')) { return [string][char][Convert]::ToInt32($e.Substring(1), 16) }
+        switch -CaseSensitive ($e) {
+            'n' { return "`n" }
+            'r' { return "`r" }
+            't' { return "`t" }
+            'b' { return [string][char]8 }
+            'f' { return [string][char]12 }
+            'v' { return [string][char]11 }
+            '0' { return [string][char]0 }
+            "`r`n" { return '' }
+            "`n" { return '' }
+            "`r" { return '' }
+        }
+        return $e
+    }
+    return [regex]::Replace($body, '\\(u\{[0-9A-Fa-f]+\}|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|\r\n|[\s\S])', $decode)
+}
+
+# The referenced_image_paths the agent's JavaScript passed, from every literal list in it.
+# Literal is $false when the source names referenced_image_paths without a literal list.
+function Get-JsReferencedPaths([string]$Source) {
+    $string = '"(?:[^"\\]|\\[\s\S])*"|''(?:[^''\\]|\\[\s\S])*''|`(?:[^`\\$]|\\[\s\S]|\$(?!\{))*`'
+    $list = '["'']?\breferenced_image_paths["'']?\s*:\s*\[\s*((?:(?:' + $string + ')\s*,\s*)*(?:' + $string + '))?\s*,?\s*\]'
+    $paths = @()
+    $lists = [regex]::Matches($Source, $list)
+    foreach ($m in $lists) {
+        foreach ($s in [regex]::Matches($m.Groups[1].Value, $string)) { $paths += ConvertFrom-JsString $s.Value }
+    }
+    $named = [regex]::Matches($Source, '\breferenced_image_paths\b').Count
+    return [pscustomobject]@{ Paths = $paths; Literal = ($named -eq $lists.Count) }
+}
+
+# Every tool offered to the agent model, across every model request in every trace folder under
+# $Root: top-level and namespaced tools, and the tools nested in code-mode exec.
+function Read-OfferedTools([string]$Root) {
+    $result = [pscustomobject]@{ Requests = 0; WithTools = 0; Incremental = 0; Tools = [ordered]@{}; Problems = @() }
+    foreach ($log in Get-TraceLogs $Root) {
+        foreach ($traceEvent in Get-TraceEvents $log @('inference_started')) {
+            $relative = Get-Field $traceEvent 'payload', 'request_payload', 'path'
+            if (-not $relative) { $result.Problems += "an inference_started event in $($log.Directory.Name) names no request payload"; continue }
+            $file = Join-Path $log.DirectoryName $relative
+            if (-not (Test-Path -LiteralPath $file)) { $result.Problems += "missing $file"; continue }
+            $result.Requests++
+            # A follow-up request is mostly the image's base64 and carries no tools: it is not
+            # parsed.
+            $text = [IO.File]::ReadAllText($file, $utf8)
+            if ($text.IndexOf('"additional_tools"', [StringComparison]::Ordinal) -lt 0 -and
+                $text.IndexOf('"tools"', [StringComparison]::Ordinal) -lt 0) {
+                $result.Incremental++
+                continue
+            }
+            $request = ConvertFrom-JsonText $text
+            $text = $null
+            $lists = @()
+            $top = Get-Field $request 'tools'
+            if ($top -is [Array]) { $lists += , $top }
+            $items = Get-Field $request 'input'
+            if ($items -is [Array]) {
+                foreach ($item in $items) {
+                    $tools = Get-Field $item 'tools'
+                    if ((Get-Field $item 'type') -eq 'additional_tools' -and $tools -is [Array]) { $lists += , $tools }
+                }
+            }
+            if ($lists.Count -eq 0) { $result.Incremental++; continue }
+            $result.WithTools++
+            foreach ($list in $lists) {
+                foreach ($tool in $list) {
+                    if ((Get-Field $tool 'type') -eq 'namespace') {
+                        $inner = Get-Field $tool 'tools'
+                        if ($inner -is [Array]) {
+                            foreach ($t in $inner) { Add-OfferedTool $result ([string](Get-Field $tool 'name')) $t }
+                        }
+                    }
+                    else {
+                        Add-OfferedTool $result '' $tool
+                    }
+                }
+            }
+        }
+    }
+    return $result
+}
+
+function Add-OfferedTool($Result, [string]$Namespace, $Tool) {
+    $name = [string](Get-Field $Tool 'name')
+    # A hosted tool such as {type: "web_search"} has no name.
+    if (-not $name) { $name = [string](Get-Field $Tool 'type') }
+    $key = if ($Namespace) { "$Namespace.$name" } else { $name }
+    if (-not $Result.Tools.Contains($key)) {
+        $Result.Tools[$key] = [pscustomobject]@{ Key = $key; Namespace = $Namespace; Name = $name; Nested = $false }
+    }
+    $description = Get-Field $Tool 'description'
+    if ($name -eq 'exec' -and $description -is [string]) {
+        foreach ($m in [regex]::Matches($description, '(?m)^###\s+`([^`]+)`')) {
+            $nestedName = $m.Groups[1].Value
+            $nestedKey = "exec > $nestedName"
+            if (-not $Result.Tools.Contains($nestedKey)) {
+                # A nested tool is named <namespace>__<name>, as in image_gen__imagegen.
+                $nestedNs = if ($nestedName -match '^(.+)__(.+)$') { $Matches[1] } else { '' }
+                $Result.Tools[$nestedKey] = [pscustomobject]@{ Key = $nestedKey; Namespace = $nestedNs; Name = $nestedName; Nested = $true }
+            }
+        }
+    }
+}
+
+# What V1 makes of one offered tool: Required, Allowed (with the reason it is documented as
+# harmless), Forbidden (with what it is), or Unclassified.
+function Get-ToolVerdict($Tool) {
+    $name = $Tool.Name
+    $bare = if ($Tool.Nested -and $name -match '^(.+)__(.+)$') { $Matches[2] } else { $name }
+    if (-not $Tool.Nested -and $name -eq 'exec') { return @('Required', 'code mode') }
+    if ($Tool.Nested -and $name -eq 'image_gen__imagegen') { return @('Required', 'the image tool') }
+    if ($Tool.Namespace -match '^(collaboration|multi_agent.*|agents?)$') { return @('Forbidden', 'sub-agent') }
+    if ($Tool.Namespace -match '^mcp(__|$)' -or $name -match '^mcp__') { return @('Forbidden', 'MCP server tool') }
+    if ($Tool.Nested) {
+        switch ($name) {
+            'apply_patch' { return @('Allowed', 'offered to every model while an environment exists; under the read-only sandbox and approvalPolicy never, Codex rejects every patch') }
+            'view_image' { return @('Allowed', 'reads an image into the model''s context; writes nothing') }
+            'clock__curr_time' { return @('Allowed', 'clock') }
+        }
+    }
+    else {
+        switch ($name) {
+            'wait' { return @('Allowed', 'code mode: waits on a yielded exec cell') }
+            'sleep' { return @('Allowed', 'clock') }
+            'request_user_input_async' { return @('Allowed', 'offered by the model catalogue, with no config switch in codex-cli 0.156.0; it records an agent message and returns at once, never waiting for an answer') }
+        }
+    }
+    $forbidden = '^(shell.*|.*_shell|exec_command|unified_exec.*|write_stdin|web_search.*|browser.*|computer.*|spawn_agent|send_message|send_input|wait_agent|list_agents|interrupt_agent|followup_task|resume_agent|close_agent|request_user_input.*|skill.*|tool_suggest.*|tool_search.*|request_plugin_install|list_available_plugins)$'
+    if ($bare -match $forbidden -or $name -match $forbidden) { return @('Forbidden', 'shell, stdin, web, browser, computer-use, sub-agent, user-input, skill or tool-suggest tool') }
+    return @('Unclassified', '')
+}
+
+# Every image call in every trace folder under $Root, with the referenced_image_paths it was
+# given: from its invocation payload when the trace has one, else from the JavaScript of the exec
+# cell that made it.
+function Read-ImageCalls([string]$Root) {
+    $calls = New-Object System.Collections.Generic.List[object]
+    foreach ($log in Get-TraceLogs $Root) {
+        $cells = @{}
+        foreach ($traceEvent in Get-TraceEvents $log @('code_cell_started', 'tool_call_started')) {
+            $payload = Get-Field $traceEvent 'payload'
+            if ((Get-Field $payload 'type') -eq 'code_cell_started') {
+                $cells[[string](Get-Field $payload 'runtime_cell_id')] = [string](Get-Field $payload 'source_js')
+                continue
+            }
+            if ((Get-Field $payload 'kind', 'type') -ne 'image_generation') { continue }
+            $call = [pscustomobject]@{ Folder = $log.Directory.Name; At = Get-Field $traceEvent 'wall_time_unix_ms'; Source = ''; Paths = @(); Known = $false }
+            $relative = Get-Field $payload 'invocation_payload', 'path'
+            if ($relative) {
+                $file = Join-Path $log.DirectoryName $relative
+                if (Test-Path -LiteralPath $file) {
+                    $invocation = ConvertFrom-JsonText ([IO.File]::ReadAllText($file, $utf8))
+                    $arguments = Get-Field $invocation 'payload', 'arguments'
+                    if ($arguments -is [string]) {
+                        $refs = Get-Field (ConvertFrom-JsonText $arguments) 'referenced_image_paths'
+                        $call.Paths = @($refs | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                        $call.Source = 'invocation payload'
+                        $call.Known = $true
+                    }
+                }
+            }
+            if (-not $call.Known) {
+                $cell = [string](Get-Field $payload 'requester', 'runtime_cell_id')
+                if ($cells.ContainsKey($cell)) {
+                    $found = Get-JsReferencedPaths $cells[$cell]
+                    $call.Paths = @($found.Paths)
+                    $call.Source = 'exec cell source'
+                    $call.Known = $found.Literal
+                }
+            }
+            $calls.Add($call)
+        }
+    }
+    return $calls.ToArray()
+}
+
+function Get-FullPathOrSelf([string]$Path) {
+    try { return [IO.Path]::GetFullPath($Path) } catch { return $Path }
+}
+
+# V1 and V3 from the trace under $TraceRoot. V3 looks for $Reference, when given, in the image
+# calls' referenced_image_paths. The lists are also written to $ReportPath, when given.
+function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$ReportPath) {
+    Write-Host '-> V1: tools offered to the agent model (rollout trace)'
+    $offered = $null
+    $calls = @()
+    $traceError = $null
+    try {
+        $offered = Read-OfferedTools $TraceRoot
+        $calls = @(Read-ImageCalls $TraceRoot)
+    }
+    catch {
+        $traceError = $_.Exception.Message
+    }
+    if ($traceError -or $null -eq $offered) {
+        Add-Check 'V1 and V3: the rollout trace is readable' 'MANUAL' "$traceError; inspect $TraceRoot by hand"
+        return
+    }
+
+    $byVerdict = @{ Required = @(); Allowed = @(); Forbidden = @(); Unclassified = @() }
+    foreach ($tool in $offered.Tools.Values) {
+        $verdict = Get-ToolVerdict $tool
+        $shown = if ($verdict[0] -eq 'Allowed') { "$($tool.Key) ($($verdict[1]))" } else { $tool.Key }
+        $byVerdict[$verdict[0]] += $shown
+    }
+    $top = @($offered.Tools.Values | Where-Object { -not $_.Nested } | ForEach-Object { $_.Key })
+    $nested = @($offered.Tools.Values | Where-Object { $_.Nested } | ForEach-Object { $_.Name })
+    $none = { param($list) if (@($list).Count) { @($list) -join ', ' } else { 'none' } }
+    $lines = @(
+        "model requests: $($offered.Requests) ($($offered.WithTools) with a tool list, $($offered.Incremental) follow-ups without one)",
+        "offered: $(& $none $top)",
+        "nested in exec: $(& $none $nested)",
+        "allowed (documented): $(& $none $byVerdict.Allowed)",
+        "forbidden: $(& $none $byVerdict.Forbidden)",
+        "unclassified: $(& $none $byVerdict.Unclassified)",
+        "image calls: $($calls.Count)"
+    )
+    foreach ($call in $calls) {
+        $paths = if ($call.Known) { "[$(@($call.Paths) -join ', ')]" } else { 'unknown (not a literal list)' }
+        $lines += "  $($call.Folder): referenced_image_paths $paths, from the $(if ($call.Source) { $call.Source } else { 'trace: none found' })"
+    }
+    foreach ($p in $offered.Problems) { $lines += "problem: $p" }
+    foreach ($l in $lines) { Write-Host "      $l" -ForegroundColor DarkGray }
+    if ($ReportPath) {
+        [IO.File]::WriteAllLines($ReportPath, [string[]]$lines, $utf8)
+        Write-Host "      saved to $ReportPath" -ForegroundColor DarkGray
+    }
+
+    if ($offered.WithTools -eq 0) {
+        Add-Check 'V1: tool list' 'MANUAL' "no model request with a tool list found under $TraceRoot; inspect it by hand"
+    }
+    else {
+        Test-Check 'V1: exec is offered' (@($offered.Tools.Values | Where-Object { -not $_.Nested -and $_.Name -eq 'exec' }).Count -gt 0) ''
+        Test-Check 'V1: image_gen__imagegen is nested in exec' ($nested -contains 'image_gen__imagegen') ''
+        Test-Check 'V1: no shell, stdin, web search, browser, computer-use, sub-agent, user-input, skill, tool-suggest or MCP tool' ($byVerdict.Forbidden.Count -eq 0) (& $none $byVerdict.Forbidden)
+        if ($byVerdict.Unclassified.Count -gt 0) {
+            Add-Check 'V1: every offered tool is classified' 'MANUAL' "review: $($byVerdict.Unclassified -join ', ')"
+        }
+        else {
+            Add-Check 'V1: every offered tool is classified' 'PASS'
+        }
+    }
+
+    Write-Host '-> V3: the reference image in the image call (rollout trace)'
+    $v3Name = 'V3: the reference reached the image tool''s referenced_image_paths'
+    if (-not $Reference) {
+        Add-Check $v3Name 'SKIP' 'no reference image to look for'
+        return
+    }
+    # Only a call made after the reference existed can name it. Text Codex sent to the model
+    # never counts: the developer instructions, the tool's declaration and the tagged input name
+    # both the parameter and the path whatever the agent does.
+    $wanted = Get-FullPathOrSelf $Reference
+    $hits = @($calls | Where-Object { @($_.Paths | ForEach-Object { Get-FullPathOrSelf $_ }) -contains $wanted })
+    if ($hits.Count -gt 0) {
+        Add-Check $v3Name 'PASS' "$wanted (from the $($hits[0].Source) of the image call in $($hits[0].Folder))"
+    }
+    elseif ($calls.Count -gt 0 -and @($calls | Where-Object { -not $_.Known }).Count -eq 0) {
+        Test-Check $v3Name $false "no image call listed $wanted; see the image calls above"
+    }
+    else {
+        Add-Check $v3Name 'MANUAL' "$($calls.Count) image call(s) found, not every one readable; inspect $TraceRoot by hand"
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Offline mode: the trace checks only
+# ---------------------------------------------------------------------------------------------
+
+if ($CheckTrace) {
+    if ($SpendQuota) {
+        Write-Host '-CheckTrace reads an existing trace and cannot be combined with -SpendQuota.' -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ''
+    Write-Host 'codex-imagegen smoke test: offline trace check. Nothing is started and nothing is spent.'
+    Write-Host "Trace: $CheckTrace"
+    if ($ReferencePath) { Write-Host "Reference image: $ReferencePath" }
+    Write-Host ''
+    if (-not (Test-Path -LiteralPath $CheckTrace -PathType Container)) {
+        Write-Host "Not a folder: $CheckTrace" -ForegroundColor Red
+        exit 1
+    }
+    if (@(Get-TraceLogs $CheckTrace).Count -eq 0) {
+        Write-Host "No trace.jsonl under $CheckTrace" -ForegroundColor Red
+        exit 1
+    }
+    Invoke-TraceChecks $CheckTrace $ReferencePath ''
+    Complete-Smoke 'TRACE CHECK PASS' '' 'TRACE CHECK FAIL'
+}
+
+# ---------------------------------------------------------------------------------------------
+# The live run
+# ---------------------------------------------------------------------------------------------
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $work = Join-Path ([IO.Path]::GetTempPath()) "codex-imagegen-smoke-$stamp"
@@ -88,7 +479,6 @@ $psi.RedirectStandardInput = $true
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.CreateNoWindow = $true
-$utf8 = New-Object System.Text.UTF8Encoding($false)
 $psi.StandardOutputEncoding = $utf8
 $psi.StandardErrorEncoding = $utf8
 if ($SpendQuota) {
@@ -365,91 +755,8 @@ else {
 # V1 and V3, from Codex's rollout trace and the server's stderr
 # ---------------------------------------------------------------------------------------------
 
-# Whether $Object has a property called $Name (Set-StrictMode makes reading a missing one an error).
-function Test-Property($Object, [string]$Name) {
-    return ($null -ne $Object) -and ($Object.PSObject.Properties.Name -contains $Name)
-}
-
 if ($SpendQuota) {
-    Write-Host '-> V1: tools offered to the agent model (rollout trace)'
-    # Each thread writes <root>\trace-<uuid>-<thread>\trace.jsonl, one event per line, each naming
-    # its payload files by a path relative to that folder (codex-rs rollout-trace at rust-v0.156.0,
-    # raw_event.rs and payload.rs):
-    # - inference_started names the Responses request, whose `tools` list is what the model saw.
-    #   Nested tools reachable from code-mode `exec` are listed in its description as "### `name`"
-    #   headings (code-mode-protocol description.rs).
-    # - tool_call_started names the invocation of each tool Codex ran, nested calls from `exec`
-    #   included: {tool_name, tool_namespace, payload: {type: "function", arguments: "<JSON>"}}
-    #   (tool_dispatch.rs). The image tool's is how V3 is checked.
-    $topLevel = New-Object System.Collections.Generic.HashSet[string]
-    $nested = New-Object System.Collections.Generic.HashSet[string]
-    $requests = 0
-    $imageCalls = @()
-    $traceError = $null
-    try {
-        foreach ($log in @(Get-ChildItem -LiteralPath $traceRoot -Recurse -Filter 'trace.jsonl' -ErrorAction SilentlyContinue)) {
-            foreach ($line in [IO.File]::ReadAllLines($log.FullName, $utf8)) {
-                if ($line -notmatch '"(inference_started|tool_call_started)"') { continue }
-                $traceEvent = ConvertFrom-Json -InputObject $line
-                if ($traceEvent.payload.type -eq 'inference_started') {
-                    $payloadPath = Join-Path $log.DirectoryName $traceEvent.payload.request_payload.path
-                    if (-not (Test-Path -LiteralPath $payloadPath)) { continue }
-                    $request = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($payloadPath, $utf8))
-                    $requests++
-                    foreach ($tool in @($request.tools)) {
-                        $toolName = if (Test-Property $tool 'name') { $tool.name } else { $tool.type }
-                        [void]$topLevel.Add($toolName)
-                        if (Test-Property $tool 'tools') {
-                            foreach ($inner in @($tool.tools)) { [void]$nested.Add("$toolName.$($inner.name)") }
-                        }
-                        if ($toolName -eq 'exec' -and (Test-Property $tool 'description')) {
-                            foreach ($m in [regex]::Matches($tool.description, '(?m)^### `([^`]+)`')) {
-                                [void]$nested.Add($m.Groups[1].Value)
-                            }
-                        }
-                    }
-                }
-                elseif ($traceEvent.payload.type -eq 'tool_call_started') {
-                    $ref = if (Test-Property $traceEvent.payload 'invocation_payload') { $traceEvent.payload.invocation_payload } else { $null }
-                    if ($null -eq $ref) { continue }
-                    $invocationPath = Join-Path $log.DirectoryName $ref.path
-                    if (-not (Test-Path -LiteralPath $invocationPath)) { continue }
-                    $invocation = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($invocationPath, $utf8))
-                    # Matched on the tool's name alone, so a change of namespace does not hide it.
-                    if ($invocation.tool_name -ne 'imagegen' -or -not (Test-Property $invocation.payload 'arguments')) { continue }
-                    $arguments = ConvertFrom-Json -InputObject $invocation.payload.arguments
-                    $paths = @()
-                    if (Test-Property $arguments 'referenced_image_paths') {
-                        $paths = @($arguments.referenced_image_paths | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
-                    }
-                    $imageCalls += [pscustomobject]@{ At = [long]$traceEvent.wall_time_unix_ms; Paths = $paths }
-                }
-            }
-        }
-    }
-    catch {
-        $traceError = $_.Exception.Message
-    }
-    $toolReport = Join-Path $work 'v1-tools.txt'
-    $reportLines = @("requests inspected: $requests", "top-level tools: $(@($topLevel) -join ', ')", "nested tools: $(@($nested) -join ', ')",
-        "image tool calls: $($imageCalls.Count)")
-    foreach ($call in $imageCalls) { $reportLines += "  referenced_image_paths: [$(@($call.Paths) -join ', ')]" }
-    [IO.File]::WriteAllLines($toolReport, $reportLines, $utf8)
-    foreach ($l in $reportLines) { Write-Host "      $l" -ForegroundColor DarkGray }
-    if ($traceError) {
-        Add-Check 'V1: the rollout trace is readable' 'MANUAL' "$traceError; inspect $traceRoot by hand"
-    }
-    if ($requests -eq 0) {
-        Add-Check 'V1: tool list' 'MANUAL' "no inference request found in the trace under $traceRoot; inspect it by hand"
-    }
-    else {
-        Test-Check 'V1: exec is offered' ($topLevel.Contains('exec')) ''
-        Test-Check 'V1: the image tool is nested in exec' (@($nested | Where-Object { $_ -match 'imagegen' }).Count -gt 0) ''
-        $forbidden = 'shell|exec_command|write_stdin|web_search|browser|computer|spawn_agent|send_input|wait_agent|close_agent|resume_agent|followup_task|send_message|list_agents|interrupt_agent|skill|tool_suggest|request_plugin_install|list_available_plugins'
-        $offending = @(@($topLevel) + @($nested) | Where-Object { $_ -match $forbidden })
-        Test-Check 'V1: no shell, stdin, web search, browser, computer-use, multi-agent, skill or tool-suggest tool' ($offending.Count -eq 0) ($offending -join ', ')
-        Write-Host "      full list saved to $toolReport" -ForegroundColor DarkGray
-    }
+    Invoke-TraceChecks $traceRoot $v1 (Join-Path $work 'v1-tools.txt')
 
     # V1's last part: Codex reports savedPath. The result reads the same when the server falls
     # back to the image's base64, so the server logs where each image came from (turn.rs,
@@ -477,25 +784,6 @@ if ($SpendQuota) {
             Test-Check "V1: Codex reported savedPath for $session, and $session-v1.png is a byte copy of it" $same $savedPath
         }
     }
-
-    # V3's first half: the reference reached the image tool's referenced_image_paths, as Codex
-    # recorded the call. Never judged from text Codex sent to the model: the developer instructions,
-    # the tool's declaration and the tagged input already name both the parameter and the path.
-    if ($v1) {
-        $v3Name = 'V3: the reference reached the image tool''s referenced_image_paths'
-        $v1Full = [IO.Path]::GetFullPath($v1)
-        # Only the second thread's call can name the first image's copy: it did not exist before.
-        if (@($imageCalls | Where-Object { $_.Paths -contains $v1Full }).Count -gt 0) {
-            Add-Check $v3Name 'PASS' $v1Full
-        }
-        elseif ($imageCalls.Count -ge 2) {
-            $last = @($imageCalls | Sort-Object At)[-1]
-            Test-Check $v3Name $false "the last image call had referenced_image_paths: [$(@($last.Paths) -join ', ')]"
-        }
-        else {
-            Add-Check $v3Name 'MANUAL' "$($imageCalls.Count) image tool call(s) found in the trace; inspect $traceRoot by hand"
-        }
-    }
     Write-Host "      the trace holds prompts and tool I/O; delete $traceRoot when done" -ForegroundColor DarkGray
 }
 
@@ -503,17 +791,7 @@ if ($SpendQuota) {
 # Summary
 # ---------------------------------------------------------------------------------------------
 
-$failed = @($script:checks | Where-Object { $_.Outcome -eq 'FAIL' })
-$manual = @($script:checks | Where-Object { $_.Outcome -eq 'MANUAL' })
-Write-Host ''
-Write-Host ("{0} checks: {1} passed, {2} failed, {3} to inspect by hand, {4} skipped" -f $script:checks.Count,
-    @($script:checks | Where-Object { $_.Outcome -eq 'PASS' }).Count, $failed.Count, $manual.Count,
-    @($script:checks | Where-Object { $_.Outcome -eq 'SKIP' }).Count)
-if ($failed.Count -gt 0) {
-    Write-Host 'SMOKE FAIL' -ForegroundColor Red
-    foreach ($f in $failed) { Write-Host "  $($f.Name): $($f.Detail)" -ForegroundColor Red }
-    exit 1
+if ($SpendQuota) {
+    Complete-Smoke 'SMOKE PASS' "Images: $outDir"
 }
-Write-Host $(if ($SpendQuota) { 'SMOKE PASS' } else { 'SMOKE PASS (free steps only)' }) -ForegroundColor Green
-if ($SpendQuota) { Write-Host "Images: $outDir" }
-exit 0
+Complete-Smoke 'SMOKE PASS (free steps only)'

@@ -7,8 +7,10 @@ each image, progress, cancellation and deadlines, errors), `status` lists runnin
 first version. M2 has no session store or leases (M3), so `generate` does not yet refuse an existing name with
 `SESSION_EXISTS`, and `refine` still validates its arguments, runs preflight and returns `INTERNAL_ERROR`. Not
 built yet either: recycling the shared child after a missed per-request deadline (see Deadlines). The
-unit tests use a scripted fake app-server; `smoke.ps1`'s paid steps were exercised only against a throwaway fake
-app-server, not yet against real Codex, so V0, V1, V2 and V3 are still to run.
+unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
+V2 (the generate part) and V3. Its trace also showed the sub-agent and `request_user_input` tools still offered to
+the agent model, which the spawn line now switches off, so V1 is re-checked on the next paid run. V0 is still to
+run.
 
 Claims carry one of three tags:
 
@@ -369,20 +371,47 @@ server.
 codex app-server --listen stdio://
   --enable image_generation
   --disable apps --disable plugins --disable hooks --disable memories --disable multi_agent
-  --disable goals --disable shell_tool --disable tool_suggest --disable skill_search
-  --disable browser_use --disable computer_use --disable in_app_browser
+  --disable multi_agent_v2 --disable goals --disable shell_tool --disable tool_suggest
+  --disable skill_search --disable browser_use --disable computer_use --disable in_app_browser
   -c notify=[] -c skills.bundled.enabled=false -c skills.include_instructions=false
+  -c agents.enabled=false -c tools.experimental_request_user_input.enabled=false
   -c web_search="disabled" -c approvals_reviewer="user" -c windows.sandbox="unelevated"
   -c thread_unload_delay_secs=5
 ```
 
 **What has been checked.**
 
-- Every switch was accepted and shows up in `config/read` [verified].
+- Every switch was accepted, and `config/read` shows it in effect [verified]. One is shown differently:
+  `config/read`'s `config` carries only `web_search` under `tools` (app-server-protocol `ToolsV2`), so
+  `tools.experimental_request_user_input.enabled` appears only in the reply's `origins`, as taken from the
+  session-flags layer, which holds our `-c` [verified: `config/read` on 0.156.0; source].
 - For apps, plugins, bundled skills, notify and MCP servers, the effect also shows in `skills/list`,
   `plugin/list` and `mcpServerStatus/list` [verified].
-- For the rest, and for the image tool still being offered through `exec` under these switches, the effect is
-  known from source only [assumed: V1].
+- The first paid smoke run (2026-09-25, before the three switches below were added) recorded the tools the
+  agent model was offered [verified: rollout trace]:
+  - `exec`, with `apply_patch`, `view_image`, `clock__curr_time` and `image_gen__imagegen` nested in it;
+  - `wait` (code mode's wait on a running `exec` cell), `request_user_input` and `request_user_input_async`;
+  - `sleep`, in a `clock` namespace;
+  - six sub-agent tools in a `collaboration` namespace: `spawn_agent`, `send_message`, `followup_task`,
+    `wait_agent`, `list_agents` and `interrupt_agent`;
+  - no shell, stdin, web search, browser, computer-use, skill, tool-suggest or MCP tool.
+- **Sub-agent tools.** `--disable multi_agent` does not remove them. The model catalogue gives `gpt-6-astra`
+  MultiAgentV2, which applies unless `agents.enabled = false`, and an enabled `multi_agent_v2` feature
+  outranks even that [verified: source, `core/src/config/mod.rs` `multi_agent_version_override`]. So both are
+  switched off: under `agents.enabled=false` alone, a user's `[features.multi_agent_v2] enabled = true` stayed
+  in effect, and `--disable multi_agent_v2` turned it off [verified: `config/read` on a test home].
+- **`request_user_input`** is offered unless `tools.experimental_request_user_input.enabled = false`
+  [verified: source, `core/src/config/mod.rs`, `core/src/tools/spec_plan.rs`].
+- **`request_user_input_async` stays.** It is offered because the catalogue lists `send_user_message_async` for
+  `gpt-6-astra`, and no config switch removes it. It only records an agent message holding the questions and
+  returns at once; it never waits for an answer and sends no request to this server [verified: source,
+  `core/src/tools/handlers/request_user_input_async.rs`] [decided: accepted].
+- **`apply_patch` stays.** It is nested in `exec` for every model while the thread has an environment, and the
+  environment cannot go without breaking `referenced_image_paths`. Under the read-only sandbox with
+  `approvalPolicy: never`, Codex rejects every patch [verified: source, `core/src/safety.rs`] [decided: accepted].
+  `view_image` and the clock tools are harmless and allowed.
+- That the sub-agent and `request_user_input` tools are gone from the offered list under the new switches is
+  known from source and `config/read` only [assumed: V1].
 - `--enable image_generation` guards against a user config that turns the tool off.
 
 **Environment.**
@@ -421,8 +450,11 @@ Preflight runs **once per child instance**, and again after every spawn or respa
    `MODEL_UNAVAILABLE`. If it is present but hidden, `status` notes it, since a hidden model is often being
    retired.
 4. **`config/read`**, with `cwd` set to the work directory. The effective config must show every spawn switch
-   in effect: `features.image_generation` true, each switched-off feature false, `web_search`, `notify`,
-   `skills.*`, `approvals_reviewer` and `windows.sandbox` as set. A legacy alias of a switched-off feature
+   in effect: `features.image_generation` true, each switched-off feature false (a feature that also takes
+   settings may read as a table, which counts when its `enabled` is false [verified: `config/read`]),
+   `web_search`, `notify`, `skills.*`, `agents.enabled`, `approvals_reviewer` and `windows.sandbox` as set.
+   `tools.experimental_request_user_input.enabled`, which `config` leaves out, must have the session-flags
+   layer (our `-c`) as its entry in the reply's `origins`. A legacy alias of a switched-off feature
    (`connectors`, `memory_tool`, `collab`, `codex_hooks`) must not be true. Anything else fails with
    `IMAGEGEN_UNAVAILABLE`, naming the setting. Our switches outrank every layer except legacy managed config
    (`managed_config.toml`) [verified: source, `config/src/config_layer_source.rs`]. So this catches that
@@ -813,8 +845,11 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
 
 - **Commands.** Codex runs with a read-only sandbox, `approvalPolicy: never` and the shell tool disabled. Its
   only code execution is the code-mode `exec` isolate: V8 with no Node, no filesystem and no network, able
-  only to call the nested tools that remain [verified: source]. The hardened tool list is confirmed in V1.
-  Nothing asks the user for approval.
+  only to call the nested tools that remain [verified: source]. `apply_patch` is among them, offered to every
+  model, but the read-only sandbox with `approvalPolicy: never` refuses every write it attempts [verified:
+  trace + source]. The sub-agent and `request_user_input` tools are switched off (see [Spawn](#spawn)); that
+  they are gone from the offered list is re-checked in V1. `request_user_input_async` remains and cannot wait
+  for an answer. Nothing asks the user for approval.
 - **Reads.** Codex can read any file the user can: the image tool reads referenced paths. `reference_images`
   are checked for an image signature first.
 - **Writes.** The only writes to disk are the image tool's, into `<CODEX_HOME>\generated_images`, and this
@@ -828,6 +863,7 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   - MCP servers, rebuilt per thread and guarded by the canary
   - `notify`
   - web search
+  - sub-agents and `request_user_input`
   - the auto-review subagent
 - **Dedicated home (`--codex-home <dir>`).** One-time setup: `CODEX_HOME=<dir> codex login --device-auth`.
   - It avoids everything under `~/.codex`: config, `AGENTS.md`, MCP servers, plugins, user skills.
@@ -971,13 +1007,28 @@ that image as a reference (V3), each checked for an `image/jpeg` preview of 512,
 edge of 1024 px or less, and the `<session>-v1.png` file. V2 is compared by the script itself: the `codex prompt`
 line, JSON-decoded, must equal the prompt sent (whitespace at either end aside), and the server must raise no
 prompt warning. It runs the server with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and reads the
-trace:
+trace. Each thread writes a `trace-*` folder holding `trace.jsonl` and the payload files its events name
+[verified: real trace, 0.156.0]:
 
-- V1: the offered tools, from each recorded Responses request's `tools`, plus the nested tools listed as
-  headings in `exec`'s description;
-- V3: the image tool's recorded invocation (a `tool_call_started` event's payload) must list the first image in
-  `referenced_image_paths`. Text Codex sent to the model never counts: the developer instructions, the tool's
-  declaration and the tagged input name both the parameter and the path whatever the agent does.
+- V1: the offered tools, from every model request in every trace folder. A full request carries them in its
+  first input item (`additional_tools`), grouped in namespaces; a follow-up request in the same turn carries only
+  the new input, the image's multi-MB result among it, and no tools, so it is not parsed. The tools nested in
+  `exec` are the "### `name`" headings in its description, not the calls it shows as examples. V1 passes when
+  `exec` is offered with `image_gen__imagegen` nested in it, and no shell, stdin, web-search, browser,
+  computer-use, sub-agent (the `collaboration` namespace or its tool names), `request_user_input`, skill,
+  tool-suggest or MCP tool is offered. `apply_patch`, `view_image`, `wait`, the clock tools and
+  `request_user_input_async` are listed as allowed (documented; see [Spawn](#spawn)), and anything else is flagged
+  for review.
+- V3: an image call is a `tool_call_started` event of kind `image_generation`. Its `referenced_image_paths` come
+  from its invocation payload, or, if the trace has none, from the JavaScript of the `exec` cell that made it
+  (the matching `code_cell_started` event's `source_js`, JavaScript string escapes decoded). Some call must list
+  the first image (full path, compared case-insensitively). The event's `input_preview` is truncated and never
+  used. Text Codex sent to the model never counts: the developer instructions, the tool's declaration and the
+  tagged input name both the parameter and the path whatever the agent does.
+- The tool results, which carry each image's base64, are never read.
+
+`smoke.ps1 -CheckTrace <trace folder> [-ReferencePath <png>]` runs only these two checks against the trace of an
+earlier run. It starts nothing and spends nothing.
 
 V1's `savedPath` comes from the server's stderr: each image must have logged its `savedPath`, under
 `<CODEX_HOME>\generated_images`, byte-identical to the published copy, and none may have fallen back to the
@@ -1014,9 +1065,9 @@ Each item must pass before the code that depends on it is considered done.
 | V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
-| V1 | The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, multi-agent, skill and tool-suggest tools. The item is reported and `savedPath` is populated. | 1 image (part of smoke) | M2 |
-| V2 | Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. | part of smoke | M2 |
-| V3 | `reference_images` on generate reach `referenced_image_paths` and influence the output. | 1 image | M2 |
+| V1 | **Partially run 2026-09-25.** The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill and tool-suggest tools. The item is reported and `savedPath` is populated. The first paid run's trace showed `exec` with the nested image tool, `savedPath` populated and byte-identical to the published copies, and no shell, stdin, web-search, browser, computer-use, skill or tool-suggest tool, but also the sub-agent and `request_user_input` tools (see [Spawn](#spawn)). The re-check after switching them off is pending the next paid run. | 1 image (part of smoke) | M2 |
+| V2 | **Passed 2026-09-25 for generate.** Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. The generate prompt with quotes, a backslash, a newline and non-ASCII text came back verbatim. The refine part is pending M3. | part of smoke | M2 |
+| V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
 | V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
 | V5 | With `--codex-home` pointing at a dedicated home, images land under that home. | 1 image, plus a one-time login by the owner | M4 |
 | V9 | Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeed. | 2 images | M3 |
