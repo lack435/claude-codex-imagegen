@@ -1357,6 +1357,7 @@ fn success(
         (call.usage)()
     ));
     lines.push(scratch_line(call.cfg.session_ttl_days));
+    lines.push(SHOW_USER_LINE.to_string());
     // Several images can each owe the same warning; it is said once.
     let mut said = std::collections::HashSet::new();
     warnings.retain(|w| said.insert(w.clone()));
@@ -1587,6 +1588,12 @@ fn same_prompt(revised: &str, sent: &str) -> bool {
     revised.trim() == sent.trim()
 }
 
+/// Every success tells the agent to show the image. Many clients fold tool results away (the Claude
+/// desktop app shows the preview only inside the collapsed tool row [verified: owner, 2026-09-25]),
+/// so the preview is often seen by the agent alone [decided].
+const SHOW_USER_LINE: &str = "the user may not see this tool result: show them the image, by \
+     displaying or sending the file if you have a tool for that, otherwise by giving them its path";
+
 /// The scratch-space line every success carries (docs/design.md, "Output files").
 fn scratch_line(ttl_days: u32) -> String {
     match ttl_days {
@@ -1784,6 +1791,7 @@ mod tests {
         );
         assert!(scratch_line(1).contains("after 1 day idle"));
         assert!(!scratch_line(0).contains("expire"));
+        assert!(SHOW_USER_LINE.starts_with("the user may not see this tool result"));
     }
 }
 
@@ -1975,7 +1983,7 @@ mod generate_tests {
 
         let text = content[1]["text"].as_str().unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 7, "{text}");
+        assert_eq!(lines.len(), 8, "{text}");
         assert_eq!(lines[0], "session: fox   version: 1");
         assert_eq!(
             lines[1],
@@ -2007,6 +2015,7 @@ mod generate_tests {
             lines[6],
             "output files are scratch and expire after 7 days idle; move keepers into the project"
         );
+        assert_eq!(lines[7], SHOW_USER_LINE);
         assert!(!text.contains("warning:"), "{text}");
 
         assert_eq!(

@@ -1027,6 +1027,8 @@ impl ToolHost for App {
              anything or using quota.\n\n\
              Each image comes back as a 1024px preview plus the absolute path of the \
              full-resolution PNG. A generation takes about a minute. {}\n\n\
+             The user often cannot see tool results, so show them each image: display or send \
+             the file if you have a tool for that, otherwise give them its path.\n\n\
              If a call fails, no image was produced: relay the remediation in the result to the \
              user and stop the image task. Never substitute an image made another way (SVG, \
              ASCII art, HTML or CSS, code that draws one, or another image tool), and never say \

@@ -264,7 +264,8 @@ content: [
      "codex prompt: <revisedPrompt>\n" +
      "codex note: <Codex's closing line, quoted, untrusted>\n" +
      "took 38.1 s; Codex agent usage: weekly 44% (resets 2026-10-01 14:17)\n" +
-     "output files are scratch and expire after 7 days idle; move keepers into the project"}
+     "output files are scratch and expire after 7 days idle; move keepers into the project\n" +
+     "the user may not see this tool result: show them the image, by displaying or sending the file if you have a tool for that, otherwise by giving them its path"}
 ]
 ```
 
@@ -279,6 +280,11 @@ Formatting details [decided]:
 - If Codex makes several images in one turn, each gets its own version and preview, in order; the first line
   reads `versions: 1, 2`, each image line is labelled `image 1 of 2:`, and a warning says so.
 - If the copy failed, the first line reads `version: none published (see the warnings)`.
+
+Every success ends with a line telling the agent to show the user the image, by displaying or sending the file if
+it has a tool for that, otherwise by giving its path, and the `initialize` instructions say the same [decided].
+Many clients fold tool results away: in the Claude desktop app the preview appears only inside the collapsed
+tool row [verified: owner, 2026-09-25], so the preview is often seen by the agent alone.
 
 A result returns success whenever at least one image completed, whatever happened afterwards [decided].
 Anything unusual is added as a `warning:` line:
