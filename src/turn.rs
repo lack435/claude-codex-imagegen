@@ -9,10 +9,11 @@
 //!   the registry asks for (an interrupt that just came due, the unsubscribe of a lingering turn)
 //!   is only queued.
 //! - [`generate`] runs on the call's own thread: `config/read` and `thread/start`, `turn/start`,
-//!   then each event as it arrives. A completed image is copied into the output folder and
-//!   previewed at once, not at the end of the turn, so a turn that is interrupted, times out or
-//!   fails afterwards still keeps it. When the turn ends, however it ends, the thread is
-//!   unsubscribed and the result is built from whatever images completed.
+//!   then each event as it arrives. A completed image is copied into the output folder, previewed
+//!   and recorded in its session at once, not at the end of the turn, so a turn that is
+//!   interrupted, times out or fails afterwards still keeps it, and `status` and a later refine
+//!   see it. When the turn ends, however it ends, the thread is unsubscribed and the result is
+//!   built from whatever images completed.
 //!
 //! The one rule that deserves care (AGENTS.md): an image that completed is never reported as a
 //! failure. Whatever happens after it -- an interrupt, a timeout, a failed copy, a failed preview, a
@@ -41,6 +42,7 @@ use crate::mcp::Progress;
 use crate::output;
 use crate::preview::{self, Preview};
 use crate::registry::{ChildRef, FollowUp, Interrupt, Registry, TurnEvent, TurnSlot};
+use crate::session::{ImageOutcome, SessionWriter};
 
 /// How long a call waits for `turn/completed` after interrupting its turn, before it returns and
 /// leaves the session lingering (docs/design.md, "After `turn/interrupt`").
@@ -480,10 +482,16 @@ pub struct Call<'a> {
 
 /// A validated generate request, with its output folder already pre-checked.
 pub struct Request<'a> {
+    /// The session's name as it names files: as it was first spelled.
     pub session: &'a str,
     pub prompt: &'a str,
     pub reference_images: &'a [PathBuf],
     pub output_dir: &'a Path,
+    /// The version the first image is published as: the session record's `next_version`, 1 for a
+    /// new session. A taken name bumps it (docs/design.md, "File names").
+    pub first_version: u32,
+    /// Records each image in the session store as it completes.
+    pub record: &'a SessionWriter,
 }
 
 /// A finished call: the success result, or the failure still unrendered (the tool layer reports a
@@ -537,6 +545,8 @@ struct Delivered {
 /// Everything the turn produced.
 #[derive(Default)]
 struct Turn {
+    /// The Codex thread the turn runs on, recorded with each image.
+    thread_id: String,
     images: Vec<Delivered>,
     failures: Vec<ItemFailure>,
     /// The last line of the last agent message.
@@ -591,7 +601,8 @@ pub fn generate(call: &Call<'_>, slot: TurnSlot<Event>, request: &Request<'_>) -
     }
 
     let mut turn = Turn {
-        next_version: 1,
+        thread_id: thread_id.clone(),
+        next_version: request.first_version,
         ..Turn::default()
     };
     // The canary usually arrives right behind thread/start's reply [verified: smoke log]. Caught
@@ -901,6 +912,16 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
                  Codex's own copy",
                 request.output_dir.display()
             ));
+            record_image(
+                turn,
+                request,
+                &ImageOutcome {
+                    version: None,
+                    output_path: None,
+                    saved_path: Some(path),
+                    bytes: None,
+                },
+            );
             turn.images.push(Delivered {
                 version: None,
                 path: Some(path.clone()),
@@ -972,6 +993,17 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
         .as_ref()
         .map(|p| (p.source_width, p.source_height))
         .or_else(|| preview::png_dimensions(&bytes));
+    record_image(
+        turn,
+        request,
+        &ImageOutcome {
+            version,
+            // `path` falls back to Codex's copy when the copy failed; only ours is an output.
+            output_path: version.and(path.as_deref()),
+            saved_path: image.saved_path.as_deref(),
+            bytes: Some(bytes.len() as u64),
+        },
+    );
     turn.images.push(Delivered {
         version,
         path,
@@ -980,6 +1012,22 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
         preview,
         revised_prompt: image.revised_prompt,
     });
+}
+
+/// Record a delivered image in the session store, at once. A write that fails is a warning: the
+/// image completed and was delivered, and only a later refine is affected (docs/design.md,
+/// "Success result").
+fn record_image(turn: &mut Turn, request: &Request<'_>, image: &ImageOutcome<'_>) {
+    if let Err(e) = request.record.image_completed(&turn.thread_id, image) {
+        eprintln!(
+            "codex-imagegen: session {}: could not update the session record: {e}",
+            request.session
+        );
+        turn.warnings.push(format!(
+            "the session record could not be updated ({e}), so {} may not find this session",
+            crate::tools::REFINE
+        ));
+    }
 }
 
 /// The stderr line saying where a completed image's bytes come from. The base64 fallback is
@@ -1515,11 +1563,12 @@ mod generate_tests {
     };
     use crate::mcp::{CallContext, ToolHost};
     use crate::preview::testing::photo_like_png;
+    use crate::session::{Output, Store};
     use crate::testutil::{temp_dir, TempDir};
     use crate::tools::testing::{fixture, fixture_with, result_text, Fixture};
     use crate::tools::{GENERATE, STATUS};
-    use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     const WAIT: Duration = Duration::from_secs(10);
 
@@ -1811,6 +1860,237 @@ mod generate_tests {
         );
         assert_eq!(std::fs::read(dir.join("fox-v2.png")).unwrap(), saved.bytes);
         assert_eq!(listing(&dir), vec!["fox-v1.png", "fox-v2.png"]);
+        // The record carries on from the version actually used, and lists only our file.
+        let record = f.record("fox").unwrap();
+        assert_eq!(record.next_version, 3);
+        assert_eq!(
+            record.outputs,
+            vec![Output {
+                version: 2,
+                path: dir.join("fox-v2.png"),
+                bytes: saved.bytes.len() as u64
+            }]
+        );
+    }
+
+    #[test]
+    fn the_session_record_is_written_as_the_first_image_completes_not_at_turn_end() {
+        let saved = saved_png();
+        // The fake checks the store between the image and the end of the turn. The store's path
+        // is known only once the fixture exists, so it is handed over through this.
+        let store: Arc<OnceLock<Store>> = Arc::default();
+        let recorded_mid_turn = Arc::new(AtomicBool::new(false));
+        let (probe, flag) = (Arc::clone(&store), Arc::clone(&recorded_mid_turn));
+        let fake = codex(vec![
+            Step::Send(turn_started()),
+            Step::Send(image_started("exec-1")),
+            Step::Send(image_completed("exec-1", "p", "", Some(&saved.path))),
+            Step::Run(Arc::new(move || {
+                let store = probe.get().expect("the store was handed over");
+                let deadline = Instant::now() + WAIT;
+                while Instant::now() < deadline {
+                    if store.read().is_ok_and(|f| f.get("fox").is_some()) {
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })),
+            Step::Send(agent_message("Created your fox.")),
+            Step::Send(turn_completed("completed", Value::Null)),
+        ]);
+        let f = fixture(fake);
+        store.set(f.store().clone()).unwrap();
+        let result = generate(&f, json!({"prompt": "p", "session": "Fox"}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(
+            recorded_mid_turn.load(Ordering::SeqCst),
+            "the record was not there before the turn ended"
+        );
+
+        let record = f.record("FOX").unwrap();
+        let published = f.dir.join("generated-images").join("Fox-v1.png");
+        assert_eq!(record.name, "Fox");
+        assert_eq!(record.thread_id, THREAD_ID);
+        // The home the child reported in its handshake, and the output folder this call used.
+        assert_eq!(record.codex_home, PathBuf::from(r"C:\Users\someone\.codex"));
+        assert_eq!(record.model, "gpt-6-astra");
+        assert_eq!(record.output_dir, f.dir.join("generated-images"));
+        assert_eq!(record.turns, 1);
+        assert_eq!(
+            record.last_output_path.as_deref(),
+            Some(published.as_path())
+        );
+        assert_eq!(
+            record.last_saved_path.as_deref(),
+            Some(saved.path.as_path())
+        );
+        assert_eq!(record.last_output_bytes, Some(saved.bytes.len() as u64));
+        assert_eq!(record.next_version, 2);
+        assert_eq!(record.outputs.len(), 1);
+        assert!(record.created > 0 && record.created == record.updated);
+
+        // status lists it.
+        let status = text_of(
+            &f.app
+                .call_tool(STATUS, &json!({}), &CallContext::detached()),
+        );
+        assert!(status.contains("sessions in this project: 1\n"), "{status}");
+        assert!(
+            status.contains(&format!(
+                "\n  Fox: 1 turn, latest {}, updated ",
+                published.display()
+            )),
+            "{status}"
+        );
+        assert!(status.contains("(under a minute ago)"), "{status}");
+    }
+
+    #[test]
+    fn a_turn_that_completes_no_image_writes_no_record_and_leaves_the_name_free() {
+        let f = fixture(codex(vec![
+            Step::Send(turn_started()),
+            Step::Send(image_started("exec-1")),
+            Step::Send(image_failed("exec-1", Value::Null)),
+            Step::Send(turn_completed("completed", Value::Null)),
+        ]));
+        assert_eq!(
+            code_of(&generate(&f, json!({"prompt": "p", "session": "fox"}))),
+            "IMAGE_FAILED"
+        );
+        assert!(f.record("fox").is_none());
+        assert!(!f.store().path().exists(), "the store was written");
+        // The name is still free: the next try is not SESSION_EXISTS.
+        assert_eq!(
+            code_of(&generate(&f, json!({"prompt": "p", "session": "fox"}))),
+            "IMAGE_FAILED"
+        );
+    }
+
+    #[test]
+    fn an_existing_session_name_is_refused_whatever_its_case_before_codex_starts() {
+        let f = fixture(codex(vec![]));
+        let writer = SessionWriter::new(
+            f.store().clone(),
+            "Fox",
+            Some(crate::session::NewSession {
+                codex_home: PathBuf::from(r"C:\Users\someone\.codex"),
+                model: "gpt-6-astra".to_string(),
+                output_dir: f.dir.join("generated-images"),
+            }),
+        );
+        writer
+            .image_completed(
+                THREAD_ID,
+                &ImageOutcome {
+                    version: None,
+                    output_path: None,
+                    saved_path: None,
+                    bytes: None,
+                },
+            )
+            .unwrap();
+        let result = generate(&f, json!({"prompt": "p", "session": "FOX"}));
+        assert_eq!(code_of(&result), "SESSION_EXISTS");
+        let text = text_of(&result);
+        assert!(text.starts_with("REQUEST REJECTED\n"), "{text}");
+        assert!(text.contains("'FOX' already exists"), "{text}");
+        assert!(text.contains("(as 'Fox')"), "{text}");
+        assert!(
+            text.contains("codex_imagegen_refine with session 'Fox'"),
+            "{text}"
+        );
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "Codex was started");
+        assert!(f.running().is_empty(), "the session was left claimed");
+    }
+
+    #[test]
+    fn a_session_leased_by_another_process_is_busy_before_codex_starts() {
+        let saved = saved_png();
+        let f = fixture(codex(image_turn(&saved.path, "p")));
+        // Another handle on the same lease file, as another codex-imagegen process has.
+        let elsewhere = Store::new(&f.state_dir()).try_lease("fox").unwrap();
+        assert!(elsewhere.is_some());
+        let result = generate(&f, json!({"prompt": "p", "session": "FOX"}));
+        assert_eq!(code_of(&result), "SESSION_BUSY");
+        assert!(
+            text_of(&result).contains("another codex-imagegen process"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "Codex was started");
+        assert!(f.running().is_empty(), "the session was left claimed");
+        // Released there, it goes ahead here; and this call's lease is released when it returns.
+        drop(elsewhere);
+        let result = generate(&f, json!({"prompt": "p", "session": "FOX"}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(f.store().try_lease("fox").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_session_store_that_cannot_be_read_stops_generate_before_codex_starts_but_not_status() {
+        let f = fixture(codex(vec![]));
+        let path = f.store().path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        for args in [
+            json!({"prompt": "p", "session": "fox"}),
+            json!({"prompt": "p"}),
+        ] {
+            let result = generate(&f, args);
+            assert_eq!(code_of(&result), "STORE_CORRUPT");
+            let text = text_of(&result);
+            assert!(text.contains("=== ACTION REQUIRED ==="), "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        }
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "Codex was started");
+        assert!(f.running().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+
+        let (is_error, status) = result_text(&f.app.call_tool(
+            STATUS,
+            &json!({}),
+            &CallContext::detached(),
+        ));
+        assert!(!is_error, "{status}");
+        assert!(
+            status.contains("sessions in this project: unknown -- the session store"),
+            "{status}"
+        );
+        assert!(status.contains("(STORE_CORRUPT)"), "{status}");
+        assert!(status.contains("image generation: available"), "{status}");
+    }
+
+    #[test]
+    fn a_session_record_that_cannot_be_written_is_a_warning_on_the_success() {
+        let saved = saved_png();
+        let store: Arc<OnceLock<Store>> = Arc::default();
+        let probe = Arc::clone(&store);
+        let fake = codex(vec![
+            Step::Send(turn_started()),
+            Step::Send(image_started("exec-1")),
+            // After the claim read the store: a folder now stands where the store goes.
+            Step::Run(Arc::new(move || {
+                std::fs::create_dir_all(probe.get().unwrap().path()).unwrap();
+            })),
+            Step::Send(image_completed("exec-1", "p", "", Some(&saved.path))),
+            Step::Send(turn_completed("completed", Value::Null)),
+        ]);
+        let f = fixture(fake);
+        store.set(f.store().clone()).unwrap();
+        let result = generate(&f, json!({"prompt": "p", "session": "fox"}));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = text_of(&result);
+        assert!(text.starts_with("session: fox   version: 1\n"), "{text}");
+        assert!(
+            text.contains("\nwarning: the session record could not be updated ("),
+            "{text}"
+        );
+        assert!(
+            text.contains("so codex_imagegen_refine may not find this session"),
+            "{text}"
+        );
+        assert!(f.dir.join("generated-images").join("fox-v1.png").is_file());
     }
 
     #[test]
@@ -1985,6 +2265,16 @@ mod generate_tests {
         );
         // The preview was built from the bytes all the same.
         assert_eq!(result["content"][0]["type"], "image");
+        // Recorded all the same, with Codex's copy as the latest image and no output of ours.
+        let record = f.record("s").unwrap();
+        assert_eq!(record.last_output_path, None);
+        assert_eq!(
+            record.last_saved_path.as_deref(),
+            Some(saved.path.as_path())
+        );
+        assert_eq!(record.last_output_bytes, Some(saved.bytes.len() as u64));
+        assert!(record.outputs.is_empty());
+        assert_eq!(record.next_version, 1);
     }
 
     #[test]
@@ -2054,6 +2344,16 @@ mod generate_tests {
         assert!(
             text.contains("warning: another image call in this turn failed"),
             "{text}"
+        );
+        // One turn, two outputs, in stream order.
+        let record = f.record("s").unwrap();
+        assert_eq!(record.turns, 1);
+        let versions: Vec<u32> = record.outputs.iter().map(|o| o.version).collect();
+        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(record.next_version, 3);
+        assert_eq!(
+            record.last_output_path,
+            Some(f.dir.join("generated-images").join("s-v2.png"))
         );
     }
 

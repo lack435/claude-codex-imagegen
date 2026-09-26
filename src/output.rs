@@ -204,8 +204,8 @@ pub fn publish(
 }
 
 /// Create `path`, which must not exist, holding `bytes`, flushed to disk. If anything fails after
-/// the file was created, it is removed again.
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// the file was created, it is removed again. Also writes the session store's temp files.
+pub fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
@@ -263,6 +263,22 @@ fn transient(e: &io::Error) -> bool {
         e.raw_os_error(),
         Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
     )
+}
+
+/// Run `op`, retrying for about 0.8 s while it fails with a sharing or access error: another
+/// process (typically an antivirus scanner) holding a file this process has just written. The
+/// session store's reads, renames and lock files go through this.
+pub fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut waits = RENAME_RETRY_WAITS_MS.iter();
+    loop {
+        match op() {
+            Err(e) if transient(&e) => match waits.next() {
+                Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                None => return Err(e),
+            },
+            done => return done,
+        }
+    }
 }
 
 /// Rename `from` to `to`, failing with ERROR_ALREADY_EXISTS or ERROR_FILE_EXISTS if `to` exists.

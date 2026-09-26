@@ -425,6 +425,83 @@ pub fn session_busy(session: &str, interrupted: bool) -> Failure {
     )
 }
 
+/// Another codex-imagegen process holds the session's lease: a call on it is running there, in
+/// another Claude Code window, or a cleanup is removing it. Not waited for, as a busy session in
+/// this process is not (docs/design.md, "Sessions").
+pub fn session_busy_elsewhere(session: &str) -> Failure {
+    Failure::new(
+        "SESSION_BUSY",
+        format!(
+            "The session '{session}' is busy in another codex-imagegen process (another Claude \
+             Code window, or a cleanup): a call on it is still running there."
+        ),
+        "Nothing was spent. Wait for that call to finish and call again, or use a different \
+         session name.",
+    )
+}
+
+/// generate always starts a new session, and this name is taken (compared case-insensitively).
+/// `recorded` is the name as the session was created, which may differ in case.
+pub fn session_exists(session: &str, recorded: &str) -> Failure {
+    let spelled = if recorded == session {
+        String::new()
+    } else {
+        format!(" (as '{recorded}')")
+    };
+    Failure::new(
+        "SESSION_EXISTS",
+        format!(
+            "A session named '{session}' already exists in this project{spelled}. \
+             codex_imagegen_generate always starts a new session."
+        ),
+        format!(
+            "Nothing was spent. To change that session's image, call codex_imagegen_refine with \
+             session '{recorded}'. To start a new one, call codex_imagegen_generate with another \
+             session name, or without one to have a name picked."
+        ),
+    )
+}
+
+/// The session store exists but cannot be parsed. generate and refine refuse to run rather than
+/// write over sessions they cannot see (docs/design.md, "Sessions").
+pub fn store_corrupt(path: &Path, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "STORE_CORRUPT",
+        format!(
+            "codex-imagegen's session store {} cannot be read, so it will not start or continue \
+             a session: writing to it would lose the sessions recorded there.",
+            path.display()
+        ),
+        format!(
+            "The file {path} is damaged or was written by a newer codex-imagegen. Move it aside \
+             (for example, rename it to sessions.json.bad) and retry: codex-imagegen then starts \
+             a fresh store for this project. The sessions recorded in the old file can no longer \
+             be refined, and their images and Codex threads are no longer expired \
+             automatically.",
+            path = path.display()
+        ),
+    )
+    .with_detail(detail)
+}
+
+/// The session store, its lock or a session lease could not be used: the state folder is missing
+/// permissions, on a filesystem without byte-range locks, or held by a stuck process.
+pub fn store_unusable(path: &Path, detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "STORE_CORRUPT",
+        format!(
+            "codex-imagegen could not use its session store at {}, so it will not start or \
+             continue a session.",
+            path.display()
+        ),
+        "Check that codex-imagegen's state folder exists on a local disk and that this user can \
+         create and change files in it (codex_imagegen_status shows the folder). To move it, set \
+         the CODEX_IMAGEGEN_HOME environment variable or pass --state-dir, then restart the MCP \
+         server. If another codex-imagegen process is stuck, closing it releases the store.",
+    )
+    .with_detail(detail)
+}
+
 /// `--max-concurrent` image calls are already running in this process.
 pub fn too_many_running(max: usize) -> Failure {
     Failure::new(
@@ -698,6 +775,10 @@ mod tests {
             server_shutting_down(),
             session_busy("fox", false),
             session_busy("fox", true),
+            session_busy_elsewhere("fox"),
+            session_exists("FOX", "fox"),
+            store_corrupt(Path::new(r"C:\s\sessions.json"), "expected value at line 1"),
+            store_unusable(Path::new(r"C:\s\sessions.lock"), "access is denied"),
             too_many_running(4),
             cancelled(),
         ]

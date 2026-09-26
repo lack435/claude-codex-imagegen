@@ -19,6 +19,7 @@ mod mcp;
 mod output;
 mod preview;
 mod registry;
+mod session;
 #[cfg(test)]
 mod testutil;
 mod tools;

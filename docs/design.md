@@ -4,10 +4,14 @@ Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applie
 scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
 and the CI contract check. M2 is implemented: `generate` runs end to end (pre-check, turn, copy and preview on
 each image, progress, cancellation and deadlines, errors), `status` lists running turns, and `smoke.ps1` has its
-first version. M2 has no session store or leases (M3), so `generate` does not yet refuse an existing name with
-`SESSION_EXISTS`, and `refine` still validates its arguments, runs preflight and returns `INTERNAL_ERROR`. Not
-built yet either: recycling the shared child after a missed per-request deadline (see Deadlines). The
-unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
+first version. M3 is in progress: the session store, its lock and the per-session leases are implemented,
+`generate` refuses an existing name with `SESSION_EXISTS` and records each completed image in its session, and
+`status` lists this project's sessions and the last cleanup. Not built yet in M3: `refine` (it still validates
+its arguments, runs preflight and returns `INTERNAL_ERROR`), resume and writer-lock handling, cleanup (automatic
+expiry and `--cleanup`, which exits 1), the full `smoke.ps1` and V9. Not built yet either: recycling the shared
+child after a missed per-request deadline (see Deadlines). The unit tests use a scripted fake app-server. The
+store, leases and generate records have been exercised only by those tests and by a free `--doctor` run; no
+paid run has covered them yet. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
 V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input` tools still offered to
 the agent model. The spawn line now switches those off, and the second paid run passed V1, V2 (generate) and V3
 (34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
@@ -234,7 +238,9 @@ No arguments and no quota. It reports:
 - whether the pinned model is listed (and whether it is hidden)
 - every usage window (see [Usage display](#usage-display))
 - running turns, with session and elapsed time
-- sessions in this project: name, turns, latest output path, last update
+- sessions in this project, most recently updated first (up to 20): name, turns, latest output path, last
+  update and its age; then the last cleanup (see [Cleanup](#cleanup)), or "not run yet". A store that cannot be
+  read is reported here with the records that still parse, not failed on
 
 Live reads are bounded to about 10 s each. On timeout, the last value is shown with its age.
 
@@ -288,7 +294,9 @@ Anything unusual is added as a `warning:` line:
 Claude ── tools/call generate|refine
   1. validate: prompt/feedback non-empty, session name, reference image signatures,
      output_dir resolved + created + probe-written              ── any failure: BAD_REQUEST, nothing spent
-  2. registry try_start (busy / concurrency cap / shutdown) and the per-session cross-process lease
+  2. registry try_start (busy / concurrency cap / shutdown), then the per-session cross-process lease
+     (held elsewhere: SESSION_BUSY), then the store read under it (generate: an existing name is
+     SESSION_EXISTS; a store that cannot be read is STORE_CORRUPT)                  ── nothing spent
   3. ensure the child: spawn in a kill-on-close job → initialize → preflight (once per child)
   4. config/read → build the MCP-off map for this thread
   5. generate: thread/start          refine: pick the edit target (see Refine), then thread/resume
@@ -609,18 +617,43 @@ sees the server's tools. A report that comes later interrupts the turn.
   `<state base>\<project-leaf>-<fnv64(lowercased cwd)>\sessions.json`. The state base is
   `%CODEX_IMAGEGEN_HOME%`, or else `%USERPROFILE%\.codex-imagegen` [decided]. It is deliberately not under
   `%LOCALAPPDATA%`, which packaged (MSIX) hosts redirect.
-- **Record fields.** `{thread_id, codex_home, model, created, updated, turns, last_saved_path,
+- **The file.** `{version: 1, sessions: {<lowercased name>: <record>}, last_cleanup?}`. Records are keyed by the
+  lowercased name, because names compare case-insensitively. `last_cleanup` is the outcome of the last cleanup
+  that covered this store, `{at, removed, freed_bytes, skipped:[{name, why}]}`, shown by `status`. A file with
+  another `version` is refused like one that cannot be parsed, since rewriting it would drop what a newer build
+  keeps there [decided].
+- **Record fields.** `{name, thread_id, codex_home, model, created, updated, turns, last_saved_path,
   last_output_path, last_output_bytes, output_dir, next_version, outputs:[{version, path, bytes}]}`.
-  `outputs` lists every file this server published for the session. [Cleanup](#cleanup) uses it.
+  - `name` is the name as the session was created; file names keep that spelling.
+  - `codex_home` is the child's `codexHome` from its handshake. `created` and `updated` are Unix seconds.
+  - `turns` counts turns that completed at least one image.
+  - `last_saved_path` and `last_output_path` are Codex's copy and ours of the latest image; either is null when
+    that copy does not exist (no `savedPath`, or a failed copy), never an older version's path.
+    `last_output_bytes` is that image's size, which checks either copy.
+  - `outputs` lists every file this server published for the session. [Cleanup](#cleanup) uses it.
 - **When the record is written.** When the session's first image completes, not at turn end. It is updated on
   every later completed image, in stream order. A turn that produces no completed image leaves a new name free,
-  and leaves an existing record unchanged.
-- **How it is written.** Atomically: a temp file, then rename with retry. A `LockFileEx` byte-range lock on a
-  sibling lock file serialises access, and the OS releases it if the process dies.
+  and leaves an existing record unchanged. A record is never taken over by a call on another thread. A write
+  that fails after the image was delivered is a `warning:` on the success, saying refine may not find the
+  session.
+- **How it is written.** Atomically: a temp file in the same folder (`.sessions.<pid>-<seq>.tmp`), flushed, then
+  renamed over the live file with retry; the live file is never deleted first. A `LockFileEx` byte-range lock on
+  the sibling `sessions.lock` serialises every read-modify-write, and the OS releases it if the process dies. A
+  writer waits up to 10 s for it; one held longer belongs to a stuck process, and the write fails. Plain reads
+  take no lock, because the rename already makes them safe.
+- **How it is read.** `generate` and `refine` fail closed: a store that exists but cannot be parsed (or read) is
+  `STORE_CORRUPT`, and nothing is spent, because the record written later would replace sessions the call cannot
+  see. It is never overwritten or moved aside automatically. `status` reads tolerantly: it lists the records
+  that still parse and says what is wrong. A missing store is an empty one.
 - **Two kinds of exclusion.**
-  - The per-session **lease** (a `LockFileEx` lock per name, held for the whole call) stops a same-name
-    generate from spending quota twice across processes. It also keeps the record's read, turn and write in
-    order.
+  - The per-session **lease** (a `LockFileEx` lock on `<state dir>\locks\<name>-<fnv64(lowercased name)>.lock`,
+    held for the whole call) stops a same-name generate from spending quota twice across processes: it is taken
+    before the record is read. It also keeps the record's read, turn and write in order. A lease held by
+    another process is not waited for: the call gets `SESSION_BUSY` at once, as a busy session in this process
+    does [decided]. The readable part of the lease file name keeps only letters, digits, `-` and `_`.
+  - Lock files are never deleted. They are opened without delete sharing, so a held one cannot be deleted and
+    replaced by a fresh file that a second process would then lock. So `locks\` keeps one empty file per session
+    name ever used [decided: accepted].
   - **Cross-process exclusion on the thread itself** comes from Codex's writer lock. We release it by
     unsubscribing after every turn, so a session created in one Claude Code window can be refined from another
     about 5 s later.
@@ -818,6 +851,11 @@ case is always a success with warnings.
 | Stop and escalate | `CLI_NOT_FOUND`, `SPAWN_FAILED`, `APP_SERVER_FAILED`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED`, `IMAGEGEN_UNAVAILABLE`, `MODEL_UNAVAILABLE`, `RATE_LIMITED`, `UPSTREAM_ERROR`, `CONTENT_REFUSED`, `IMAGE_FAILED`, `NO_IMAGE`, `TIMEOUT`, `STORE_CORRUPT`, `INTERNAL_ERROR` |
 | Agent-correctable (short form) | `BAD_REQUEST`, `SESSION_EXISTS`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `SESSION_BUSY`, `SESSION_OPEN_ELSEWHERE`, `TOO_MANY_RUNNING`, `CANCELLED`, `SERVER_SHUTTING_DOWN` |
 
+`STORE_CORRUPT` covers a session store that exists but cannot be parsed (the remediation: move it aside, and a
+fresh store starts), and one that cannot be used at all: its folder, its lock or a lease failed with an I/O error,
+or another process held the store lock past its wait. `SESSION_BUSY` covers a session busy in this process and
+one whose lease another process holds.
+
 **Which failure is reported** when no image completed, first match wins [decided]: an isolation breach; a
 cancellation; the child dying; a failed turn (by its `codexErrorInfo`); an exhausted image quota; another failed
 image item; the budget running out; a protocol anomaly; then the turn's end state (`NO_IMAGE` for a completed turn
@@ -962,7 +1000,7 @@ Planned modules:
 | `codex.rs` | Binary resolution, preflight, per-thread config map, thread/turn parameters, developer instructions, input text. |
 | `registry.rs` | Running turns per session: busy check, cap, phases, per-thread event routing (holding a canary that beats the thread's registration), lingering-interrupt state, shutdown. |
 | `turn.rs` | One image turn: notification parsing and routing on the reader thread; on the call's thread `thread/start`, `turn/start`, copy and preview per image, cancel hook, deadlines, canary, unsubscribe; result building and the no-image failure choice. |
-| `session.rs` | Session store: atomic JSON, `LockFileEx` store lock and per-name leases, record type. |
+| `session.rs` | Session store: atomic JSON, strict and tolerant reads, `LockFileEx` store lock and per-name leases, record type, and the per-call writer that records each completed image. |
 | `output.rs` | Output-dir resolution and pre-check, no-replace versioned publish, automatic session names. |
 | `cleanup.rs` | Session expiry and the `--cleanup` sweep, with the deletion safety rules. |
 | `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode with the size steps, base64. |
@@ -1006,6 +1044,14 @@ tested against a scripted fake child that replays message sequences for these ca
 - a child seen to exit before its last image line is read, and one that exits while the call is busy with an
   earlier image
 - a deleted edit target, where no turn is sent
+- sessions, through generate: the record written as the first image completes (not at turn end) and not when no
+  image completed; `next_version` after a taken file name; several images in one turn; a failed copy; an existing
+  name, whatever its case, refused with `SESSION_EXISTS` before Codex starts; a lease held by another handle
+  refused with `SESSION_BUSY` before Codex starts; an unreadable store refused with `STORE_CORRUPT` while `status`
+  still reports; a record write that fails as a warning on the success; automatic names drawn again while taken
+- the store itself: concurrent writers on separate handles losing no update while readers never see a partial
+  file; a store that cannot be parsed never overwritten; the tolerant read keeping the records that parse; another
+  store version refused; leases excluding each other across handles whatever the case; the store lock's wait
 - cleanup:
   - an expired session is removed completely;
   - a session whose lease is held is skipped;
