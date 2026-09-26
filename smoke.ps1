@@ -324,8 +324,12 @@ function Read-ImageCalls([string]$Root) {
     return $calls.ToArray()
 }
 
+# Resolved against PowerShell's location, not .NET's current directory: Windows PowerShell 5.1 does
+# not move the latter on Set-Location, so [IO.Path]::GetFullPath would resolve a relative path
+# against wherever the session started.
 function Get-FullPathOrSelf([string]$Path) {
-    try { return [IO.Path]::GetFullPath($Path) } catch { return $Path }
+    try { return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path) }
+    catch { return $Path }
 }
 
 # V1 and V3 from the trace under $TraceRoot. V3 looks for $Reference, when given, in the image
@@ -335,9 +339,9 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
     $offered = $null
     $calls = @()
     $traceError = $null
+    $callsError = $null
     try {
         $offered = Read-OfferedTools $TraceRoot
-        $calls = @(Read-ImageCalls $TraceRoot)
     }
     catch {
         $traceError = $_.Exception.Message
@@ -345,6 +349,13 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
     if ($traceError -or $null -eq $offered) {
         Add-Check 'V1 and V3: the rollout trace is readable' 'MANUAL' "$traceError; inspect $TraceRoot by hand"
         return
+    }
+    # Separately, so a V3 parse problem cannot hide the V1 result.
+    try {
+        $calls = @(Read-ImageCalls $TraceRoot)
+    }
+    catch {
+        $callsError = $_.Exception.Message
     }
 
     $byVerdict = @{ Required = @(); Allowed = @(); Forbidden = @(); Unclassified = @() }
@@ -383,18 +394,20 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
         Test-Check 'V1: exec is offered' (@($offered.Tools.Values | Where-Object { -not $_.Nested -and $_.Name -eq 'exec' }).Count -gt 0) ''
         Test-Check 'V1: image_gen__imagegen is nested in exec' ($nested -contains 'image_gen__imagegen') ''
         Test-Check 'V1: no shell, stdin, web search, browser, computer-use, sub-agent, user-input, skill, tool-suggest or MCP tool' ($byVerdict.Forbidden.Count -eq 0) (& $none $byVerdict.Forbidden)
-        if ($byVerdict.Unclassified.Count -gt 0) {
-            Add-Check 'V1: every offered tool is classified' 'MANUAL' "review: $($byVerdict.Unclassified -join ', ')"
-        }
-        else {
-            Add-Check 'V1: every offered tool is classified' 'PASS'
-        }
+        # The tool surface is a security boundary, so a tool nobody has classified fails the check
+        # rather than waiting for someone to read a MANUAL line: a Codex update that adds a tool
+        # should stop the run until the tool is judged and listed.
+        Test-Check 'V1: every offered tool is classified' ($byVerdict.Unclassified.Count -eq 0) "unclassified: $(& $none $byVerdict.Unclassified); classify them in Get-ToolVerdict"
     }
 
     Write-Host '-> V3: the reference image in the image call (rollout trace)'
     $v3Name = 'V3: the reference reached the image tool''s referenced_image_paths'
     if (-not $Reference) {
         Add-Check $v3Name 'SKIP' 'no reference image to look for'
+        return
+    }
+    if ($callsError) {
+        Add-Check $v3Name 'MANUAL' "the image calls could not be read ($callsError); inspect $TraceRoot by hand"
         return
     }
     # Only a call made after the reference existed can name it. Text Codex sent to the model

@@ -630,6 +630,8 @@ pub fn mcp_off_map(config: &Value) -> Value {
 /// `tools.experimental_request_user_input.enabled` was missing from it under the switch
 /// [verified: config/read, 0.156.0]. `origins` still names the layer each one was taken from, so
 /// it must be the child's own switches (`sessionFlags`), which hold the value it was started with.
+/// This checks the layer, not the value: that the value in our layer is `false` is guaranteed by
+/// the spawn line itself, which `the_spawn_line_is_exactly_the_designs` pins.
 const SWITCHES_CHECKED_BY_ORIGIN: &[&str] = &["tools.experimental_request_user_input.enabled"];
 
 /// The first spawn switch that the effective configuration does not show in effect, named as
