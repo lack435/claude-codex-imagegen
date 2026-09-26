@@ -31,7 +31,9 @@ not run. M4 verified cancellation and the dedicated home live: the paid `smoke.p
 refine cancelled 5 s into its image call got no response, Codex completed the turn as `interrupted`, and after
 60 s no file had been published or saved by Codex and the record still held one image), V5 (status, the record
 and every `savedPath` named the dedicated home, and nothing of the thread was in the ambient home), V1 and V3 on
-0.157.1, and the sweep removing the session from the dedicated home.
+0.157.1, and the sweep removing the session from the dedicated home. M5's README is written: install, a
+"check that it works" list for Claude Code, the tools, options, the dedicated home, output files and cleanup,
+troubleshooting, and the IJG notice. The tag-driven release workflow is not built.
 
 Claims carry one of three tags:
 
