@@ -30,8 +30,10 @@ pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The Codex versions this build was tested against. Outside it `status` warns and generation
 /// still proceeds, because a hard refusal would break on every Codex auto-update [decided].
-pub const TESTED_RANGE: &str = "0.156.x";
-const TESTED_MAJOR_MINOR: (u64, u64) = (0, 156);
+/// 0.157 passed the full paid smoke on 0.157.1 [verified: 2026-09-26].
+pub const TESTED_RANGE: &str = "0.156.x to 0.157.x";
+const TESTED_MAJOR: u64 = 0;
+const TESTED_MINORS: std::ops::RangeInclusive<u64> = 156..=157;
 
 /// Notifications the child is asked not to send: streaming deltas and state this server never
 /// reads. `mcpServer/startupStatus/updated` is deliberately absent: it is the canary that an MCP
@@ -425,12 +427,13 @@ pub fn parse_version(user_agent: &str) -> Option<String> {
     looks_right.then(|| version.to_string())
 }
 
-/// Whether `version` is in [`TESTED_RANGE`]: same major and minor, any patch or suffix.
+/// Whether `version` is in [`TESTED_RANGE`]: the tested major and one of the tested minors, any
+/// patch or suffix.
 pub fn in_tested_range(version: &str) -> bool {
     let mut parts = version.split('.');
     let major = parts.next().and_then(|p| p.parse::<u64>().ok());
     let minor = parts.next().and_then(|p| p.parse::<u64>().ok());
-    (major, minor) == (Some(TESTED_MAJOR_MINOR.0), Some(TESTED_MAJOR_MINOR.1))
+    major == Some(TESTED_MAJOR) && minor.is_some_and(|m| TESTED_MINORS.contains(&m))
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,7 +2117,9 @@ mod tests {
         assert!(in_tested_range("0.156.0"));
         assert!(in_tested_range("0.156.12"));
         assert!(in_tested_range("0.156.1-alpha.2"));
-        assert!(!in_tested_range("0.157.0"));
+        assert!(in_tested_range("0.157.1"));
+        assert!(!in_tested_range("0.155.9"));
+        assert!(!in_tested_range("0.158.0"));
         assert!(!in_tested_range("0.15.6"));
         assert!(!in_tested_range("1.156.0"));
         assert!(!in_tested_range("garbage"));

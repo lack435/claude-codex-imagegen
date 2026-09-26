@@ -667,7 +667,9 @@ sees the server's tools. A report that comes later interrupts the turn.
 
 ### Codex version pinning
 
-- The tested range starts as exactly 0.156.x. Outside it, `status` warns and generation still proceeds
+- The tested range started as exactly 0.156.x. It is 0.156.x to 0.157.x since the full paid smoke passed on
+  0.157.1 (2026-09-26, 61 of 61 checks: generate, refine, refine after a restart, status, V1, V2, V3 and the
+  sweep), after the M4 run there. Outside it, `status` warns and generation still proceeds
   [decided], because a hard refusal would break on every Codex auto-update.
 - Parsing is defensive:
   - unknown fields are ignored;

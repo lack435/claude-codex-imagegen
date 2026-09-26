@@ -92,6 +92,10 @@ Ask in plain language; Claude picks the tool. Three tools are offered:
 | `codex_imagegen_refine` | Edits the session's latest image | `session`, `feedback`; optional `output_dir`, up to 4 more `reference_images` |
 | `codex_imagegen_status` | Reports the setup, usage, running turns and this project's sessions | none (free) |
 
+Reference images are files: Claude passes their paths, and each must be a PNG, JPEG or WebP. In the
+desktop app you can also paste an image into the chat and ask for a variation, an edit or a remaster of
+it, with no file saved first: the app keeps the pasted image as a file and gives Claude its path.
+
 The prompt and the feedback reach Codex's image tool verbatim. A generation takes about 40 s. Claude Code
 moves a call that runs past 120 s to the background, and the server stops a call after
 `--timeout-seconds` (300 by default).

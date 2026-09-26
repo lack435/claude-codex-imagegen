@@ -2241,7 +2241,7 @@ mod tests {
         for expected in [
             "server: codex-imagegen ",
             r"Codex CLI: C:\fake\codex.exe",
-            "Codex version: 0.156.0 (tested range 0.156.x)",
+            "Codex version: 0.156.0 (tested range 0.156.x to 0.157.x)",
             "app-server: running",
             r"Codex home: C:\Users\someone\.codex (ambient",
             "account: chatgpt, plan pro",
@@ -2289,14 +2289,15 @@ mod tests {
     #[test]
     fn status_warns_about_an_untested_codex_version_and_shows_a_hidden_model() {
         let codex = FakeCodex {
-            user_agent: "codex-imagegen/0.157.1 (Windows 10.0.26200; x86_64)".to_string(),
+            user_agent: "codex-imagegen/0.158.0 (Windows 10.0.26200; x86_64)".to_string(),
             model_pages: vec![vec![crate::codex::testing::model("gpt-6-astra", true)]],
             ..FakeCodex::default()
         };
         let f = fixture(codex);
         let (_, report) = call(&f.app, STATUS, json!({}));
         assert!(
-            report.contains("Codex version: 0.157.1 -- outside the tested range 0.156.x"),
+            report
+                .contains("Codex version: 0.158.0 -- outside the tested range 0.156.x to 0.157.x"),
             "{report}"
         );
         assert!(report.contains("listed, but hidden"), "{report}");
