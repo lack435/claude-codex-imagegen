@@ -9,16 +9,18 @@ existing name with `SESSION_EXISTS` and records each completed image in its sess
 `thread/resume` with its "is closing", "active writer" and "no rollout found" handling, the M2 turn engine);
 cleanup (automatic expiry, once per server process, and `--cleanup`); `status` lists this project's sessions and
 the last cleanup; and the full `smoke.ps1`, with V9 behind `-Concurrent`. After an independent review of M3,
-cleanup was hardened: each published file records a content fingerprint, every deletion goes through the handle
-its checks were made on (a POSIX delete, so a PNG open in a viewer does not keep Codex's folder), a read-only file
-is kept as the user's protection, a link under the Codex home is never followed, and `--cleanup` fails when it
-cannot search for stores. Not built yet: recycling the shared child after a missed per-request deadline (see
-Deadlines). The unit tests use a scripted fake app-server. Beyond
-them, the paid `smoke.ps1 -SpendQuota -Concurrent` run of 2026-09-26 (about 5 images) passed 102 of 102 checks:
-generate, refine with a feedback containing quotes, a backslash, a newline and non-ASCII text (verbatim), refine
-again after killing the server (resume after restart), `status` listing the session with 3 turns, V9 (two servers
-generating at once into one store), V1 and V3 on every image call, and `--cleanup --older-than-days 0` removing
-every record, published file, Codex image folder and rollout. Earlier: the first paid `smoke.ps1` run against real
+cleanup was hardened: each published file records a content fingerprint and its resolved path, every deletion
+goes through the handle its checks were made on (a POSIX delete, so a PNG open in a viewer does not keep Codex's
+folder), an output is deleted only while that handle shows it where it was published, a read-only file is kept
+as the user's protection, a link under the Codex home is never followed, a Codex image folder that cannot be
+removed keeps its session's record so it is retried, and `--cleanup` fails when it cannot search for stores.
+Not built yet: recycling the shared child after a missed per-request deadline (see Deadlines). The unit tests
+use a scripted fake app-server. Beyond them, the paid `smoke.ps1 -SpendQuota -Concurrent` run of 2026-09-26
+(about 5 images) passed 102 of 102 checks: generate, refine with a feedback containing quotes, a backslash, a
+newline and non-ASCII text (verbatim), refine again after killing the server (resume after restart), `status`
+listing the session with 3 turns, V9 (two servers generating at once into one store), V1 and V3 on every image
+call, and `--cleanup --older-than-days 0` removing every record, published file, Codex image folder and
+rollout; that run predates the cleanup hardening above, which unit tests cover. Earlier: the first paid `smoke.ps1` run against real
 Codex (2026-09-25) passed V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input`
 tools still offered to the agent model. The spawn line now switches those off, and the second paid run passed
 V1, V2 (generate) and V3 (34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
@@ -673,7 +675,8 @@ sees the server's tools. A report that comes later interrupts the turn.
   another `version` is refused like one that cannot be parsed, since rewriting it would drop what a newer build
   keeps there [decided].
 - **Record fields.** `{name, thread_id, codex_home, model, created, updated, turns, last_saved_path,
-  last_output_path, last_output_bytes, output_dir, next_version, outputs:[{version, path, bytes, fnv1a64}]}`.
+  last_output_path, last_output_bytes, output_dir, next_version,
+  outputs:[{version, path, bytes, fnv1a64, resolved_path}]}`.
   - `name` is the name as the session was created; file names keep that spelling.
   - `codex_home` is the child's `codexHome` from its handshake. `created` and `updated` are Unix seconds.
   - `turns` counts turns that completed at least one image.
@@ -686,6 +689,14 @@ sees the server's tools. A report that comes later interrupts the turn.
     that was edited or replaced, even by one of the same size, from the one published, and is no defence
     against deliberate forgery [decided]. Records written before it existed have none, and still read;
     cleanup then cannot show such a file to be ours, and keeps it.
+  - `resolved_path` is where the file really was once published: its final path, with every link on the way
+    resolved, read just after the rename through a handle (`std::fs::canonicalize`, which asks
+    `GetFinalPathNameByHandleW`, as cleanup does for the handle it deletes through), in the `\\?\` form. An
+    output folder that was itself a link when the file was published records the folder behind the link
+    [verified: unit test, with a real junction]. It lets cleanup tell the file published from an identical copy
+    that a folder on the way, since replaced by a link, now reaches. A record written before it existed, or
+    one whose path could not be read at publication (logged), has none, and still reads; cleanup then keeps the
+    file, as with a missing `fnv1a64`.
 - **When the record is written.** When the session's first image completes, not at turn end. It is updated on
   every later completed image, in stream order. A turn that produces no completed image leaves a new name free,
   and leaves an existing record unchanged. A record is never taken over by a call on another thread. A write
@@ -829,17 +840,28 @@ session can no longer be refined. Expiry is therefore per session [decided].
      not follow a link at its name, and only while that handle shows a plain file, not read-only, whose final
      path lies directly in that canonical folder; the empty folder is removed the same way. A PNG open in a
      viewer that shares delete is unlinked at once all the same, so the folder still goes [verified: unit
-     test]. Anything else in it, a read-only PNG included, keeps the folder (logged), not the session.
+     test]. When cleanup kept something in the folder on purpose (anything not a PNG, a PNG that is a link or
+     not a plain file, a read-only PNG), the folder cannot be emptied: its removal is not attempted, and it
+     stays, logged, without keeping the session [verified: unit test, also with the folder held open]. When it
+     kept nothing, the folder should be empty, and a failure to remove it is a failed deletion (step 7), not
+     something kept on purpose: another process holding it open without delete sharing, or, where POSIX
+     deletes are unsupported, a PNG a viewer holds still delete-pending. A read-only folder is kept, logged.
   6. Delete each file in `outputs` that is still, at its exact path and under the name it was published with
      (`<name>-v<version>.png`), a plain file with the recorded size and `fnv1a64`, both recomputed through the
-     handle that deletes it, and is not read-only. A file that was edited, replaced (even by one of the same
-     size) or renamed is left alone, and so is one whose record has no `fnv1a64` and one made read-only.
-     Folders are never removed.
+     handle that deletes it, whose final path through that handle is its recorded `resolved_path` (compared
+     case-insensitively, without the `\\?\` prefix), and that is not read-only. A file that was edited,
+     replaced (even by one of the same size) or renamed is left alone, and so is one now reached somewhere
+     else: an output folder replaced by a junction to an archive holding an identical copy reaches that copy,
+     same name, size and content, and its final path gives it away [verified: unit test, with a real
+     junction]. So is one whose record has no `fnv1a64` or no `resolved_path`, and one made read-only. Folders
+     are never removed.
   7. Drop the session record, last, so a cleanup cut short is retried next time. A deletion in steps 5 or 6 that
-     fails (as opposed to a file left alone on purpose, such as a changed or read-only one), for example
-     because another process holds the file open without delete sharing, keeps the record for the same reason;
-     the thread is already gone then, so the next run's `thread/delete` answers "no rollout found" and the rest
-     follows.
+     fails (as opposed to a file left alone on purpose, such as a changed, moved or read-only one), for example
+     because another process holds the file, or Codex's emptied folder, open without delete sharing, keeps the
+     record for the same reason; the thread is already gone then, so the next run's `thread/delete` answers
+     "no rollout found", files already deleted count as gone, and the rest follows [verified: unit test, for a
+     held output and a held Codex folder]. Were a failed folder removal only logged, the record would go and
+     nothing would ever retry the folder.
 - **Reporting.** The outcome (sessions removed, bytes freed, anything skipped and why) is logged to stderr, and
   kept as the store's `last_cleanup` for `status` under "last cleanup", also when nothing was due. "Freed"
   counts only the files codex-imagegen deleted itself, not the rollout `thread/delete` removed.
@@ -873,7 +895,8 @@ codex-imagegen.exe --cleanup [--older-than-days N]
 ### Safety rules
 
 - The server deletes only three kinds of thing:
-  - the files it recorded publishing, when the path, size and content fingerprint (`fnv1a64`) still match;
+  - the files it recorded publishing, when the path, the final path recorded at publication
+    (`resolved_path`), the size and the content fingerprint (`fnv1a64`) still match;
   - Codex's per-thread image folder for a thread it created, when neither that folder nor `generated_images`
     is a link and its canonical path is where it should be;
   - that thread itself, through `thread/delete`.
@@ -883,16 +906,22 @@ codex-imagegen.exe --cleanup [--older-than-days N]
   with DELETE and read access, sharing with readers only, so no other process can write, rename or delete it
   while it is open, and a file being written or held without delete sharing is left for next time. It is
   opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so a link at the name is opened as itself and never followed.
-  Type, attributes, size, fingerprint and final path are read through it, and the deletion is marked on it, so
-  the file verified is the file deleted [verified: unit test, for the sharing, a held file, junctions at the
-  name and on the path, and a same-size replacement].
+  Folders on the way are still resolved, so where a link there could redirect the deletion, the handle's final
+  path is checked: a Codex PNG's must lie directly in the thread's canonical folder, and an output's must be
+  its recorded `resolved_path`. Type, attributes, size, fingerprint and final path are read through it, and the
+  deletion is marked on it, so the file verified is the file deleted [verified: unit test, for the sharing, a
+  held file, junctions at the name and on the path, an output folder swapped for a junction, and a same-size
+  replacement].
 - The deletion is a POSIX delete: `SetFileInformationByHandle` with `FileDispositionInfoEx`, flags
   `FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`. The name is gone as the handle closes,
   even while a viewer that shares delete still has the file open (it can go on reading it), so Codex's folder
   can be removed right after its PNGs [verified: unit test, on NTFS]. A file system without POSIX deletes
   refuses that, and the legacy `FileDispositionInfo` is then marked on the same handle, so the guarantee is the
-  same; there a file a viewer holds stays delete-pending until the viewer closes it, and its folder is left,
-  logged [verified: unit test, with the refusal injected]. The refusals that fall back are
+  same; there a file a viewer holds stays delete-pending until the viewer closes it, and its folder cannot be
+  removed until then [verified: unit test, with the refusal injected]. That is a failed folder removal, so the
+  session's record is kept and the folder retried next time, by the same path as a folder held open [verified:
+  unit test, for the held folder; the delete-pending case is not exercised at the session level, since NTFS
+  takes the POSIX delete]. The refusals that fall back are
   ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED and ERROR_INVALID_FUNCTION, expected from FAT, exFAT and some
   network file systems [assumed: V10]; any other error is a failed deletion.
 - A read-only file or folder is kept [decided]: the attribute is the user's protection, and cleanup honours it.
@@ -1027,8 +1056,8 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   are checked for an image signature first.
 - **Writes.** The only writes to disk are the image tool's, into `<CODEX_HOME>\generated_images`, and this
   server's new files in the output directory. The server never overwrites. It deletes only what
-  [Cleanup](#cleanup) allows: the files it recorded publishing (path, size and content fingerprint must
-  match), Codex's image folder for its own threads, and those threads.
+  [Cleanup](#cleanup) allows: the files it recorded publishing (path, resolved path, size and content
+  fingerprint must match), Codex's image folder for its own threads, and those threads.
 - **User configuration, in ambient mode (the default).** The user's `~/.codex/AGENTS.md` reaches the agent
   model, and nothing short of another home stops it [verified]. Everything else that could act is switched off:
   - apps and connectors

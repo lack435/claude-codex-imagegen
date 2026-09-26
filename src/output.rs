@@ -7,7 +7,9 @@
 //! - Publishing a completed image as `<session>-v<N>.png`: written to a temp file in the
 //!   destination directory, then renamed with `MoveFileExW` *without* `MOVEFILE_REPLACE_EXISTING`.
 //!   When the name is taken, N is bumped and the rename retried, so an existing file is never
-//!   overwritten, even when several projects or processes share a folder.
+//!   overwritten, even when several projects or processes share a folder. The published file's
+//!   final path is then read back for the session record, so cleanup can tell it from a copy
+//!   reached later through a link.
 //! - Automatic session names, from local time.
 //!
 //! Writing into the caller's output directory is one of the places rigor belongs (AGENTS.md). This
@@ -163,6 +165,9 @@ pub struct Published {
     pub path: PathBuf,
     /// The N actually used, which is `first_version` unless that name was taken.
     pub version: u32,
+    /// Where the file really is, read just after it was published ([`resolve`]). `None` when that
+    /// could not be read, and then cleanup keeps the file.
+    pub resolved: Option<PathBuf>,
 }
 
 /// `<session>-v<N>.png`.
@@ -232,6 +237,7 @@ fn rename_to_first_free(
         match rename_no_replace(temp, &target) {
             Ok(()) => {
                 return Ok(Published {
+                    resolved: resolve(&target),
                     path: target,
                     version,
                 })
@@ -250,6 +256,24 @@ fn rename_to_first_free(
                 None => return Err(e),
             },
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Where a file just published really is: its final path, with every link on the way resolved.
+/// `std::fs::canonicalize` reads it through a handle with `GetFinalPathNameByHandleW`, as cleanup
+/// reads the path of the handle it deletes through, so the two compare (docs/design.md, "Record
+/// fields"). A failure is only logged: the image is published all the same, and cleanup, finding
+/// no resolved path in the record, keeps the file.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(resolved) => Some(resolved),
+        Err(e) => {
+            eprintln!(
+                "codex-imagegen: could not resolve the published {} ({e}); cleanup will keep it",
+                path.display()
+            );
+            None
         }
     }
 }
@@ -514,7 +538,8 @@ mod tests {
             published,
             Published {
                 path: dir.join("fox-v1.png"),
-                version: 1
+                version: 1,
+                resolved: Some(fs::canonicalize(dir.join("fox-v1.png")).unwrap()),
             }
         );
         assert_eq!(fs::read(&published.path).unwrap(), b"png bytes");
@@ -523,6 +548,30 @@ mod tests {
         let next = publish(&dir, "fox", 2, b"second").unwrap();
         assert_eq!(next.version, 2);
         assert_eq!(listing(&dir), vec!["fox-v1.png", "fox-v2.png"]);
+    }
+
+    #[test]
+    fn a_file_published_through_a_link_records_where_it_really_is() {
+        let root = temp_dir("output");
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        crate::testutil::make_junction(&link, &real);
+        let published = publish(&link, "fox", 1, b"png bytes").unwrap();
+        assert_eq!(published.path, link.join("fox-v1.png"));
+        // The folder behind the link, not the link.
+        assert_eq!(
+            published.resolved,
+            Some(fs::canonicalize(real.join("fox-v1.png")).unwrap())
+        );
+        assert!(!crate::cleanup::same_path(
+            published.resolved.as_deref().unwrap(),
+            &fs::canonicalize(&root)
+                .unwrap()
+                .join("link")
+                .join("fox-v1.png")
+        ));
+        assert_eq!(listing(&real), vec!["fox-v1.png"]);
     }
 
     #[test]

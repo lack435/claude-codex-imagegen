@@ -1132,6 +1132,7 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
                     saved_path: Some(path),
                     bytes: None,
                     fnv1a64: None,
+                    resolved_path: None,
                 },
             );
             turn.images.push(Delivered {
@@ -1152,7 +1153,7 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
         }
     };
 
-    let (version, path) = match output::publish(
+    let (version, path, resolved) = match output::publish(
         request.output_dir,
         request.session,
         turn.next_version,
@@ -1160,7 +1161,11 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
     ) {
         Ok(published) => {
             turn.next_version = published.version + 1;
-            (Some(published.version), Some(published.path))
+            (
+                Some(published.version),
+                Some(published.path),
+                published.resolved,
+            )
         }
         Err(e) => {
             let fallback = image.saved_path.clone();
@@ -1177,7 +1182,7 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
                     request.output_dir.display()
                 ),
             });
-            (None, fallback)
+            (None, fallback, None)
         }
     };
     let preview = match preview::build(&bytes) {
@@ -1214,9 +1219,10 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
             output_path: version.and(path.as_deref()),
             saved_path: image.saved_path.as_deref(),
             bytes: Some(bytes.len() as u64),
-            // Cleanup deletes our copy only while its content still matches this (docs/design.md,
-            // "Cleanup"); `publish` wrote exactly these bytes.
+            // Cleanup deletes our copy only while its content still matches this, and only where
+            // it was published (docs/design.md, "Cleanup"); `publish` wrote exactly these bytes.
             fnv1a64: Some(Fnv1a64::of(&bytes)),
+            resolved_path: resolved.as_deref(),
         },
     );
     turn.images.push(Delivered {
@@ -2118,6 +2124,7 @@ mod generate_tests {
                 path: dir.join("fox-v2.png"),
                 bytes: saved.bytes.len() as u64,
                 fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
+                resolved_path: Some(std::fs::canonicalize(dir.join("fox-v2.png")).unwrap()),
             }]
         );
     }
@@ -2237,6 +2244,7 @@ mod generate_tests {
                     saved_path: None,
                     bytes: None,
                     fnv1a64: None,
+                    resolved_path: None,
                 },
             )
             .unwrap();
@@ -3068,6 +3076,7 @@ mod refine_tests {
         std::fs::create_dir_all(out).unwrap();
         let v1 = out.join(format!("{name}-v1.png"));
         std::fs::write(&v1, &saved.bytes).unwrap();
+        let resolved = std::fs::canonicalize(&v1).unwrap();
         SessionWriter::new(
             f.store().clone(),
             name,
@@ -3085,6 +3094,7 @@ mod refine_tests {
                 saved_path: Some(&saved.path),
                 bytes: Some(saved.bytes.len() as u64),
                 fnv1a64: Some(Fnv1a64::of(&saved.bytes)),
+                resolved_path: Some(&resolved),
             },
         )
         .unwrap();
@@ -3192,12 +3202,14 @@ mod refine_tests {
             vec![
                 Output {
                     version: 1,
+                    resolved_path: Some(std::fs::canonicalize(&v1).unwrap()),
                     path: v1,
                     bytes: saved.bytes.len() as u64,
                     fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
                 },
                 Output {
                     version: 2,
+                    resolved_path: Some(std::fs::canonicalize(&v2).unwrap()),
                     path: v2,
                     bytes: saved.bytes.len() as u64,
                     fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
@@ -3275,6 +3287,7 @@ mod refine_tests {
                         path: older.clone(),
                         bytes: saved.bytes.len() as u64,
                         fnv1a64: None,
+                        resolved_path: None,
                     },
                 );
                 Ok(())

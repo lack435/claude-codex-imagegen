@@ -141,7 +141,7 @@ pub struct Record {
     /// The version the next image is published as: the last one actually used, plus one.
     pub next_version: u32,
     /// Every file this server published for the session. Cleanup deletes only these, and only
-    /// while the path, size and content fingerprint still match.
+    /// while the path, resolved path, size and content fingerprint still match.
     pub outputs: Vec<Output>,
 }
 
@@ -157,6 +157,13 @@ pub struct Output {
     /// one published, and keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fnv1a64: Option<String>,
+    /// Where the file really was once published: its final path, every link on the way resolved,
+    /// as Windows reports it through a handle (`\\?\` form). Cleanup deletes the file only while
+    /// its deleting handle shows it there, so a folder on the way replaced by a link to a copy
+    /// elsewhere never redirects the deletion. Absent from records written before it existed, and
+    /// when it could not be read at publication; cleanup then keeps the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<PathBuf>,
 }
 
 impl Output {
@@ -199,6 +206,7 @@ impl Record {
                 path: path.to_path_buf(),
                 bytes,
                 fnv1a64: image.fnv1a64.map(Output::fingerprint_text),
+                resolved_path: image.resolved_path.map(Path::to_path_buf),
             });
             self.next_version = self.next_version.max(version.saturating_add(1));
         }
@@ -623,6 +631,8 @@ pub struct ImageOutcome<'a> {
     pub bytes: Option<u64>,
     /// The 64-bit FNV-1a of those bytes, which are exactly what was published.
     pub fnv1a64: Option<u64>,
+    /// Our copy's final path, read when it was published ([`Output::resolved_path`]).
+    pub resolved_path: Option<&'a Path>,
 }
 
 /// Records one call's images in its session, each as it completes, in stream order
@@ -729,6 +739,7 @@ mod tests {
             saved_path: Some(Path::new(r"C:\codex\generated_images\t\exec-1.png")),
             bytes: Some(bytes),
             fnv1a64: Some(0xfeed_0000_0000_0000 | bytes),
+            resolved_path: Some(path),
         }
     }
 
@@ -820,14 +831,17 @@ mod tests {
     }
 
     #[test]
-    fn an_output_recorded_before_fingerprints_still_reads_and_is_written_back_without_one() {
+    fn an_output_recorded_before_fingerprints_or_resolved_paths_still_reads_and_is_written_back() {
         let dir = temp_dir("session");
         let store = Store::new(&dir);
         let mut old = serde_json::to_value(record("fox")).unwrap();
+        let resolved = r"\\?\D:\archive\fox-v4.png";
         old["outputs"] = serde_json::json!([
             {"version": 1, "path": r"C:\out\fox-v1.png", "bytes": 5},
             {"version": 2, "path": r"C:\out\fox-v2.png", "bytes": 6, "fnv1a64": "not hex!"},
             {"version": 3, "path": r"C:\out\fox-v3.png", "bytes": 7, "fnv1a64": "00000000000000ff"},
+            {"version": 4, "path": r"C:\out\fox-v4.png", "bytes": 8, "fnv1a64": "00000000000000fe",
+             "resolved_path": resolved},
         ]);
         let text = serde_json::json!({"version": 1, "sessions": {"fox": old}}).to_string();
         fs::write(store.path(), text).unwrap();
@@ -838,11 +852,19 @@ mod tests {
         assert_eq!(outputs[0].fingerprint(), None);
         assert_eq!(outputs[1].fingerprint(), None);
         assert_eq!(outputs[2].fingerprint(), Some(0xff));
+        // A record written before resolved paths has none.
+        assert_eq!(outputs[2].resolved_path, None);
+        assert_eq!(
+            outputs[3].resolved_path.as_deref(),
+            Some(Path::new(resolved))
+        );
         store.update(|_| Ok(())).unwrap();
         let value: Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
         let written = &value["sessions"]["fox"]["outputs"];
         assert!(written[0].get("fnv1a64").is_none(), "{written}");
+        assert!(written[2].get("resolved_path").is_none(), "{written}");
         assert_eq!(written[2]["fnv1a64"], "00000000000000ff");
+        assert_eq!(written[3]["resolved_path"], resolved);
         assert_eq!(Output::fingerprint_text(0xab), "00000000000000ab");
     }
 
@@ -1034,6 +1056,7 @@ mod tests {
                 path: v1.clone(),
                 bytes: 100,
                 fnv1a64: Some("feed000000000064".to_string()),
+                resolved_path: Some(v1.clone()),
             }]
         );
         assert_eq!(first.outputs[0].fingerprint(), Some(0xfeed_0000_0000_0064));
@@ -1083,6 +1106,7 @@ mod tests {
                     saved_path: Some(saved),
                     bytes: Some(20),
                     fnv1a64: Some(20),
+                    resolved_path: None,
                 },
             )
             .unwrap();

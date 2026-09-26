@@ -14,12 +14,16 @@
 //! - In Codex's image folder only `*.png` files are removed, then the folder once it is empty.
 //!   Neither `generated_images` nor the thread's folder may be a link (a reparse point), and the
 //!   folder's canonical path must be the canonical Codex home's `generated_images\<threadId>`;
-//!   otherwise nothing in it is touched.
+//!   otherwise nothing in it is touched. A folder that holds something cleanup kept on purpose
+//!   stays, and the session still goes; one that should now be empty but cannot be removed is a
+//!   problem, so the record is kept and its removal retried.
 //! - An output is deleted only while its exact path is a plain file under the name it was
-//!   published with, with the recorded size and content fingerprint. A file that was edited,
-//!   replaced (even by one of the same size) or renamed is left alone, and so is one whose record
-//!   has no fingerprint. No folder in an output directory is ever removed, and nothing is matched
-//!   by wildcard there.
+//!   published with, with the recorded size and content fingerprint, and while the handle that
+//!   deletes it shows it at the final path recorded when it was published. A file that was
+//!   edited, replaced (even by one of the same size), renamed, or is now reached through a link
+//!   somewhere else is left alone, and so is one whose record has no fingerprint or no resolved
+//!   path. No folder in an output directory is ever removed, and nothing is matched by wildcard
+//!   there.
 //! - Every file is deleted through the handle its checks were made on ([`crate::delete`]), which
 //!   admits no other writer or deleter and never follows a link at the file's name.
 //! - A read-only file or folder is kept, as the user's protection: logged, not retried, and not a
@@ -389,6 +393,14 @@ fn check_codex_folder(codex_home: &Path, thread_id: &str) -> FolderCheck {
 /// `<codex_home>\generated_images\<thread_id>\`, then the folder once it is empty, after
 /// [`check_codex_folder`] has shown the folder to be the one it should be. `thread/delete` leaves
 /// it behind [verified: live, V8].
+///
+/// The folder stays, logged, when cleanup kept something in it on purpose: anything not a PNG, a
+/// PNG that is a link or not a plain file, or a read-only one. Then it cannot be emptied, and that
+/// is no reason to keep the session. Otherwise it should be empty, and a failure to remove it is a
+/// problem, so the record is kept and the next cleanup tries again: another process may hold it
+/// open without delete sharing, or, where POSIX deletes are unsupported, a PNG a viewer holds may
+/// still be delete-pending. Were it only logged, the record would go and nothing would ever retry
+/// the folder.
 fn remove_codex_images(
     codex_home: &Path,
     thread_id: &str,
@@ -420,6 +432,8 @@ fn remove_codex_images(
         }
     };
     let before = problems.len();
+    // Whether cleanup left anything in the folder on purpose.
+    let mut kept = false;
     for entry in entries {
         let path = match entry {
             Ok(entry) => entry.path(),
@@ -432,11 +446,15 @@ fn remove_codex_images(
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
         if !is_png {
+            kept = true;
             continue;
         }
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.is_file() && is_plain(&meta) => {}
-            Ok(_) => continue,
+            Ok(_) => {
+                kept = true;
+                continue;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 problems.push(format!("could not read {} ({e})", path.display()));
@@ -445,19 +463,22 @@ fn remove_codex_images(
         }
         // Retried as a whole, so each attempt opens and checks the file afresh.
         let outcome = output::retry_transient(|| delete_codex_png(&path, &folder));
+        kept |= matches!(outcome, Ok(Verdict::Kept(_)));
         settle(&path, outcome, freed, problems);
     }
-    if problems.len() == before {
-        match output::retry_transient(|| remove_codex_folder(&dir, &folder)) {
-            Ok(Verdict::Deleted(_) | Verdict::Gone) => {}
-            Ok(Verdict::Kept(why) | Verdict::Refused(why)) => {
-                eprintln!("codex-imagegen: cleanup: left {}: {why}", dir.display());
-            }
-            // Something other than a PNG is in it (ERROR_DIR_NOT_EMPTY): not ours to delete, and
-            // no reason to keep the session.
-            Err(e) => eprintln!("codex-imagegen: cleanup: left {} ({e})", dir.display()),
-        }
+    if problems.len() > before {
+        // The record is kept, and the folder is looked at again next time.
+        return;
     }
+    if kept {
+        eprintln!(
+            "codex-imagegen: cleanup: left Codex's image folder {}: it holds what cleanup kept",
+            dir.display()
+        );
+        return;
+    }
+    let outcome = output::retry_transient(|| remove_codex_folder(&dir, &folder));
+    settle(&dir, outcome, freed, problems);
 }
 
 /// Delete one of Codex's PNGs through a handle that never follows a link at its name, once that
@@ -508,7 +529,8 @@ fn remove_codex_folder(dir: &Path, folder: &Path) -> io::Result<Verdict> {
 }
 
 /// Delete the files this server published for the session, each only while its exact path is a
-/// plain file under its published name, with the recorded size and content fingerprint.
+/// plain file under its published name, with the recorded size and content fingerprint, that the
+/// deleting handle shows where it was published.
 fn remove_outputs(record: &Record, freed: &mut u64, problems: &mut Vec<String>) {
     for published in &record.outputs {
         let path = &published.path;
@@ -549,18 +571,38 @@ fn remove_outputs(record: &Record, freed: &mut u64, problems: &mut Vec<String>) 
             );
             continue;
         };
+        let Some(resolved) = published.resolved_path.as_deref() else {
+            eprintln!(
+                "codex-imagegen: cleanup: kept {}: its record holds no resolved path (an earlier \
+                 build wrote it, or the path could not be read when it was published), so it \
+                 cannot be shown to be where the file was published",
+                path.display()
+            );
+            continue;
+        };
         // Retried as a whole, so each attempt opens and checks the file afresh: one replaced
         // between attempts is judged as it is then.
-        let outcome = output::retry_transient(|| delete_output(path, published.bytes, fingerprint));
+        let outcome =
+            output::retry_transient(|| delete_output(path, published.bytes, fingerprint, resolved));
         settle(path, outcome, freed, problems);
     }
 }
 
-/// Delete a published output through one handle, only while that handle shows a plain file with
-/// the recorded size and content fingerprint, that is not read-only. Size, fingerprint and
-/// attributes are read through the handle, which admits no other writer or deleter, and the
-/// deletion is marked on it, so the file checked is the file deleted.
-fn delete_output(path: &Path, bytes: u64, fingerprint: u64) -> io::Result<Verdict> {
+/// Delete a published output through one handle, only while that handle shows a plain file at
+/// `resolved`, the final path recorded when it was published, with the recorded size and content
+/// fingerprint, that is not read-only. Location, size, fingerprint and attributes are read through
+/// the handle, which admits no other writer or deleter, and the deletion is marked on it, so the
+/// file checked is the file deleted.
+///
+/// The handle never follows a link at the file's own name, but folders on the way are resolved: a
+/// published folder since replaced by a junction to an archive holding an identical copy reaches
+/// that copy, with the same size and fingerprint. Its final path gives it away, and it is kept.
+fn delete_output(
+    path: &Path,
+    bytes: u64,
+    fingerprint: u64,
+    resolved: &Path,
+) -> io::Result<Verdict> {
     let Some(file) = delete::open(path)? else {
         return Ok(Verdict::Gone);
     };
@@ -568,6 +610,14 @@ fn delete_output(path: &Path, bytes: u64, fingerprint: u64) -> io::Result<Verdic
         return Ok(Verdict::Kept(
             "it changed after it was published".to_string(),
         ));
+    }
+    let at = file.final_path()?;
+    if !same_path(&at, resolved) {
+        return Ok(Verdict::Kept(format!(
+            "it is no longer where it was published: it resolves to {}, not {}",
+            at.display(),
+            resolved.display()
+        )));
     }
     let (content, read) = file.fingerprint()?;
     if read != bytes || content != fingerprint {
@@ -1112,6 +1162,7 @@ mod tests {
                 fs::write(&path, &bytes).unwrap();
                 outputs.push(Output {
                     version: *v,
+                    resolved_path: Some(fs::canonicalize(&path).unwrap()),
                     path,
                     bytes: bytes.len() as u64,
                     fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&bytes))),
@@ -1398,24 +1449,123 @@ mod tests {
     }
 
     #[test]
+    fn an_output_folder_swapped_for_a_junction_to_an_identical_copy_keeps_the_copy() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1, 2]);
+        // The output folder is archived, and a junction to the archive stands where it was: each
+        // recorded path now reaches a copy with the same name, size and content.
+        let out = world.out_dir();
+        let archive = world.dir.join("archive");
+        fs::create_dir(&archive).unwrap();
+        for output in &record.outputs {
+            fs::copy(&output.path, archive.join(output.path.file_name().unwrap())).unwrap();
+        }
+        fs::remove_dir_all(&out).unwrap();
+        make_junction(&out, &archive);
+        assert_eq!(fs::read(&record.outputs[0].path).unwrap(), vec![1u8; 101]);
+
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        for name in ["fox-v1.png", "fox-v2.png"] {
+            assert!(
+                archive.join(name).is_file(),
+                "the archived copy {name} was deleted through the junction"
+            );
+        }
+        assert_eq!(
+            fs::read(archive.join("fox-v1.png")).unwrap(),
+            vec![1u8; 101]
+        );
+        assert_eq!(
+            fs::read(archive.join("fox-v2.png")).unwrap(),
+            vec![2u8; 102]
+        );
+        // Kept on purpose, like a renamed file: nothing of ours is left at the recorded paths, and
+        // the link will still be there next time, so the session goes rather than being retried
+        // for ever.
+        assert!(!world.images_dir(THREAD).exists(), "Codex's image folder");
+        let file = world.file();
+        assert!(file.get("fox").is_none(), "the kept copy kept the session");
+        let outcome = file.last_cleanup.unwrap();
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert_eq!(outcome.freed_bytes, 101 + 102, "Codex's two copies only");
+        // Why, as cleanup logs it.
+        let v1 = &record.outputs[0];
+        let verdict = delete_output(
+            &v1.path,
+            v1.bytes,
+            v1.fingerprint().unwrap(),
+            v1.resolved_path.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&verdict, Verdict::Kept(why)
+                if why.starts_with("it is no longer where it was published")),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_output_whose_record_has_no_resolved_path_is_kept() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        // As an earlier build recorded it: a fingerprint, but no resolved path.
+        world
+            .store
+            .update(|file| {
+                file.sessions.get_mut("fox").unwrap().outputs[0].resolved_path = None;
+                Ok(())
+            })
+            .unwrap();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        assert!(
+            record.outputs[0].path.is_file(),
+            "a file that cannot be shown to be where it was published was deleted"
+        );
+        let file = world.file();
+        assert!(file.get("fox").is_none());
+        assert!(file.last_cleanup.unwrap().skipped.is_empty());
+        assert!(!world.images_dir(THREAD).exists());
+    }
+
+    #[test]
     fn a_matching_output_is_checked_and_deleted_through_one_handle() {
         let dir = temp_dir("cleanup");
         let path = dir.join("fox-v1.png");
         fs::write(&path, b"foobar").unwrap();
         let fingerprint = Fnv1a64::of(b"foobar");
+        let resolved = fs::canonicalize(&path).unwrap();
         let kept = |verdict: Verdict| matches!(verdict, Verdict::Kept(_));
-        assert!(kept(delete_output(&path, 7, fingerprint).unwrap()));
-        assert!(kept(delete_output(&path, 6, fingerprint ^ 1).unwrap()));
+        assert!(kept(
+            delete_output(&path, 7, fingerprint, &resolved).unwrap()
+        ));
+        assert!(kept(
+            delete_output(&path, 6, fingerprint ^ 1, &resolved).unwrap()
+        ));
+        // Everything matches but where it was published.
+        let elsewhere = fs::canonicalize(&dir)
+            .unwrap()
+            .join("other")
+            .join("fox-v1.png");
+        assert!(kept(
+            delete_output(&path, 6, fingerprint, &elsewhere).unwrap()
+        ));
         assert_eq!(fs::read(&path).unwrap(), b"foobar");
+        // Compared as Windows compares paths: another case, without the `\\?\` prefix.
+        let plain = resolved.to_string_lossy()[4..].to_uppercase();
         assert_eq!(
-            delete_output(&path, 6, fingerprint).unwrap(),
+            delete_output(&path, 6, fingerprint, Path::new(&plain)).unwrap(),
             Verdict::Deleted(6)
         );
         assert!(!path.exists());
-        assert_eq!(delete_output(&path, 6, fingerprint).unwrap(), Verdict::Gone);
+        assert_eq!(
+            delete_output(&path, 6, fingerprint, &resolved).unwrap(),
+            Verdict::Gone
+        );
         // A folder at the name is not a file of ours.
         fs::create_dir(&path).unwrap();
-        assert!(kept(delete_output(&path, 0, Fnv1a64::of(b"")).unwrap()));
+        assert!(kept(
+            delete_output(&path, 0, Fnv1a64::of(b""), &resolved).unwrap()
+        ));
         assert!(path.is_dir());
     }
 
@@ -1479,8 +1629,9 @@ mod tests {
         assert_eq!(outcome.freed_bytes, 101 + 102 + 102);
         // Kept on purpose, which cleanup logs, without the deletion being attempted.
         let fingerprint = protected.fingerprint().unwrap();
+        let resolved = protected.resolved_path.as_deref().unwrap();
         assert_eq!(
-            delete_output(&protected.path, protected.bytes, fingerprint).unwrap(),
+            delete_output(&protected.path, protected.bytes, fingerprint, resolved).unwrap(),
             Verdict::Kept("it is read-only".to_string())
         );
         assert!(protected.path.is_file());
@@ -1572,6 +1723,90 @@ mod tests {
         let mut content = Vec::new();
         viewer.read_to_end(&mut content).unwrap();
         assert_eq!(content, vec![1u8; 101]);
+    }
+
+    /// A handle on `dir` that shares reading and writing but not deleting, as another process
+    /// might hold it: the folder cannot be removed while it is open.
+    fn hold_folder(dir: &Path) -> fs::File {
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_codex_folder_that_cannot_be_removed_keeps_the_record_and_is_retried() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        let dir = world.images_dir(THREAD);
+        let held = hold_folder(&dir);
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        // Its PNG and the session's output went; the folder could not.
+        assert!(dir.is_dir(), "a held folder was removed");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(!record.outputs[0].path.exists());
+        let file = world.file();
+        assert!(
+            file.get("fox").is_some(),
+            "the record went, so nothing would ever retry the folder"
+        );
+        let outcome = file.last_cleanup.unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        let why = &outcome.skipped[0].why;
+        assert!(
+            why.contains(&format!("could not delete {}", dir.display()))
+                && why.contains("os error 32")
+                && why.contains("retried next time"),
+            "{why}"
+        );
+
+        // Next time the handle is gone, the thread and outputs already are, and the rest goes.
+        drop(held);
+        let gone = Deletes::failing(&[(THREAD, "no rollout found for thread id x")]);
+        expire_with(&world, 7, &gone, &|_| false);
+        assert_eq!(gone.asked(), vec![THREAD.to_string()]);
+        assert!(!dir.exists(), "the folder was not retried");
+        assert!(world.home.join("generated_images").is_dir());
+        let file = world.file();
+        assert!(file.get("fox").is_none());
+        let outcome = file.last_cleanup.unwrap();
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.freed_bytes, 0);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+    }
+
+    #[test]
+    fn a_codex_folder_kept_on_purpose_is_not_retried_and_the_session_still_goes() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        let dir = world.images_dir(THREAD);
+        // A read-only PNG, which cleanup keeps, so the folder cannot be emptied; held as well,
+        // which must not turn it into a failure or a wait.
+        let protected = dir.join("exec-1.png");
+        set_read_only(&protected);
+        let held = hold_folder(&dir);
+        let started = Instant::now();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        let took = started.elapsed();
+        drop(held);
+        assert!(
+            took < PROMPTLY,
+            "the removal of a folder cleanup kept something in was retried ({took:?})"
+        );
+        assert_eq!(fs::read(&protected).unwrap(), vec![1u8; 101]);
+        assert!(!record.outputs[0].path.exists());
+        let file = world.file();
+        assert!(
+            file.get("fox").is_none(),
+            "a folder kept on purpose kept the session"
+        );
+        let outcome = file.last_cleanup.unwrap();
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert_eq!(outcome.freed_bytes, 101, "our copy only");
     }
 
     #[test]
@@ -1902,6 +2137,7 @@ mod tests {
                 next_version: 2,
                 outputs: vec![Output {
                     version: 1,
+                    resolved_path: Some(fs::canonicalize(&path).unwrap()),
                     path,
                     bytes: 5,
                     fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(b"12345"))),
