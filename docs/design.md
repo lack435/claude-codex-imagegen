@@ -10,11 +10,12 @@ existing name with `SESSION_EXISTS` and records each completed image in its sess
 cleanup (automatic expiry, once per server process, and `--cleanup`); `status` lists this project's sessions and
 the last cleanup; and the full `smoke.ps1`, with V9 behind `-Concurrent`. Not built yet: recycling the shared
 child after a missed per-request deadline (see Deadlines). The unit tests use a scripted fake app-server. Beyond
-them, M3 has been exercised only by free runs: `--doctor`, `smoke.ps1` without `-SpendQuota` (which also runs
-`--cleanup` on an empty state base), and `--cleanup` on fabricated session records whose thread ids are random
-UUIDs, in the ambient home and in a scratch dedicated home. No paid run has covered refine, resume after a
-restart, the cleanup of a real session, or V9 yet. The first paid `smoke.ps1` run against real Codex
-(2026-09-25) passed V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input`
+them, the paid `smoke.ps1 -SpendQuota -Concurrent` run of 2026-09-26 (about 5 images) passed 102 of 102 checks:
+generate, refine with a feedback containing quotes, a backslash, a newline and non-ASCII text (verbatim), refine
+again after killing the server (resume after restart), `status` listing the session with 3 turns, V9 (two servers
+generating at once into one store), V1 and V3 on every image call, and `--cleanup --older-than-days 0` removing
+every record, published file, Codex image folder and rollout. Earlier: the first paid `smoke.ps1` run against real
+Codex (2026-09-25) passed V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input`
 tools still offered to the agent model. The spawn line now switches those off, and the second paid run passed
 V1, V2 (generate) and V3 (34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
 it accurately, both through `claude -p` and in the desktop app, where it appears in the expanded tool row. The
@@ -1224,11 +1225,11 @@ Each item must pass before the code that depends on it is considered done.
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
 | V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
-| V2 | **Passed 2026-09-25 for generate.** Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. The generate prompt with quotes, a backslash, a newline and non-ASCII text came back verbatim. The refine part is built into the M3 `smoke.ps1` and has not been run yet. | part of smoke | M2 |
+| V2 | **Passed** (generate 2026-09-25; refine 2026-09-26). Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. Both the generate prompt and the refine feedback came back verbatim, and the edit target reached `referenced_image_paths`. | part of smoke | M2/M3 |
 | V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
 | V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
 | V5 | With `--codex-home` pointing at a dedicated home, images land under that home. | 1 image, plus a one-time login by the owner | M4 |
-| V9 | Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeed. `smoke.ps1 -SpendQuota -Concurrent` runs it; not run yet. | 2 images | M3 |
+| V9 | **Passed 2026-09-26.** Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeeded (26 s and 30 s), and both sessions were recorded in the shared store. `smoke.ps1 -SpendQuota -Concurrent`. | 2 images | M3 |
 
 ## Milestones
 
