@@ -33,10 +33,11 @@ tagged releases yet. [`docs/design.md`](docs/design.md) describes how it works a
    codex login
    ```
 
-2. **Get `codex-imagegen.exe`.** Download the `codex-imagegen-<commit>` artifact from the latest
-   successful CI run on `main` (the repository's Actions tab), or build it yourself (see
-   [Development](#development)). Put it in a folder outside any repository, for example `C:\tools\`.
-   Claude Code keeps the exe open while it runs, so it should not live where a build overwrites it.
+2. **Get `codex-imagegen.exe`** from the repository's latest GitHub release, where its SHA-256 is
+   published next to it. Between releases, every CI run leaves a `codex-imagegen-<commit>` artifact
+   (the Actions tab), and you can also build it yourself (see [Development](#development)). Put it in
+   a folder outside any repository, for example `C:\tools\`. Claude Code keeps the exe open while it
+   runs, so it should not live where a build overwrites it.
 
 3. **Check it from a terminal.** This is free: nothing is generated.
 
@@ -90,6 +91,10 @@ Ask in plain language; Claude picks the tool. Three tools are offered:
 | `codex_imagegen_generate` | Starts a new session and makes an image | `prompt`; optional `session` name, `output_dir`, up to 5 `reference_images` |
 | `codex_imagegen_refine` | Edits the session's latest image | `session`, `feedback`; optional `output_dir`, up to 4 more `reference_images` |
 | `codex_imagegen_status` | Reports the setup, usage, running turns and this project's sessions | none (free) |
+
+Reference images are files: Claude passes their paths, and each must be a PNG, JPEG or WebP. In the
+desktop app you can also paste an image into the chat and ask for a variation, an edit or a remaster of
+it, with no file saved first: the app keeps the pasted image as a file and gives Claude its path.
 
 The prompt and the feedback reach Codex's image tool verbatim. A generation takes about 40 s. Claude Code
 moves a call that runs past 120 s to the background, and the server stops a call after
@@ -209,6 +214,21 @@ The paid modes are billed to your ChatGPT plan:
 
 `.\smoke.ps1 -CheckTrace <folder>` re-reads the Codex trace a paid run left behind, and spends nothing.
 [`AGENTS.md`](AGENTS.md) has the rules for working on the code.
+
+**Releasing.** Set the new version in `Cargo.toml` (run `cargo build` to update `Cargo.lock`) and merge
+that through a pull request. Then tag the merged commit on `main` and push the tag:
+
+```powershell
+git tag v0.2.0
+```
+
+```powershell
+git push origin v0.2.0
+```
+
+The Release workflow runs the full CI checks on that commit and publishes a GitHub release holding the
+exe CI built and its SHA-256. It refuses a tag that is not on `main`, and one that does not match the
+version the exe reports. A tag with a suffix, such as `v0.2.0-rc.1`, is published as a pre-release.
 
 ## Acknowledgements
 

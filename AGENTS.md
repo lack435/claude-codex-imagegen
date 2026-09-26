@@ -71,8 +71,8 @@ answer it explicitly.
 ## Conventions that are easy to get wrong
 
 - **Never commit `codex-imagegen.exe`.** `dist\` is gitignored. Distributed binaries come from CI,
-  never from a workstation. Today that is the per-commit build artifact; a tag-driven release
-  workflow may come later.
+  never from a workstation: the GitHub release a `vX.Y.Z` tag on `main` publishes
+  (`.github/workflows/release.yml`), or the per-commit build artifact between releases.
 - **Release build flags live in `build.ps1`.** Its `CARGO_ENCODED_RUSTFLAGS` overrides every
   `rustflags` key in `.cargo/config.toml`, so a flag the release needs, such as the path remapping or
   the static CRT, must go in that list.

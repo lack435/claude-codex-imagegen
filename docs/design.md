@@ -33,7 +33,8 @@ refine cancelled 5 s into its image call got no response, Codex completed the tu
 and every `savedPath` named the dedicated home, and nothing of the thread was in the ambient home), V1 and V3 on
 0.157.1, and the sweep removing the session from the dedicated home. M5's README is written: install, a
 "check that it works" list for Claude Code, the tools, options, the dedicated home, output files and cleanup,
-troubleshooting, and the IJG notice. The tag-driven release workflow is not built.
+troubleshooting, and the IJG notice. The tag-driven release workflow is built (see Build and CI) and has
+not published a release yet.
 
 Claims carry one of three tags:
 
@@ -666,7 +667,9 @@ sees the server's tools. A report that comes later interrupts the turn.
 
 ### Codex version pinning
 
-- The tested range starts as exactly 0.156.x. Outside it, `status` warns and generation still proceeds
+- The tested range started as exactly 0.156.x. It is 0.156.x to 0.157.x since the full paid smoke passed on
+  0.157.1 (2026-09-26, 61 of 61 checks: generate, refine, refine after a restart, status, V1, V2, V3 and the
+  sweep), after the M4 run there. Outside it, `status` warns and generation still proceeds
   [decided], because a hard refusal would break on every Codex auto-update.
 - Parsing is defensive:
   - unknown fields are ignored;
@@ -1203,7 +1206,12 @@ The estimate is about 3,500 lines without tests.
   in and that the exe does not import `VCRUNTIME140.dll` [verified].
 - CI runs on Windows. It includes a no-quota contract check: the shipped exe, given a missing `--codex-bin`,
   must return `CLI_NOT_FOUND` with an ACTION REQUIRED block.
-- The tag-driven release workflow comes later.
+- **Release.** Pushing a `vX.Y.Z` tag runs `release.yml`. It calls `ci.yml` as a job, so the release gets
+  the same checks and the same build as every pull request, and then publishes the binary that run built and
+  uploaded as a GitHub release, with its SHA-256 in the notes and in `codex-imagegen.exe.sha256`. The download
+  is verified against the upload's digest. It refuses a tag whose commit is not on `main`, a tag that is not
+  `vX.Y.Z` (optionally with a suffix, which makes a pre-release), and a tag that differs from the version the
+  exe reports, which is `Cargo.toml`'s [decided]. Nothing is signed.
 
 **Unit tests (`cargo test`).** These never spawn a real Codex or call a model. The `app-server` client is
 tested against a scripted fake child that replays message sequences for these cases:
