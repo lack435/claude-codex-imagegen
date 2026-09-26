@@ -8,9 +8,10 @@ first version. M2 has no session store or leases (M3), so `generate` does not ye
 `SESSION_EXISTS`, and `refine` still validates its arguments, runs preflight and returns `INTERNAL_ERROR`. Not
 built yet either: recycling the shared child after a missed per-request deadline (see Deadlines). The
 unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
-V2 (the generate part) and V3. Its trace also showed the sub-agent and `request_user_input` tools still offered to
-the agent model, which the spawn line now switches off, so V1 is re-checked on the next paid run. V0 is still to
-run.
+V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input` tools still offered to
+the agent model. The spawn line now switches those off, and the second paid run passed V1, V2 (generate) and V3
+(34 of 34 automated checks). V0, the check that Claude Code itself renders the preview and shows progress, needs
+an interactive Claude Code session and is still to run.
 
 Claims carry one of three tags:
 
@@ -1065,7 +1066,7 @@ Each item must pass before the code that depends on it is considered done.
 | V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
-| V1 | **Partially run 2026-09-25.** The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill and tool-suggest tools. The item is reported and `savedPath` is populated. The first paid run's trace showed `exec` with the nested image tool, `savedPath` populated and byte-identical to the published copies, and no shell, stdin, web-search, browser, computer-use, skill or tool-suggest tool, but also the sub-agent and `request_user_input` tools (see [Spawn](#spawn)). The re-check after switching them off is pending the next paid run. | 1 image (part of smoke) | M2 |
+| V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
 | V2 | **Passed 2026-09-25 for generate.** Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. The generate prompt with quotes, a backslash, a newline and non-ASCII text came back verbatim. The refine part is pending M3. | part of smoke | M2 |
 | V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
 | V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
