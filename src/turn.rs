@@ -439,6 +439,19 @@ pub fn route_notification(
     let Some((thread_id, event)) = parse_notification(method, params) else {
         return;
     };
+    // How every turn ended, whether or not its call is still waiting: the evidence for an
+    // interrupt (V4) and for a turn that outlived its call.
+    if let Event::TurnCompleted {
+        turn_id, status, ..
+    } = &event
+    {
+        eprintln!(
+            "codex-imagegen: turn {} on thread {} completed: {}",
+            crate::jsonrpc::clamp(turn_id, 100),
+            crate::jsonrpc::clamp(&thread_id, 100),
+            crate::jsonrpc::clamp(status, 40)
+        );
+    }
     send_follow_up(sender, registry.route(&thread_id, event));
 }
 
@@ -991,6 +1004,12 @@ fn wait_for_turn(
         }
         let until = give_up_at.unwrap_or(call.budget.deadline);
         if give_up_at.is_some_and(|at| now >= at) {
+            eprintln!(
+                "codex-imagegen: session {}: Codex did not confirm the interrupt within {} s; the \
+                 session stays busy until it does",
+                request.session,
+                call.interrupt_wait.as_secs()
+            );
             return (Ended::GaveUp, stop);
         }
         if !call.server.is_alive() {
@@ -1062,7 +1081,14 @@ fn apply_event(
             deliver(turn, image, request);
             phase("waiting for Codex");
         }
-        Event::ImageFailed { failure, .. } => turn.failures.push(failure),
+        Event::ImageFailed { failure, .. } => {
+            eprintln!(
+                "codex-imagegen: session {}: image item failed: {}",
+                request.session,
+                failure_text(&failure)
+            );
+            turn.failures.push(failure);
+        }
         Event::AgentMessage { text, .. } => {
             if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
                 turn.note = Some(line.trim().to_string());
@@ -1405,8 +1431,10 @@ fn end_warnings(
     match ended {
         Ended::Completed => match turn.status.as_deref() {
             Some("completed") => {}
+            // "after the image finished" only when it did: under a cancel or the limit, the image
+            // may have completed in the seconds the call waited for the interrupt.
             Some("interrupted") => warnings.push(match &why {
-                Some(why) => format!("{why} after the image finished, so the turn was interrupted"),
+                Some(why) => format!("{why}, so the turn was interrupted"),
                 None if stop == Some(Stop::Breach) => {
                     "the turn was interrupted after the image finished".to_string()
                 }
@@ -1425,8 +1453,8 @@ fn end_warnings(
             )),
         },
         Ended::GaveUp => warnings.push(format!(
-            "{} after the image finished; the turn was interrupted, Codex had not confirmed it \
-             within {} s, and the session stays busy until it does",
+            "{}, so the turn was interrupted; Codex had not confirmed it within {} s, and the \
+             session stays busy until it does",
             why.unwrap_or_else(|| "the turn was stopped".to_string()),
             call.interrupt_wait.as_secs()
         )),
@@ -2739,6 +2767,71 @@ mod generate_tests {
         // Unsubscribing now would also stop the turn/completed that frees the session.
         assert!(FakeCodex::sent(&seen, "thread/unsubscribe").is_empty());
 
+        wait_sent(&seen, "thread/unsubscribe", 1);
+        wait_until("the session to be freed", || f.running().is_empty());
+    }
+
+    #[test]
+    fn an_image_that_completes_after_the_limit_but_before_the_turn_ends_is_a_success() {
+        let saved = saved_png();
+        let fake = codex_with(TurnScript {
+            steps: vec![
+                Step::Send(turn_started()),
+                Step::Send(image_started("exec-1")),
+            ],
+            // Codex finishes the image in the seconds the call waits for the interrupt.
+            on_interrupt: vec![
+                image_completed("exec-1", "p", "", Some(&saved.path)),
+                turn_completed("interrupted", Value::Null),
+            ],
+            ..TurnScript::default()
+        });
+        let f = fixture_with(fake, &[], |cfg, _| cfg.timeout = Duration::from_secs(1));
+        let result = generate(&f, json!({"prompt": "p", "session": "late"}));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = text_of(&result);
+        assert!(
+            text.contains(
+                "warning: the call reached its 1-second limit (--timeout-seconds), so the turn \
+                 was interrupted"
+            ),
+            "{text}"
+        );
+        assert!(f.dir.join("generated-images").join("late-v1.png").is_file());
+        assert_eq!(f.record("late").unwrap().turns, 1);
+    }
+
+    #[test]
+    fn an_image_is_kept_when_the_limit_passes_and_codex_never_confirms_the_interrupt() {
+        let saved = saved_png();
+        let fake = codex_with(TurnScript {
+            steps: vec![
+                Step::Send(turn_started()),
+                Step::Send(image_started("exec-1")),
+                Step::Send(image_completed("exec-1", "p", "", Some(&saved.path))),
+                Step::Sleep(Duration::from_millis(2000)),
+                Step::Send(turn_completed("interrupted", Value::Null)),
+            ],
+            on_interrupt: vec![],
+            ..TurnScript::default()
+        });
+        let seen = Arc::clone(&fake.seen);
+        let f = fixture_with(fake, &[], |cfg, wait| {
+            cfg.timeout = Duration::from_millis(500);
+            *wait = Duration::from_millis(300);
+        });
+        let result = generate(&f, json!({"prompt": "p", "session": "fox"}));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = text_of(&result);
+        assert!(
+            text.contains("the session stays busy until it does"),
+            "{text}"
+        );
+        assert!(f.dir.join("generated-images").join("fox-v1.png").is_file());
+        assert_eq!(f.record("fox").unwrap().turns, 1);
+        let running = f.running();
+        assert_eq!(running.len(), 1);
+        assert!(running[0].interrupted);
         wait_sent(&seen, "thread/unsubscribe", 1);
         wait_until("the session to be freed", || f.running().is_empty());
     }

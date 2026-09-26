@@ -163,13 +163,17 @@ fn login_instructions(codex_home: Option<&Path>) -> String {
         None => "  codex login\n\n\
                  Sign in with the ChatGPT account whose plan should pay for the images."
             .to_string(),
+        // Commands to paste as they stand: PowerShell has no `VAR=value command` form, and the
+        // variable is removed again so it does not linger in that window.
         Some(home) => format!(
             "codex-imagegen runs Codex with a dedicated home, {home} (its --codex-home flag), so \
-             sign that home in: in a terminal, set the CODEX_HOME environment variable to \
-             {home} and run\n\n\
-             \x20 codex login --device-auth\n\n\
+             sign that home in. In PowerShell:\n\n\
+             \x20 $env:CODEX_HOME = '{quoted}'; codex login --device-auth; Remove-Item \
+             Env:CODEX_HOME\n\n\
+             (in Git Bash: CODEX_HOME='{home}' codex login --device-auth)\n\n\
              Sign in with the ChatGPT account whose plan should pay for the images.",
-            home = home.display()
+            home = home.display(),
+            quoted = home.display().to_string().replace('\'', "''")
         ),
     }
 }
@@ -228,6 +232,27 @@ pub fn spawn_failed(bin: &str, detail: impl Into<String>) -> Failure {
     .with_detail(detail)
 }
 
+/// The Codex home to start the child with is missing or not a folder. Codex exits at once on such
+/// a `CODEX_HOME` [verified: codex-cli 0.157.1], which would otherwise reach the agent as an
+/// app-server failure with a retry remediation.
+pub fn codex_home_unusable(home: &Path, why: &str) -> Failure {
+    Failure::new(
+        "SPAWN_FAILED",
+        format!("Codex was not started: its home {} {why}.", home.display()),
+        format!(
+            "codex-imagegen runs Codex with CODEX_HOME set to its --codex-home folder, and Codex \
+             refuses a home that is missing or not a folder. Either create the folder and sign it \
+             in once:\n\n\
+             \x20 New-Item -ItemType Directory -Force '{quoted}'\n\n{login}\n\n\
+             and retry, or correct the --codex-home value in the codex-imagegen MCP registration \
+             (a backslash just before the closing quote swallows the quote) and restart the MCP \
+             server (restart the Claude Code session, or reconnect the server with /mcp).",
+            quoted = home.display().to_string().replace('\'', "''"),
+            login = login_instructions(Some(home))
+        ),
+    )
+}
+
 /// The Codex app-server failed, timed out, or exited while answering `method`.
 pub fn app_server_failed(method: &str, detail: impl Into<String>) -> Failure {
     Failure::new(
@@ -276,15 +301,18 @@ pub fn not_chatgpt_account(account_type: &str, codex_home: Option<&Path>) -> Fai
 }
 
 /// The signed-in account's plan does not get image generation (`planType: "free"`).
-pub fn imagegen_unavailable_on_plan(plan: &str) -> Failure {
+pub fn imagegen_unavailable_on_plan(plan: &str, codex_home: Option<&Path>) -> Failure {
     Failure::new(
         "IMAGEGEN_UNAVAILABLE",
         format!(
             "The signed-in ChatGPT account is on the '{plan}' plan, and codex-imagegen does not \
              generate images on that plan."
         ),
-        "Sign Codex in with an account on a paid ChatGPT plan (run codex login in a terminal), \
-         then retry. codex-imagegen picks up the new login on its next call, with no restart.",
+        format!(
+            "Sign Codex in with an account on a paid ChatGPT plan. In a terminal:\n\n{}\n\n\
+             Then retry. codex-imagegen picks up the new login on its next call, with no restart.",
+            login_instructions(codex_home)
+        ),
     )
 }
 
@@ -790,7 +818,7 @@ mod tests {
             not_authenticated(None),
             not_authenticated(Some(Path::new(r"D:\codex-home"))),
             not_chatgpt_account("apiKey", None),
-            imagegen_unavailable_on_plan("free"),
+            imagegen_unavailable_on_plan("free", None),
             imagegen_unavailable_capability(),
             imagegen_unavailable_setting("features.image_generation = false"),
             codex_config_unreadable("legacy `profile = \"x\"` config is no longer supported"),
@@ -950,10 +978,26 @@ mod tests {
     #[test]
     fn a_dedicated_home_is_named_in_the_login_instructions() {
         let failure = not_authenticated(Some(Path::new(r"D:\codex-home")));
-        assert!(failure.remediation.contains(r"D:\codex-home"));
-        assert!(failure.remediation.contains("CODEX_HOME"));
+        assert!(
+            failure.remediation.contains(
+                r"$env:CODEX_HOME = 'D:\codex-home'; codex login --device-auth; Remove-Item Env:CODEX_HOME"
+            ),
+            "{}",
+            failure.remediation
+        );
+        assert!(failure
+            .remediation
+            .contains(r"CODEX_HOME='D:\codex-home' codex login --device-auth"));
         let ambient = not_authenticated(None);
         assert!(!ambient.remediation.contains("CODEX_HOME"));
+        // A quote in the path is doubled inside PowerShell's single quotes.
+        let quoted = not_authenticated(Some(Path::new(r"D:\o'neil")));
+        assert!(quoted.remediation.contains(r"'D:\o''neil'"));
+        // The plan refusal signs in the same home.
+        let plan = imagegen_unavailable_on_plan("free", Some(Path::new(r"D:\codex-home")));
+        assert!(plan
+            .remediation
+            .contains(r"$env:CODEX_HOME = 'D:\codex-home'"));
     }
 
     #[test]

@@ -888,6 +888,11 @@ impl App {
                 "Codex home: {} ({mode})",
                 handshake.codex_home.display()
             ));
+        } else if let Some(home) = &self.cfg.codex_home {
+            line(format!(
+                "Codex home: {} (dedicated, from --codex-home; Codex did not start)",
+                home.display()
+            ));
         }
         line(format!("account: {}", account_text(facts, failure)));
         line(format!(
