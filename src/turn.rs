@@ -940,7 +940,7 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
                 ),
                 None => format!(
                     "could not save the image into {} ({e}), and Codex kept no copy of its \
-                         own: the preview above is the only copy",
+                         own: the preview is the only copy",
                     request.output_dir.display()
                 ),
             });
@@ -1703,7 +1703,7 @@ mod generate_tests {
         );
         assert_eq!(
             lines[2],
-            "preview above is a 96px JPEG; the file is the full-resolution original"
+            "the preview is a 96px JPEG; the file is the full-resolution original"
         );
         assert_eq!(
             lines[3],
@@ -2024,7 +2024,7 @@ mod generate_tests {
             text.contains("warning: no preview could be built"),
             "{text}"
         );
-        assert!(!text.contains("preview above"), "{text}");
+        assert!(!text.contains("the preview is a"), "{text}");
         let published = f.dir.join("generated-images").join("s-v1.png");
         assert_eq!(std::fs::read(published).unwrap(), saved.bytes);
     }

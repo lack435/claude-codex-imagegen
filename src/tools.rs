@@ -2066,11 +2066,15 @@ mod tests {
             });
             *lock(&f.app.child) = Some(replacement);
 
+            // Fake children have no process or job, so this only shows begin_shutdown does not
+            // block on the retired child; the shared-grace arithmetic runs only for real children.
+            // The checks that matter follow: the call returns promptly, and the interrupt went to
+            // the retired child, not the replacement.
             let started = Instant::now();
             f.app.begin_shutdown();
             assert!(
                 started.elapsed() < SHUTDOWN_GRACE,
-                "{:?}",
+                "begin_shutdown blocked for {:?}",
                 started.elapsed()
             );
             let (is_error, text) = rx

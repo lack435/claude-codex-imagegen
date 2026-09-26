@@ -74,16 +74,16 @@ impl Preview {
         let edge = self.width.max(self.height);
         if self.mime_type == "image/png" {
             format!(
-                "preview above is a {edge}px PNG, because the image has transparency; the file is \
+                "the preview is a {edge}px PNG, because the image has transparency; the file is \
                  the full-resolution original"
             )
         } else if self.flattened {
             format!(
-                "preview above is a {edge}px JPEG with the transparency flattened onto white; the \
+                "the preview is a {edge}px JPEG with the transparency flattened onto white; the \
                  file is the full-resolution original, transparency included"
             )
         } else {
-            format!("preview above is a {edge}px JPEG; the file is the full-resolution original")
+            format!("the preview is a {edge}px JPEG; the file is the full-resolution original")
         }
     }
 }
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!((w, h), (1024, 936));
         assert_eq!(
             preview.note(),
-            "preview above is a 1024px JPEG; the file is the full-resolution original"
+            "the preview is a 1024px JPEG; the file is the full-resolution original"
         );
         let block = preview.image_block();
         assert_eq!(block["type"], "image");
@@ -695,7 +695,7 @@ mod tests {
         assert_eq!((w, h), (640, 480));
         assert_eq!(
             small.note(),
-            "preview above is a 640px JPEG; the file is the full-resolution original"
+            "the preview is a 640px JPEG; the file is the full-resolution original"
         );
     }
 

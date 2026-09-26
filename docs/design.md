@@ -10,8 +10,10 @@ built yet either: recycling the shared child after a missed per-request deadline
 unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
 V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input` tools still offered to
 the agent model. The spawn line now switches those off, and the second paid run passed V1, V2 (generate) and V3
-(34 of 34 automated checks). V0, the check that Claude Code itself renders the preview and shows progress, needs
-an interactive Claude Code session and is still to run.
+(34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
+it accurately, both through `claude -p` and in the desktop app, where it appears in the expanded tool row. The
+desktop app shows no progress line; the terminal renderer draws one [verified: bundle]. The TaskStop part of V0 was
+not run.
 
 Claims carry one of three tags:
 
@@ -250,7 +252,7 @@ content: [
   {type:"text", text:
      "session: fox-watercolor   version: 2\n" +
      "image: C:\\proj\\generated-images\\fox-watercolor-v2.png  (1312x1199, 2.6 MB PNG)\n" +
-     "preview above is a 1024px JPEG; the file is the full-resolution original\n" +
+     "the preview is a 1024px JPEG; the file is the full-resolution original\n" +
      "codex prompt: <revisedPrompt>\n" +
      "codex note: <Codex's closing line, quoted, untrusted>\n" +
      "took 38.1 s; Codex agent usage: weekly 44% (resets 2026-10-01 14:17)\n" +
@@ -581,7 +583,8 @@ sees the server's tools. A report that comes later interrupts the turn.
      still queued, then closes the pipe (an idle child exits in 0.05–0.07 s [verified]);
   4. wait up to 5 s in total, one grace shared by all of them;
   5. drop the jobs. This step never waits on the pipe, so a child that stopped reading is killed on time. A call
-     whose child is gone returns at once, so the calls still running end within the grace too.
+     whose child is gone returns soon after, bounded by the ~2.5 s exit settle (see Child death), so no call
+     outlives the grace by more than that.
 
   This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
   straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:
@@ -1073,7 +1076,7 @@ Each item must pass before the code that depends on it is considered done.
 
 | # | Check | Cost | When |
 | --- | --- | --- | --- |
-| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
+| V0 | **Passed 2026-09-25 for rendering.** Claude Code renders the JPEG preview and shows the progress line; TaskStop on a backgrounded call produces `notifications/cancelled`. Run against the real server rather than a stub. Through `claude -p` (1 image), Claude described the preview accurately and reported it intact, matching the saved file. In the desktop app's Code tab the image appears in the expanded tool row, the text block is shown above it (so the preview note is worded order-neutrally), and no progress line is drawn; the terminal renderer draws progress [verified: bundle]. The TaskStop part was not run. | 1 image + Claude usage | M2 |
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
 | V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
