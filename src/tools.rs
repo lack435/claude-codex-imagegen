@@ -1051,12 +1051,6 @@ impl ToolHost for App {
                 ),
             })
         };
-        let output_dir = json!({
-            "type": "string",
-            "description": "Folder for the full-resolution PNG. Default: the project's \
-                            generated-images folder. A relative path resolves against the \
-                            project directory.",
-        });
         vec![
             json!({
                 "name": GENERATE,
@@ -1081,7 +1075,12 @@ impl ToolHost for App {
                                             '_', '-'; up to 64). Omit to have one picked.",
                         },
                         "reference_images": reference_images(5, ""),
-                        "output_dir": output_dir.clone(),
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Folder for the full-resolution PNG. Default: the \
+                                            project's generated-images folder. A relative path \
+                                            resolves against the project directory.",
+                        },
                     },
                     "required": ["prompt"],
                     "additionalProperties": false,
@@ -1112,7 +1111,14 @@ impl ToolHost for App {
                             4,
                             " The session's latest image is always the edit target."
                         ),
-                        "output_dir": output_dir,
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Folder for the new version's full-resolution PNG. \
+                                            Default: the folder the session was created with. A \
+                                            folder given here applies to this call only. A \
+                                            relative path resolves against the project \
+                                            directory.",
+                        },
                     },
                     "required": ["session", "feedback"],
                     "additionalProperties": false,
@@ -1861,6 +1867,18 @@ mod tests {
         let refine = &tools[1]["inputSchema"];
         assert_eq!(refine["required"], json!(["session", "feedback"]));
         assert_eq!(refine["properties"]["reference_images"]["maxItems"], 4);
+        // Each tool's own default folder: refine's is the session's, not the project's.
+        assert_eq!(
+            generate["properties"]["output_dir"]["description"],
+            "Folder for the full-resolution PNG. Default: the project's generated-images folder. \
+             A relative path resolves against the project directory."
+        );
+        assert_eq!(
+            refine["properties"]["output_dir"]["description"],
+            "Folder for the new version's full-resolution PNG. Default: the folder the session \
+             was created with. A folder given here applies to this call only. A relative path \
+             resolves against the project directory."
+        );
         assert_eq!(tools[2]["inputSchema"]["properties"], json!({}));
 
         for tool in &tools {

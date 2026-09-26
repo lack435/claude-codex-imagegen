@@ -619,7 +619,8 @@ pub fn run(call: &Call<'_>, slot: TurnSlot<Event>, request: &Request<'_>) -> Fin
             edit_target,
         } => {
             phase("resuming session");
-            if let Err(failure) = resume_thread(call, &rpc, request, thread_id, edit_target, &phase)
+            if let Err(failure) =
+                resume_thread(call, &rpc, &sender, request, thread_id, edit_target, &phase)
             {
                 return Finished::failed(failure);
             }
@@ -780,8 +781,9 @@ fn start_thread(call: &Call<'_>, rpc: &Rpc<'_>) -> Result<String, Failure> {
 }
 
 /// `config/read`, the MCP-off map built fresh from it, then `thread/resume` of the session's
-/// thread, before every refine turn, even when the thread is still loaded here: then it only
-/// re-subscribes (docs/design.md, "Refine"). Its errors, by Codex's message:
+/// thread, before every refine turn. A thread still loaded here with no subscriber (inside its
+/// unload delay) is shut down and resumed cold with the fresh map and instructions, which Codex
+/// cannot apply to a loaded thread (docs/design.md, "Refine"). Its errors, by Codex's message:
 ///
 /// - "is closing": this child is unloading the thread; retried every 250 ms.
 /// - "already has an active writer": another process has it loaded, perhaps another
@@ -793,10 +795,14 @@ fn start_thread(call: &Call<'_>, rpc: &Rpc<'_>) -> Result<String, Failure> {
 /// - anything else: APP_SERVER_FAILED with the detail.
 ///
 /// The resume itself gets whatever remains of the call's budget, and every pause between tries
-/// ends at a cancellation or the end of the budget.
+/// ends at a cancellation or the end of the budget. A resume that may have subscribed this child
+/// without the turn going ahead (abandoned on a cancel or timeout, an unreadable reply, an error
+/// not listed above) is followed by `thread/unsubscribe`, so the thread's writer lock does not
+/// outlive the call.
 fn resume_thread(
     call: &Call<'_>,
     rpc: &Rpc<'_>,
+    sender: &DetachedSender,
     request: &Request<'_>,
     thread_id: &str,
     edit_target: &Path,
@@ -831,13 +837,26 @@ fn resume_thread(
                     .and_then(Value::as_str)
                 {
                     Some(id) if id == thread_id => Ok(()),
-                    _ => Err(anomaly(
-                        call,
-                        "a thread/resume reply that does not name the thread resumed",
-                    )),
+                    // Resumed, so subscribed, whatever the reply says.
+                    _ => {
+                        send_unsubscribe(sender, thread_id);
+                        Err(anomaly(
+                            call,
+                            "a thread/resume reply that does not name the thread resumed",
+                        ))
+                    }
                 };
             }
             Err(RpcError::Remote { code, message }) => (code, message),
+            // Sent, but no longer waited for: Codex goes on with it, and may still load the thread
+            // and subscribe this child. It runs the requests about one thread in the order they
+            // arrive [verified: source, `request_serialization.rs`], so this unsubscribe follows
+            // that resume, and the thread unloads after its delay whether or not the resume took.
+            Err(e @ (RpcError::Cancelled | RpcError::Timeout { .. })) => {
+                send_unsubscribe(sender, thread_id);
+                return Err(resume.failure(METHOD, e));
+            }
+            // Never sent, or the child is gone: nothing to unsubscribe from.
             Err(e) => return Err(resume.failure(METHOD, e)),
         };
         if message.contains("no rollout found") {
@@ -875,6 +894,10 @@ fn resume_thread(
             map_retried = true;
             continue;
         } else {
+            // A few of Codex's resume errors come after it has subscribed this child [verified:
+            // source, `thread_resume_inner`]. On a thread this child is not subscribed to, the
+            // unsubscribe is harmless.
+            send_unsubscribe(sender, thread_id);
             return Err(resume.failure(METHOD, RpcError::Remote { code, message }));
         };
         let now = Instant::now();
@@ -3009,6 +3032,7 @@ mod refine_tests {
     use crate::tools::testing::{fixture, fixture_with, result_text, Fixture};
     use crate::tools::{GENERATE, REFINE, STATUS};
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
 
     const FEEDBACK: &str = "Make the \"sky\" warmer,\nkeep C:\\keeper \u{2014} caf\u{e9} as is.";
 
@@ -3337,6 +3361,76 @@ mod refine_tests {
     }
 
     #[test]
+    fn a_resume_abandoned_on_a_cancel_or_a_timeout_is_followed_by_an_unsubscribe() {
+        let saved = saved_png();
+        let slow_resume = |delay_ms: u64| {
+            codex_with(TurnScript {
+                resume_delay: Duration::from_millis(delay_ms),
+                steps: image_turn(&saved.path, FEEDBACK),
+                ..TurnScript::default()
+            })
+        };
+        // Codex answers the resume after the call stopped waiting, and this child is then
+        // subscribed: without the unsubscribe the thread would hold its writer lock for as long as
+        // the child lives.
+        let check = |seen: &Mutex<Vec<Value>>, f: &Fixture| {
+            assert_eq!(
+                wait_sent(seen, "thread/unsubscribe", 1),
+                vec![json!({"threadId": THREAD_ID})]
+            );
+            let methods: Vec<String> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["method"].as_str().map(str::to_string))
+                .collect();
+            let at = |method: &str| methods.iter().position(|m| m == method).unwrap();
+            assert!(
+                at("thread/resume") < at("thread/unsubscribe"),
+                "{methods:?}"
+            );
+            assert!(FakeCodex::sent(seen, "turn/start").is_empty());
+            assert_eq!(f.record("fox").unwrap().turns, 1);
+            assert!(f.running().is_empty());
+            assert!(f.store().try_lease("fox").unwrap().is_some(), "the lease");
+        };
+
+        // Cancelled (Esc) while the resume is unanswered.
+        let fake = slow_resume(600);
+        let seen = Arc::clone(&fake.seen);
+        let f = fixture(fake);
+        seed(&f, "fox", &saved, &f.dir.join("generated-images"));
+        let cancel = Arc::new(RequestCancel::new());
+        let ctx = CallContext::with_cancel(Arc::clone(&cancel));
+        let result = std::thread::scope(|s| {
+            let call = s.spawn(|| {
+                f.app.call_tool(
+                    REFINE,
+                    &json!({"session": "fox", "feedback": FEEDBACK}),
+                    &ctx,
+                )
+            });
+            wait_sent(&seen, "thread/resume", 1);
+            cancel.cancel();
+            call.join().unwrap()
+        });
+        assert_eq!(code_of(&result), "CANCELLED");
+        check(&seen, &f);
+        // The late reply changes nothing.
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(FakeCodex::sent(&seen, "turn/start").is_empty());
+
+        // Still unanswered when the call's budget runs out.
+        let fake = slow_resume(2000);
+        let seen = Arc::clone(&fake.seen);
+        let f = fixture_with(fake, &[], |cfg, _| cfg.timeout = Duration::from_millis(800));
+        seed(&f, "fox", &saved, &f.dir.join("generated-images"));
+        let result = refine(&f, json!({"session": "fox", "feedback": FEEDBACK}));
+        assert_eq!(code_of(&result), "TIMEOUT");
+        check(&seen, &f);
+    }
+
+    #[test]
     fn a_thread_codex_no_longer_has_is_not_resumable_and_names_the_edit_target() {
         let saved = saved_png();
         let fake = codex_with(TurnScript {
@@ -3359,16 +3453,22 @@ mod refine_tests {
         assert_eq!(FakeCodex::sent(&seen, "thread/resume").len(), 1);
         assert!(FakeCodex::sent(&seen, "turn/start").is_empty());
 
-        // Any other refusal is APP_SERVER_FAILED, with Codex's words.
+        // Any other refusal is APP_SERVER_FAILED, with Codex's words. Some come after Codex has
+        // subscribed this child, so it unsubscribes.
         let fake = codex_with(TurnScript {
             resume_errors: vec![resume_error("thread is archived")],
             ..TurnScript::default()
         });
+        let seen = Arc::clone(&fake.seen);
         let f = fixture(fake);
         seed(&f, "fox", &saved, &f.dir.join("generated-images"));
         let result = refine(&f, json!({"session": "fox", "feedback": FEEDBACK}));
         assert_eq!(code_of(&result), "APP_SERVER_FAILED");
         assert!(text_of(&result).contains("thread is archived"));
+        assert_eq!(
+            wait_sent(&seen, "thread/unsubscribe", 1),
+            vec![json!({"threadId": THREAD_ID})]
+        );
     }
 
     #[test]

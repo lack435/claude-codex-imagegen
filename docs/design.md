@@ -317,6 +317,14 @@ Claude ── tools/call generate|refine
   8. release the lease; return a result built from the completed images, or an error if there were none
 ```
 
+**Unsubscribe.** Step 7 also follows a `thread/resume` that may have subscribed this child without a turn going
+ahead: one cut short by a cancel or the end of the budget, one whose reply cannot be read, and one refused with an
+error not handled under [Refine](#refine). Codex goes on with a request the client has stopped waiting for, and
+runs the requests about one thread in the order they arrive, so the unsubscribe follows the late resume and the
+thread unloads after its delay, releasing its writer lock [verified: source, `request_serialization.rs`,
+`thread_resume_inner`]. A `thread/start` cut short the same way is not unsubscribed: the call never learns its
+thread id, no session records it, and it stays loaded in the child until the child exits [decided: accepted].
+
 **Deadlines.**
 
 - The whole call counts against `--timeout-seconds` (default 300): spawn, preflight, resume, turn, copy and
@@ -344,10 +352,16 @@ Claude ── tools/call generate|refine
    aside, a trailing separator aside, and with or without the `\\?\` prefix Codex puts on a canonicalised
    `CODEX_HOME` [verified: source, `utils/home-dir`].
 3. **Always call `thread/resume`** with `excludeTurns: true` and the thread parameters, before every
-   `turn/start`, each try after a fresh `config/read` and MCP-off map. On a thread still loaded in this child,
-   that only re-subscribes [verified: source, `resume_running_thread`]. The resume gets whatever remains of the
-   call's budget, and every pause between tries ends at a cancellation or the end of the budget. Errors, by
-   Codex's message:
+   `turn/start`, each try after a fresh `config/read` and MCP-off map. Codex counts our `config` and
+   `developerInstructions` as overrides it cannot apply to a loaded thread. So on a thread still loaded in this
+   child with no subscriber, the normal state inside the unload delay after our unsubscribe, it shuts the idle
+   thread down (waiting up to 10 s, out of the resume's budget) and resumes it cold with the fresh parameters;
+   that teardown sends no `thread/closed`. Only when the thread still has a subscriber, or its shutdown fails or
+   times out, does Codex rejoin the loaded thread and ignore the overrides, logging a warning [verified: source,
+   `thread_processor.rs` `collect_resume_override_mismatches`, `resume_running_thread`]. The resume gets
+   whatever remains of the call's budget, and every pause between tries ends at a cancellation or the end of the
+   budget. A resume cut short by a cancel or the end of the budget is followed by `thread/unsubscribe` (see
+   [Unsubscribe](#request-flow)). Errors, by Codex's message:
    - "is closing; retry": this child is unloading the thread. Retry every 250 ms, within the window below, then
      `APP_SERVER_FAILED`.
    - "already has an active writer": another process has the thread loaded. It may be another codex-imagegen
@@ -357,7 +371,8 @@ Claude ── tools/call generate|refine
      the Codex app; close it there, or use a new session.
    - "no rollout found": `SESSION_NOT_RESUMABLE`, naming the edit target as the new session's reference.
    - A config error naming `mcp_servers`: rebuild the map and retry once, as for `thread/start`.
-   - Any other error: `APP_SERVER_FAILED` with the detail.
+   - Any other error: `APP_SERVER_FAILED` with the detail, after `thread/unsubscribe`, because a few of Codex's
+     resume errors come after it has subscribed this child.
 4. **Name the edit target explicitly** in the input. Codex never picks it from memory [decided].
 5. **Run the turn** exactly as generate's: the canary check before `turn/start`, each image published as
    `<session>-v<next_version>.png` (bumped past a taken name) and recorded at once, the unsubscribe, cancel,
@@ -1106,7 +1121,8 @@ tested against a scripted fake child that replays message sequences for these ca
   `output_dir` argument for one call; the edit target falling back to the published copy, versions carrying on
   past a taken name; no copy left (nothing sent, a surviving older version named); a foreign `codex_home`;
   "is closing" retried; "active writer" waited out, and ending in `SESSION_OPEN_ELSEWHERE`; "no rollout found"
-  and another refusal; `contextWindowExceeded`; a revised prompt that is not the feedback; a turn with no image;
+  and another refusal (unsubscribed); a resume abandoned on a cancel or a timeout, then answered late, followed by
+  `thread/unsubscribe`; `contextWindowExceeded`; a revised prompt that is not the feedback; a turn with no image;
   the canary after a resume; a held lease and an unreadable store before Codex starts; a generated session
   refined after Codex restarts
 - cleanup:
@@ -1139,15 +1155,21 @@ user is told the cost:
 4. (c) kill the exe (the job object must take the Codex tree with it), start a fresh one on the same state
    folder, and `refine` again: resume after a restart
 5. (d) `status`, which must list the session with three turns and its latest file; then close the server
-6. (e) free: `--cleanup --older-than-days 0` on the state folder
+6. (e) free, and run whatever the steps before got to: `--cleanup --older-than-days 0` on the state folder
 
 Each result must carry an `image/jpeg` preview of 512,000 bytes or less with a long edge of 1024 px or less, be
 the next version (`session: <name>   version: N`), name `<session>-vN.png` in the output folder, and that file
 must exist. V2 is compared by the script itself on every turn: the `codex prompt` line, JSON-decoded, must equal
-the prompt or feedback sent (whitespace at either end aside), and the server must raise no prompt warning. After
-(e), the session's record, its three published files, Codex's image folder for its thread and the thread's
-rollout (found by its id under `<codex_home>\sessions`, which must exist before) must all be gone, and
-`--cleanup` must exit 0 and report the session removed.
+the prompt or feedback sent (whitespace at either end aside), and the server must raise no prompt warning.
+
+Step (e) covers every session the isolated store records, not only those the run kept track of: a result lost
+after its image completed still left a record, and a thread in the real Codex home that nothing else would
+remove. Before it, each session's record must list exactly the files the run published, named independently of
+the record (`<session>-v1..vN`: the output folder is fresh), and those files must exist; a recorded session the
+run lost track of fails the run. After it, each session's record, those files, any other file its record listed
+or of its name in the output folder, Codex's image folder for its thread and the thread's rollout (found by its
+id under `<codex_home>\sessions`, which must exist before) must all be gone, and `--cleanup` must exit 0 and
+report the session removed.
 
 With `-Concurrent` as well (V9, about 2 more images), two server processes on the same state folder, each with
 its own stdin, get their `generate` requests before either is answered; both must succeed, and both sessions

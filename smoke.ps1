@@ -25,9 +25,11 @@
     d) status lists the session with 3 turns;
   then reads the trace for the tools the agent model was offered (V1) and the servers' stderr for
   the savedPath Codex reported for each image (V1), and finally, free:
-    e) closes every server and runs codex-imagegen.exe --cleanup --older-than-days 0 on the state
-       folder, which must remove the session's record, its three published files, Codex's image
-       folder for its thread, and the thread's rollout.
+    e) closes every server and, whatever the run got to, runs codex-imagegen.exe --cleanup
+       --older-than-days 0 on the state folder. It must remove every session the store records:
+       its record, the files the run published (<session>-v1..vN, which the record must list
+       exactly), Codex's image folder for its thread, and the thread's rollout. A recorded session
+       the run lost track of fails the run, and is still removed.
 
   With -Concurrent as well (V9, about 2 more images), two server processes on the same state
   folder, each with its own stdin, generate at the same moment; both must succeed, and both
@@ -998,26 +1000,52 @@ if ($SpendQuota) {
 # (e) The manual sweep, free: thread/delete and file deletions only
 # ---------------------------------------------------------------------------------------------
 
-if ($SpendQuota -and $sessionsMade.Count -gt 0 -and $store) {
+# On a paid run it runs whatever the run got to, and covers every session the isolated store
+# records, not only the ones the run kept track of: a result lost after its image completed (a
+# closed stream, a parse that threw) still left a record, and a thread in the real Codex home that
+# nothing else would ever remove. The store is the run's own, so the sweep can touch nothing else.
+# A tracked session's files are named independently of its record: the output folder is fresh, so
+# <session>-v1..vN are exactly the files the run published.
+
+if ($SpendQuota) {
+    $recorded = @()
+    $sessionMap = Get-Field $store 'sessions'
+    if ($sessionMap -is [Collections.IDictionary]) {
+        $recorded = @($sessionMap.Values)
+    }
+    elseif (@(Get-ChildItem -LiteralPath $stateBase -Recurse -File -Filter 'sessions.json' -ErrorAction SilentlyContinue).Count -gt 0) {
+        Test-Check '(e) the run''s session store can be read' $false 'the sweep may leave the run''s sessions behind'
+    }
     # What each session left, read before the sweep removes it.
     $left = @()
-    foreach ($name in $sessionsMade.Keys) {
-        $record = Get-Record $store $name
-        if ($null -eq $record) {
-            Test-Check "$name is recorded in the store" $false ''
-            continue
-        }
+    foreach ($record in $recorded) {
+        $name = [string](Get-Field $record 'name')
         $threadId = [string](Get-Field $record 'thread_id')
         $sessionHome = [string](Get-Field $record 'codex_home')
         # Assigned first, not piped: Get-Field hands an array over as one pipeline object.
         $published = Get-Field $record 'outputs'
         $outputs = @()
-        foreach ($o in @($published)) { $outputs += [string](Get-Field $o 'path') }
+        foreach ($o in @($published | Where-Object { $_ })) { $outputs += [string](Get-Field $o 'path') }
+        $expected = @()
+        if ($sessionsMade.Contains($name)) {
+            $expected = @(1..$sessionsMade[$name] | ForEach-Object { Join-Path $outDir "$name-v$_.png" })
+            $sameList = $outputs.Count -eq $expected.Count -and
+                -not (Compare-Object @($outputs | ForEach-Object { $_.ToLowerInvariant() }) @($expected | ForEach-Object { $_.ToLowerInvariant() }))
+            Test-Check "(e) $name's record lists exactly the $($expected.Count) file(s) the run published" $sameList ($outputs -join ', ')
+            $missing = @($expected | Where-Object { -not (Test-Path -LiteralPath $_) })
+            Test-Check "(e) $name's $($expected.Count) published file(s) exist before the sweep" ($missing.Count -eq 0) ($missing -join ', ')
+        }
+        else {
+            Test-Check "(e) $name was tracked by the run" $false 'recorded in the store, but no result the run read reported it; the sweep still removes it'
+        }
         $rollouts = @(Get-Rollouts $sessionHome $threadId)
         if ($rollouts.Count -eq 0) {
             Add-Check "(e) $name's thread has a rollout to remove" 'MANUAL' "none found for $threadId under $sessionHome\sessions; the rollout check below proves nothing"
         }
-        $left += [pscustomobject]@{ Name = $name; ThreadId = $threadId; Home = $sessionHome; Outputs = $outputs; Rollouts = $rollouts.Count }
+        $left += [pscustomobject]@{ Name = $name; ThreadId = $threadId; Home = $sessionHome; Outputs = $outputs; Expected = $expected }
+    }
+    foreach ($name in $sessionsMade.Keys) {
+        if (-not @($left | Where-Object { $_.Name -eq $name })) { Test-Check "$name is recorded in the store" $false '' }
     }
     Write-Host '-> (e) codex-imagegen.exe --cleanup --older-than-days 0 (free)'
     $sweep = Invoke-Cleanup
@@ -1026,16 +1054,20 @@ if ($SpendQuota -and $sessionsMade.Count -gt 0 -and $store) {
     foreach ($s in $left) {
         Test-Check "(e) --cleanup reports $($s.Name) removed" ($sweep.Out -match ('(?m)^removed [^:]+: ' + [regex]::Escape($s.Name) + ' \(')) ''
         Test-Check "(e) $($s.Name)'s record is gone" ($null -eq (Get-Record $after $s.Name)) ''
-        $remaining = @($s.Outputs | Where-Object { Test-Path -LiteralPath $_ })
-        Test-Check "(e) $($s.Name)'s $($s.Outputs.Count) published file(s) are gone" ($s.Outputs.Count -gt 0 -and $remaining.Count -eq 0) ($remaining -join ', ')
+        # Every file the run published for it and every one its record listed, plus anything else
+        # of its name in the output folder.
+        $files = @(@($s.Expected) + @($s.Outputs) | Where-Object { $_ } | Sort-Object -Unique)
+        $strays = @(Get-ChildItem -LiteralPath $outDir -File -Filter "$($s.Name)-v*.png" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $remaining = @(@($files) + @($strays) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Sort-Object -Unique)
+        Test-Check "(e) $($s.Name)'s $($files.Count) published file(s) are gone" ($files.Count -gt 0 -and $remaining.Count -eq 0) ($remaining -join ', ')
         $imageDir = Join-Path (Join-Path $s.Home 'generated_images') $s.ThreadId
         Test-Check "(e) Codex's image folder for $($s.Name) is gone" (-not (Test-Path -LiteralPath $imageDir)) $imageDir
         $rollouts = @(Get-Rollouts $s.Home $s.ThreadId)
         Test-Check "(e) the rollout of $($s.Name)'s thread is gone" ($rollouts.Count -eq 0) (@($rollouts | ForEach-Object { $_.FullName }) -join ', ')
     }
-}
-elseif ($SpendQuota) {
-    Add-Check '(e) --cleanup removes the run''s sessions' 'SKIP' 'no session was made, or the store could not be read'
+    if ($left.Count -eq 0) {
+        Add-Check '(e) --cleanup removes the run''s sessions' 'SKIP' 'the store holds no session'
+    }
 }
 else {
     Write-Host '-> --cleanup --older-than-days 0 on the empty state base (free)'

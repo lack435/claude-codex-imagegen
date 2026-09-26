@@ -1056,6 +1056,10 @@ pub(crate) mod testing {
         pub resume_errors: Vec<Value>,
         /// Sent right after a `thread/resume` reply.
         pub on_thread_resume: Vec<Value>,
+        /// How long the fake takes to answer a successful `thread/resume`. It answers other
+        /// requests meanwhile, and answers the resume even after the client stopped waiting for
+        /// it, as Codex does.
+        pub resume_delay: Duration,
         /// Whether `turn/start` is answered at once. If not, a step answers it, or nothing does.
         pub answer_turn_start: bool,
         /// The error `turn/start` answers with instead of a turn.
@@ -1074,6 +1078,7 @@ pub(crate) mod testing {
                 thread_start_errors: Vec::new(),
                 resume_errors: Vec::new(),
                 on_thread_resume: Vec::new(),
+                resume_delay: Duration::ZERO,
                 answer_turn_start: true,
                 turn_start_error: None,
                 steps: Vec::new(),
@@ -1333,14 +1338,26 @@ pub(crate) mod testing {
                             out.send(json!({"id": id, "error": error}));
                             return Flow::Continue;
                         }
-                        out.send(json!({"id": id, "result": {
+                        let reply = json!({"id": id, "result": {
                             "thread": {"id": message["params"]["threadId"], "ephemeral": false,
                                        "turns": []},
                             "model": message["params"]["model"], "cwd": message["params"]["cwd"],
                             "approvalPolicy": "never", "approvalsReviewer": "user",
-                            "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}}));
-                        for note in &self.turn.on_thread_resume {
-                            out.send(note.clone());
+                            "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}});
+                        let notes = self.turn.on_thread_resume.clone();
+                        let delay = self.turn.resume_delay;
+                        let out = out.clone();
+                        let answer = move || {
+                            std::thread::sleep(delay);
+                            out.send(reply);
+                            for note in notes {
+                                out.send(note);
+                            }
+                        };
+                        if delay.is_zero() {
+                            answer();
+                        } else {
+                            std::thread::spawn(answer);
                         }
                     }
                     "turn/start" => {
