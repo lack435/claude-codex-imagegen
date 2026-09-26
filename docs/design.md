@@ -8,8 +8,11 @@ first version. M3 is implemented: the session store, its lock and the per-sessio
 existing name with `SESSION_EXISTS` and records each completed image in its session; `refine` (edit target,
 `thread/resume` with its "is closing", "active writer" and "no rollout found" handling, the M2 turn engine);
 cleanup (automatic expiry, once per server process, and `--cleanup`); `status` lists this project's sessions and
-the last cleanup; and the full `smoke.ps1`, with V9 behind `-Concurrent`. Not built yet: recycling the shared
-child after a missed per-request deadline (see Deadlines). The unit tests use a scripted fake app-server. Beyond
+the last cleanup; and the full `smoke.ps1`, with V9 behind `-Concurrent`. After an independent review of M3,
+cleanup was hardened: each published file records a content fingerprint, every deletion goes through the handle
+its checks were made on, a link under the Codex home is never followed, and `--cleanup` fails when it cannot
+search for stores. Not built yet: recycling the shared child after a missed per-request deadline (see
+Deadlines). The unit tests use a scripted fake app-server. Beyond
 them, the paid `smoke.ps1 -SpendQuota -Concurrent` run of 2026-09-26 (about 5 images) passed 102 of 102 checks:
 generate, refine with a feedback containing quotes, a backslash, a newline and non-ASCII text (verbatim), refine
 again after killing the server (resume after restart), `status` listing the session with 3 turns, V9 (two servers
@@ -669,7 +672,7 @@ sees the server's tools. A report that comes later interrupts the turn.
   another `version` is refused like one that cannot be parsed, since rewriting it would drop what a newer build
   keeps there [decided].
 - **Record fields.** `{name, thread_id, codex_home, model, created, updated, turns, last_saved_path,
-  last_output_path, last_output_bytes, output_dir, next_version, outputs:[{version, path, bytes}]}`.
+  last_output_path, last_output_bytes, output_dir, next_version, outputs:[{version, path, bytes, fnv1a64}]}`.
   - `name` is the name as the session was created; file names keep that spelling.
   - `codex_home` is the child's `codexHome` from its handshake. `created` and `updated` are Unix seconds.
   - `turns` counts turns that completed at least one image.
@@ -677,6 +680,11 @@ sees the server's tools. A report that comes later interrupts the turn.
     that copy does not exist (no `savedPath`, or a failed copy), never an older version's path.
     `last_output_bytes` is that image's size, which checks either copy.
   - `outputs` lists every file this server published for the session. [Cleanup](#cleanup) uses it.
+  - `fnv1a64` is the 64-bit FNV-1a of the bytes published, as 16 lowercase hex digits (a string, because many
+    JSON readers would round a 64-bit number). It is accidental-change detection, not a MAC: it tells a file
+    that was edited or replaced, even by one of the same size, from the one published, and is no defence
+    against deliberate forgery [decided]. Records written before it existed have none, and still read;
+    cleanup then cannot show such a file to be ours, and keeps it.
 - **When the record is written.** When the session's first image completes, not at turn end. It is updated on
   every later completed image, in stream order. A turn that produces no completed image leaves a new name free,
   and leaves an existing record unchanged. A record is never taken over by a call on another thread. A write
@@ -810,14 +818,24 @@ session can no longer be refined. Expiry is therefore per session [decided].
      home and in a fresh dedicated one [verified: live, `--cleanup` on fabricated records, 2026-09-25]. "active
      writer" or any other error skips the session until next time.
   5. Delete Codex's per-thread image folder, `<codex_home>\generated_images\<threadId>\`: only `*.png` entries
-     that are plain files, then the folder once it is empty. A folder that is a link (a reparse point) is left
-     alone. Anything else in it keeps the folder, not the session.
-  6. Delete each file in `outputs` whose exact path is still a plain file with the recorded size, under the name
-     it was published with (`<name>-v<version>.png`). A file that was edited, replaced or renamed is left alone.
-     Folders are never removed.
+     that are plain files, then the folder once it is empty. First, neither `<codex_home>\generated_images` nor
+     the thread's folder may be a link (a reparse point), and the folder's canonical path must equal the
+     canonical Codex home joined with `generated_images\<threadId>` (compared case-insensitively, without the
+     `\\?\` prefix). Otherwise the whole step is skipped, with the reason logged, and the rest of the session's
+     cleanup goes on: the folder is left alone on purpose, like a changed output. A Codex home that is itself
+     reached through a link passes, since both canonical paths resolve through it [verified: unit test, with
+     real junctions]. Each PNG is then deleted through a handle (see [Safety rules](#safety-rules)) that does
+     not follow a link at its name, and only while that handle shows a plain file whose final path lies
+     directly in that canonical folder; the empty folder is removed the same way. Anything else in it keeps
+     the folder, not the session.
+  6. Delete each file in `outputs` that is still, at its exact path and under the name it was published with
+     (`<name>-v<version>.png`), a plain file with the recorded size and `fnv1a64`, both recomputed through the
+     handle that deletes it. A file that was edited, replaced (even by one of the same size) or renamed is left
+     alone, and so is one whose record has no `fnv1a64`. Folders are never removed.
   7. Drop the session record, last, so a cleanup cut short is retried next time. A deletion in steps 5 or 6 that
-     fails (as opposed to a file left alone on purpose) keeps the record for the same reason; the thread is
-     already gone then, so the next run's `thread/delete` answers "no rollout found" and the rest follows.
+     fails (as opposed to a file left alone on purpose), for example because another process holds the file
+     open without delete sharing, keeps the record for the same reason; the thread is already gone then, so the
+     next run's `thread/delete` answers "no rollout found" and the rest follows.
 - **Reporting.** The outcome (sessions removed, bytes freed, anything skipped and why) is logged to stderr, and
   kept as the store's `last_cleanup` for `status` under "last cleanup", also when nothing was due. "Freed"
   counts only the files codex-imagegen deleted itself, not the rollout `thread/delete` removed.
@@ -841,18 +859,32 @@ codex-imagegen.exe --cleanup [--older-than-days N]
   local to the home, needs no sign-in or model and runs no turn, so a signed-out home can still be cleaned
   [decided].
 - It prints what it removed and what it skipped, and records each store's outcome as its `last_cleanup`. It
-  exits 0, or 1 when a store could not be read or a home could not be reached. A session skipped because it is
-  in use is normal.
+  exits 0, or 1 when a store could not be read, a home could not be reached, or the search for stores failed:
+  the state base could not be listed, or a project folder's `sessions.json` could not be looked at for any
+  reason other than its absence. Only a store that is genuinely absent counts as none, so an inaccessible
+  project is reported rather than silently missing from the sweep. A session skipped because it is in use is
+  normal.
 - The steps and safety checks are the same as for automatic expiry.
 
 ### Safety rules
 
 - The server deletes only three kinds of thing:
-  - the files it recorded publishing, when the path and size still match;
-  - Codex's per-thread image folder for a thread it created;
+  - the files it recorded publishing, when the path, size and content fingerprint (`fnv1a64`) still match;
+  - Codex's per-thread image folder for a thread it created, when neither that folder nor `generated_images`
+    is a link and its canonical path is where it should be;
   - that thread itself, through `thread/delete`.
 - It never deletes by wildcard in an output directory, never deletes a folder in the project, and never
   touches a thread that is not in one of its session records.
+- Every file and folder is deleted through the handle its checks were made on [decided]. The handle is opened
+  with DELETE and read access, sharing with readers only, so no other process can write, rename or delete it
+  while it is open, and a file being written or held without delete sharing is left for next time. It is
+  opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so a link at the name is opened as itself and never followed.
+  Type, size, fingerprint and final path are read through it, and the deletion is marked on it
+  (`SetFileInformationByHandle` with `FileDispositionInfo`), so the file verified is the file deleted
+  [verified: unit test, for the sharing, a held file, junctions at the name and on the path, and a same-size
+  replacement].
+- Out of scope: a process that can already write the user's Codex home or output folder, racing these checks
+  on purpose. It could delete those files itself [decided].
 
 `thread/delete` works on a thread that has turns and has already unloaded. It removes the rollout, and a
 later `thread/resume` then fails with `no rollout found for thread id <id>`. Codex's
@@ -977,8 +1009,8 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   are checked for an image signature first.
 - **Writes.** The only writes to disk are the image tool's, into `<CODEX_HOME>\generated_images`, and this
   server's new files in the output directory. The server never overwrites. It deletes only what
-  [Cleanup](#cleanup) allows: the files it recorded publishing (path and size must match), Codex's image
-  folder for its own threads, and those threads.
+  [Cleanup](#cleanup) allows: the files it recorded publishing (path, size and content fingerprint must
+  match), Codex's image folder for its own threads, and those threads.
 - **User configuration, in ambient mode (the default).** The user's `~/.codex/AGENTS.md` reaches the agent
   model, and nothing short of another home stops it [verified]. Everything else that could act is switched off:
   - apps and connectors
@@ -1075,12 +1107,13 @@ Planned modules:
 | `session.rs` | Session store: atomic JSON, strict and tolerant reads, `LockFileEx` store lock and per-name leases, record type, and the per-call writer that records each completed image. |
 | `output.rs` | Output-dir resolution and pre-check, no-replace versioned publish, automatic session names. |
 | `cleanup.rs` | Session expiry and the `--cleanup` sweep, with the deletion safety rules. |
+| `delete.rs` | Deleting through the handle that was checked: opened without following a link or admitting other writers and deleters; size, fingerprint and final path read through it; the deletion marked on it. |
 | `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode with the size steps, base64. |
 | `errors.rs` | Failure contract, item-level and `codexErrorInfo` mapping. |
-| `config.rs` | Flags, state directory derivation, `fnv1a64`. |
+| `config.rs` | Flags, state directory derivation, `fnv1a64` (also the output fingerprint). |
 | `winjob.rs` | Job object and suspended spawn. |
 | `tools.rs` | `App`, the three tools, validation and start ordering, refine's edit target and home check, the child's notification handler, child retirement, the start of automatic expiry. |
-| `testutil.rs` | Test temp directories. |
+| `testutil.rs` | Test temp directories, and junctions made with `mklink /J`. |
 
 The estimate is about 3,500 lines without tests.
 

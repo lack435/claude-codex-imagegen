@@ -141,7 +141,7 @@ pub struct Record {
     /// The version the next image is published as: the last one actually used, plus one.
     pub next_version: u32,
     /// Every file this server published for the session. Cleanup deletes only these, and only
-    /// while the path and size still match.
+    /// while the path, size and content fingerprint still match.
     pub outputs: Vec<Output>,
 }
 
@@ -151,6 +151,29 @@ pub struct Output {
     pub version: u32,
     pub path: PathBuf,
     pub bytes: u64,
+    /// The 64-bit FNV-1a of the bytes published, as 16 lowercase hex digits: accidental-change
+    /// detection, not a MAC [decided]. Cleanup deletes the file only while it still matches.
+    /// Absent from records written before it existed; cleanup then cannot prove the file is the
+    /// one published, and keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fnv1a64: Option<String>,
+}
+
+impl Output {
+    /// How a fingerprint is recorded: 16 lowercase hex digits. A string rather than a JSON number,
+    /// which many readers take as a double and would round.
+    pub fn fingerprint_text(fingerprint: u64) -> String {
+        format!("{fingerprint:016x}")
+    }
+
+    /// The recorded fingerprint, `None` when there is none or it is not 16 hex digits.
+    pub fn fingerprint(&self) -> Option<u64> {
+        let text = self.fnv1a64.as_deref()?;
+        if text.len() != 16 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(text, 16).ok()
+    }
 }
 
 impl Record {
@@ -175,6 +198,7 @@ impl Record {
                 version,
                 path: path.to_path_buf(),
                 bytes,
+                fnv1a64: image.fnv1a64.map(Output::fingerprint_text),
             });
             self.next_version = self.next_version.max(version.saturating_add(1));
         }
@@ -597,6 +621,8 @@ pub struct ImageOutcome<'a> {
     pub saved_path: Option<&'a Path>,
     /// The image's size, when its bytes could be read.
     pub bytes: Option<u64>,
+    /// The 64-bit FNV-1a of those bytes, which are exactly what was published.
+    pub fnv1a64: Option<u64>,
 }
 
 /// Records one call's images in its session, each as it completes, in stream order
@@ -702,6 +728,7 @@ mod tests {
             output_path: Some(path),
             saved_path: Some(Path::new(r"C:\codex\generated_images\t\exec-1.png")),
             bytes: Some(bytes),
+            fnv1a64: Some(0xfeed_0000_0000_0000 | bytes),
         }
     }
 
@@ -790,6 +817,33 @@ mod tests {
         expected.sort();
         assert_eq!(fields, expected);
         assert!(value.get("last_cleanup").is_none());
+    }
+
+    #[test]
+    fn an_output_recorded_before_fingerprints_still_reads_and_is_written_back_without_one() {
+        let dir = temp_dir("session");
+        let store = Store::new(&dir);
+        let mut old = serde_json::to_value(record("fox")).unwrap();
+        old["outputs"] = serde_json::json!([
+            {"version": 1, "path": r"C:\out\fox-v1.png", "bytes": 5},
+            {"version": 2, "path": r"C:\out\fox-v2.png", "bytes": 6, "fnv1a64": "not hex!"},
+            {"version": 3, "path": r"C:\out\fox-v3.png", "bytes": 7, "fnv1a64": "00000000000000ff"},
+        ]);
+        let text = serde_json::json!({"version": 1, "sessions": {"fox": old}}).to_string();
+        fs::write(store.path(), text).unwrap();
+        let file = store.read().expect("an older record is still readable");
+        let outputs = &file.get("fox").unwrap().outputs;
+        assert_eq!(outputs[0].fnv1a64, None);
+        // Neither a missing nor a malformed fingerprint proves anything.
+        assert_eq!(outputs[0].fingerprint(), None);
+        assert_eq!(outputs[1].fingerprint(), None);
+        assert_eq!(outputs[2].fingerprint(), Some(0xff));
+        store.update(|_| Ok(())).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
+        let written = &value["sessions"]["fox"]["outputs"];
+        assert!(written[0].get("fnv1a64").is_none(), "{written}");
+        assert_eq!(written[2]["fnv1a64"], "00000000000000ff");
+        assert_eq!(Output::fingerprint_text(0xab), "00000000000000ab");
     }
 
     #[test]
@@ -978,9 +1032,11 @@ mod tests {
             vec![Output {
                 version: 1,
                 path: v1.clone(),
-                bytes: 100
+                bytes: 100,
+                fnv1a64: Some("feed000000000064".to_string()),
             }]
         );
+        assert_eq!(first.outputs[0].fingerprint(), Some(0xfeed_0000_0000_0064));
 
         // A second image in the same turn: the same turn, a new latest image.
         let v3 = dir.join("out").join("Fox-v3.png");
@@ -1026,6 +1082,7 @@ mod tests {
                     output_path: None,
                     saved_path: Some(saved),
                     bytes: Some(20),
+                    fnv1a64: Some(20),
                 },
             )
             .unwrap();

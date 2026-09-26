@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use crate::appserver::{AppServer, DetachedSender, RpcError};
 use crate::cancel::RequestCancel;
 use crate::codex::{self, Budget, Rpc};
-use crate::config::Config;
+use crate::config::{Config, Fnv1a64};
 use crate::errors::{self, Failure};
 use crate::mcp::Progress;
 use crate::output;
@@ -1131,6 +1131,7 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
                     output_path: None,
                     saved_path: Some(path),
                     bytes: None,
+                    fnv1a64: None,
                 },
             );
             turn.images.push(Delivered {
@@ -1213,6 +1214,9 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
             output_path: version.and(path.as_deref()),
             saved_path: image.saved_path.as_deref(),
             bytes: Some(bytes.len() as u64),
+            // Cleanup deletes our copy only while its content still matches this (docs/design.md,
+            // "Cleanup"); `publish` wrote exactly these bytes.
+            fnv1a64: Some(Fnv1a64::of(&bytes)),
         },
     );
     turn.images.push(Delivered {
@@ -2112,7 +2116,8 @@ mod generate_tests {
             vec![Output {
                 version: 2,
                 path: dir.join("fox-v2.png"),
-                bytes: saved.bytes.len() as u64
+                bytes: saved.bytes.len() as u64,
+                fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
             }]
         );
     }
@@ -2231,6 +2236,7 @@ mod generate_tests {
                     output_path: None,
                     saved_path: None,
                     bytes: None,
+                    fnv1a64: None,
                 },
             )
             .unwrap();
@@ -3078,6 +3084,7 @@ mod refine_tests {
                 output_path: Some(&v1),
                 saved_path: Some(&saved.path),
                 bytes: Some(saved.bytes.len() as u64),
+                fnv1a64: Some(Fnv1a64::of(&saved.bytes)),
             },
         )
         .unwrap();
@@ -3186,12 +3193,14 @@ mod refine_tests {
                 Output {
                     version: 1,
                     path: v1,
-                    bytes: saved.bytes.len() as u64
+                    bytes: saved.bytes.len() as u64,
+                    fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
                 },
                 Output {
                     version: 2,
                     path: v2,
-                    bytes: saved.bytes.len() as u64
+                    bytes: saved.bytes.len() as u64,
+                    fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&saved.bytes))),
                 },
             ]
         );
@@ -3265,6 +3274,7 @@ mod refine_tests {
                         version: 0,
                         path: older.clone(),
                         bytes: saved.bytes.len() as u64,
+                        fnv1a64: None,
                     },
                 );
                 Ok(())

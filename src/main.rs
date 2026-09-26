@@ -14,6 +14,7 @@ mod cancel;
 mod cleanup;
 mod codex;
 mod config;
+mod delete;
 mod errors;
 mod jsonrpc;
 mod mcp;

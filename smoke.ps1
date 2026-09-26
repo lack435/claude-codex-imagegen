@@ -28,8 +28,9 @@
     e) closes every server and, whatever the run got to, runs codex-imagegen.exe --cleanup
        --older-than-days 0 on the state folder. It must remove every session the store records:
        its record, the files the run published (<session>-v1..vN, which the record must list
-       exactly), Codex's image folder for its thread, and the thread's rollout. A recorded session
-       the run lost track of fails the run, and is still removed.
+       exactly), Codex's image folder for its thread, and the thread's rollout (which must be found
+       before the sweep, and be gone from that exact path after it; a listing error fails). A
+       recorded session the run lost track of fails the run, and is still removed.
 
   With -Concurrent as well (V9, about 2 more images), two server processes on the same state
   folder, each with its own stdin, generate at the same moment; both must succeed, and both
@@ -774,11 +775,73 @@ function Get-Record($Store, [string]$Session) {
     return Get-Field $Store 'sessions', $Session.ToLowerInvariant()
 }
 
-# The rollout files of a thread under a Codex home.
+# Whether a file or folder exists: 'present', 'gone', or why that cannot be told. Stricter than
+# Test-Path, which answers $false when a path cannot be read at all, so "cannot tell" is never
+# taken for "gone".
+function Get-PathState([string]$Path) {
+    try {
+        [void][IO.File]::GetAttributes($Path)
+        return 'present'
+    }
+    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+        return 'gone'
+    }
+    catch {
+        $e = $_.Exception
+        if ($e.InnerException) { $e = $e.InnerException }
+        return "cannot tell ($($e.Message))"
+    }
+}
+
+# The rollout files of a thread under a Codex home: Paths (full paths) and Error. A home without a
+# sessions folder has none; any error while looking is returned as Error, never as "none".
 function Get-Rollouts([string]$CodexHome, [string]$ThreadId) {
-    $sessions = Join-Path $CodexHome 'sessions'
-    if (-not (Test-Path -LiteralPath $sessions)) { return @() }
-    return @(Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter "*$ThreadId*" -ErrorAction SilentlyContinue)
+    try {
+        $sessions = Join-Path $CodexHome 'sessions'
+        $state = Get-PathState $sessions
+        if ($state -eq 'gone') { return [pscustomobject]@{ Paths = @(); Error = $null } }
+        if ($state -ne 'present') { return [pscustomobject]@{ Paths = @(); Error = "$sessions $state" } }
+        $found = @(Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter "*$ThreadId*" -ErrorAction Stop |
+            ForEach-Object { $_.FullName })
+        return [pscustomobject]@{ Paths = $found; Error = $null }
+    }
+    catch {
+        return [pscustomobject]@{ Paths = @(); Error = $_.Exception.Message }
+    }
+}
+
+# (e), before the sweep: the thread's rollout must be there to be removed. Returns the exact paths
+# found, which Test-RolloutGone checks after the sweep. Not finding one fails, so the check after
+# the sweep can never pass without having seen a rollout.
+function Find-Rollout([string]$Name, [string]$CodexHome, [string]$ThreadId) {
+    $found = Get-Rollouts $CodexHome $ThreadId
+    if ($found.Error) {
+        Test-Check "(e) $Name's thread has a rollout before the sweep" $false "listing its rollouts failed: $($found.Error)"
+        return @()
+    }
+    Test-Check "(e) $Name's thread has a rollout before the sweep" ($found.Paths.Count -gt 0) $(
+        if ($found.Paths.Count -gt 0) { $found.Paths -join ', ' } else { "none found for $ThreadId under $CodexHome\sessions" })
+    return @($found.Paths)
+}
+
+# (e), after the sweep: every rollout Find-Rollout saw is gone, by its exact path, and no other
+# rollout of the thread is left. Fails when none was seen before, and when either cannot be told.
+function Test-RolloutGone([string]$Name, [string]$CodexHome, [string]$ThreadId, [string[]]$Before) {
+    $label = "(e) the rollout of $Name's thread is gone"
+    $seen = @($Before | Where-Object { $_ })
+    if ($seen.Count -eq 0) {
+        Test-Check $label $false 'no rollout was found before the sweep, so its removal cannot be shown'
+        return
+    }
+    $wrong = @()
+    foreach ($path in $seen) {
+        $state = Get-PathState $path
+        if ($state -ne 'gone') { $wrong += "$path is $state" }
+    }
+    $after = Get-Rollouts $CodexHome $ThreadId
+    if ($after.Error) { $wrong += "listing its rollouts failed: $($after.Error)" }
+    foreach ($path in @($after.Paths | Where-Object { $seen -notcontains $_ })) { $wrong += "$path is present" }
+    Test-Check $label ($wrong.Count -eq 0) $(if ($wrong.Count -eq 0) { $seen -join ', ' } else { $wrong -join '; ' })
 }
 
 # Check one generate or refine result against the design (docs/design.md, "Success result").
@@ -1038,11 +1101,8 @@ if ($SpendQuota) {
         else {
             Test-Check "(e) $name was tracked by the run" $false 'recorded in the store, but no result the run read reported it; the sweep still removes it'
         }
-        $rollouts = @(Get-Rollouts $sessionHome $threadId)
-        if ($rollouts.Count -eq 0) {
-            Add-Check "(e) $name's thread has a rollout to remove" 'MANUAL' "none found for $threadId under $sessionHome\sessions; the rollout check below proves nothing"
-        }
-        $left += [pscustomobject]@{ Name = $name; ThreadId = $threadId; Home = $sessionHome; Outputs = $outputs; Expected = $expected }
+        $rollouts = @(Find-Rollout $name $sessionHome $threadId)
+        $left += [pscustomobject]@{ Name = $name; ThreadId = $threadId; Home = $sessionHome; Outputs = $outputs; Expected = $expected; Rollouts = $rollouts }
     }
     foreach ($name in $sessionsMade.Keys) {
         if (-not @($left | Where-Object { $_.Name -eq $name })) { Test-Check "$name is recorded in the store" $false '' }
@@ -1062,8 +1122,7 @@ if ($SpendQuota) {
         Test-Check "(e) $($s.Name)'s $($files.Count) published file(s) are gone" ($files.Count -gt 0 -and $remaining.Count -eq 0) ($remaining -join ', ')
         $imageDir = Join-Path (Join-Path $s.Home 'generated_images') $s.ThreadId
         Test-Check "(e) Codex's image folder for $($s.Name) is gone" (-not (Test-Path -LiteralPath $imageDir)) $imageDir
-        $rollouts = @(Get-Rollouts $s.Home $s.ThreadId)
-        Test-Check "(e) the rollout of $($s.Name)'s thread is gone" ($rollouts.Count -eq 0) (@($rollouts | ForEach-Object { $_.FullName }) -join ', ')
+        Test-RolloutGone $s.Name $s.Home $s.ThreadId $s.Rollouts
     }
     if ($left.Count -eq 0) {
         Add-Check '(e) --cleanup removes the run''s sessions' 'SKIP' 'the store holds no session'

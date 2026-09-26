@@ -11,11 +11,17 @@
 //! - Only a thread named in a session record is deleted, through `thread/delete` on a child of the
 //!   Codex home the record names. A record from another home, or whose thread id is not a
 //!   well-formed UUID, is skipped whole: nothing of it is touched.
-//! - In Codex's image folder only `*.png` files are removed, then the folder once it is empty, and
-//!   only when it is a plain folder rather than a link to somewhere else.
-//! - An output is deleted only while its exact path is a plain file with the recorded size, under
-//!   the name it was published with. A file that was edited, replaced or renamed is left alone. No
-//!   folder in an output directory is ever removed, and nothing is matched by wildcard there.
+//! - In Codex's image folder only `*.png` files are removed, then the folder once it is empty.
+//!   Neither `generated_images` nor the thread's folder may be a link (a reparse point), and the
+//!   folder's canonical path must be the canonical Codex home's `generated_images\<threadId>`;
+//!   otherwise nothing in it is touched.
+//! - An output is deleted only while its exact path is a plain file under the name it was
+//!   published with, with the recorded size and content fingerprint. A file that was edited,
+//!   replaced (even by one of the same size) or renamed is left alone, and so is one whose record
+//!   has no fingerprint. No folder in an output directory is ever removed, and nothing is matched
+//!   by wildcard there.
+//! - Every file is deleted through the handle its checks were made on ([`crate::delete`]), which
+//!   admits no other writer or deleter and never follows a link at the file's name.
 //! - The session's lease is held throughout, taken without waiting: a session in use is skipped,
 //!   and the record is read again under the lease, so one a call has just refreshed is left be.
 //!
@@ -34,6 +40,7 @@ use serde_json::json;
 use crate::appserver::{AppServer, RpcError};
 use crate::codex::{self, Handshake, Rpc};
 use crate::config::Config;
+use crate::delete;
 use crate::errors::Failure;
 use crate::output;
 use crate::session::{self, LastCleanup, Record, Skipped, Store, STORE_FILE};
@@ -285,9 +292,101 @@ fn thread_gone(result: Result<(), RpcError>) -> Result<(), String> {
     }
 }
 
+/// What became of one thing cleanup meant to delete.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Deleted, freeing this many bytes.
+    Deleted(u64),
+    /// Nothing was there.
+    Gone,
+    /// Left alone on purpose: it cannot be shown to be ours. Logged; the session still goes.
+    Kept(String),
+    /// Left alone because it changed under cleanup in a way nothing should: counted as a problem,
+    /// so the record is kept and the next cleanup looks again.
+    Refused(String),
+}
+
+/// Add up one deletion's outcome.
+fn settle(path: &Path, outcome: io::Result<Verdict>, freed: &mut u64, problems: &mut Vec<String>) {
+    match outcome {
+        Ok(Verdict::Deleted(bytes)) => *freed += bytes,
+        Ok(Verdict::Gone) => {}
+        Ok(Verdict::Kept(why)) => {
+            eprintln!("codex-imagegen: cleanup: kept {}: {why}", path.display());
+        }
+        Ok(Verdict::Refused(why)) => problems.push(format!("left {}: {why}", path.display())),
+        Err(e) => problems.push(format!("could not delete {} ({e})", path.display())),
+    }
+}
+
+/// Whether Codex's image folder for a thread may be cleaned out.
+#[derive(Debug, PartialEq, Eq)]
+enum FolderCheck {
+    /// There is no folder.
+    Absent,
+    /// It is where it should be; this is its canonical path.
+    Ours(PathBuf),
+    /// It, or `generated_images`, is a link or resolves elsewhere: nothing in it is touched, the
+    /// reason is logged, and the rest of the session's cleanup goes on.
+    LeftAlone(String),
+    /// It could not be checked: a problem, so the record is kept and it is retried.
+    Failed(String),
+}
+
+/// Check that `<codex_home>\generated_images\<thread_id>` is Codex's image folder for the thread
+/// and not somewhere else reached through a link: neither `generated_images` nor the folder is a
+/// reparse point, and the folder's canonical path is the canonical Codex home's
+/// `generated_images\<thread_id>`. A Codex home that is itself reached through a link is fine: it
+/// is the home the child reported, and both canonical paths resolve through it alike.
+///
+/// A process that can already write the user's Codex home could swap a link in after this check;
+/// defending against that is out of scope, since such a process can delete those files itself.
+/// Each deletion is checked again through its own handle ([`delete_codex_png`]), which catches a
+/// link that appears after this.
+fn check_codex_folder(codex_home: &Path, thread_id: &str) -> FolderCheck {
+    let images = codex_home.join("generated_images");
+    let dir = images.join(thread_id);
+    for path in [&images, &dir] {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() && is_plain(&meta) => {}
+            Ok(_) => {
+                return FolderCheck::LeftAlone(format!(
+                    "{} is a link (a reparse point) or not a folder",
+                    path.display()
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return FolderCheck::Absent,
+            Err(e) => {
+                return FolderCheck::Failed(format!("could not read {} ({e})", path.display()))
+            }
+        }
+    }
+    let home = match fs::canonicalize(codex_home) {
+        Ok(home) => home,
+        Err(e) => {
+            return FolderCheck::Failed(format!(
+                "could not resolve the Codex home {} ({e})",
+                codex_home.display()
+            ))
+        }
+    };
+    let expected = home.join("generated_images").join(thread_id);
+    match fs::canonicalize(&dir) {
+        Ok(actual) if same_path(&actual, &expected) => FolderCheck::Ours(expected),
+        Ok(actual) => FolderCheck::LeftAlone(format!(
+            "it resolves to {}, not {}",
+            actual.display(),
+            expected.display()
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => FolderCheck::Absent,
+        Err(e) => FolderCheck::Failed(format!("could not resolve {} ({e})", dir.display())),
+    }
+}
+
 /// Delete Codex's copies of the thread's images: the `*.png` files in
-/// `<codex_home>\generated_images\<thread_id>\`, then the folder once it is empty. `thread/delete`
-/// leaves it behind [verified: live, V8].
+/// `<codex_home>\generated_images\<thread_id>\`, then the folder once it is empty, after
+/// [`check_codex_folder`] has shown the folder to be the one it should be. `thread/delete` leaves
+/// it behind [verified: live, V8].
 fn remove_codex_images(
     codex_home: &Path,
     thread_id: &str,
@@ -295,21 +394,22 @@ fn remove_codex_images(
     problems: &mut Vec<String>,
 ) {
     let dir = codex_home.join("generated_images").join(thread_id);
-    let meta = match fs::symlink_metadata(&dir) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
-        Err(e) => {
-            problems.push(format!("could not read {} ({e})", dir.display()));
+    let folder = match check_codex_folder(codex_home, thread_id) {
+        FolderCheck::Absent => return,
+        FolderCheck::Ours(folder) => folder,
+        FolderCheck::LeftAlone(why) => {
+            eprintln!(
+                "codex-imagegen: cleanup: left Codex's image folder {} alone, and nothing in it \
+                 was deleted: {why}",
+                dir.display()
+            );
+            return;
+        }
+        FolderCheck::Failed(why) => {
+            problems.push(why);
             return;
         }
     };
-    if !meta.is_dir() || !is_plain(&meta) {
-        problems.push(format!(
-            "{} is not a plain folder, so it was left alone",
-            dir.display()
-        ));
-        return;
-    }
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -329,32 +429,78 @@ fn remove_codex_images(
         let is_png = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if !is_png || !meta.is_file() || !is_plain(&meta) {
+        if !is_png {
             continue;
         }
-        match output::retry_transient(|| fs::remove_file(&path)) {
-            Ok(()) => *freed += meta.len(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => problems.push(format!("could not delete {} ({e})", path.display())),
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && is_plain(&meta) => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                problems.push(format!("could not read {} ({e})", path.display()));
+                continue;
+            }
         }
+        // Retried as a whole, so each attempt opens and checks the file afresh.
+        let outcome = output::retry_transient(|| delete_codex_png(&path, &folder));
+        settle(&path, outcome, freed, problems);
     }
     if problems.len() == before {
-        match fs::remove_dir(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            // Something other than a PNG is in it: not ours to delete, and no reason to keep the
-            // session.
+        match output::retry_transient(|| remove_codex_folder(&dir, &folder)) {
+            Ok(Verdict::Deleted(_) | Verdict::Gone) => {}
+            Ok(Verdict::Kept(why) | Verdict::Refused(why)) => {
+                eprintln!("codex-imagegen: cleanup: left {}: {why}", dir.display());
+            }
+            // Something other than a PNG is in it (ERROR_DIR_NOT_EMPTY): not ours to delete, and
+            // no reason to keep the session.
             Err(e) => eprintln!("codex-imagegen: cleanup: left {} ({e})", dir.display()),
         }
     }
 }
 
+/// Delete one of Codex's PNGs through a handle that never follows a link at its name, once that
+/// handle shows a plain file directly in `folder`, the canonical path of the thread's image
+/// folder. Checking the location through the handle means a link swapped into the path after the
+/// folder was checked cannot redirect the deletion.
+fn delete_codex_png(path: &Path, folder: &Path) -> io::Result<Verdict> {
+    let Some(file) = delete::open(path)? else {
+        return Ok(Verdict::Gone);
+    };
+    if !file.is_plain_file() {
+        return Ok(Verdict::Kept("it is not a plain file".to_string()));
+    }
+    let at = file.final_path()?;
+    if !at.parent().is_some_and(|parent| same_path(parent, folder)) {
+        return Ok(Verdict::Refused(format!(
+            "it resolves to {}, outside {}",
+            at.display(),
+            folder.display()
+        )));
+    }
+    let size = file.size();
+    file.delete()?;
+    Ok(Verdict::Deleted(size))
+}
+
+/// Remove the thread's image folder, empty by now, through a handle, once that handle shows the
+/// plain folder at `folder`.
+fn remove_codex_folder(dir: &Path, folder: &Path) -> io::Result<Verdict> {
+    let Some(opened) = delete::open(dir)? else {
+        return Ok(Verdict::Gone);
+    };
+    if !opened.is_plain_folder() {
+        return Ok(Verdict::Kept("it is no longer a plain folder".to_string()));
+    }
+    let at = opened.final_path()?;
+    if !same_path(&at, folder) {
+        return Ok(Verdict::Refused(format!("it resolves to {}", at.display())));
+    }
+    opened.delete()?;
+    Ok(Verdict::Deleted(0))
+}
+
 /// Delete the files this server published for the session, each only while its exact path is a
-/// plain file with the recorded size under its published name.
+/// plain file under its published name, with the recorded size and content fingerprint.
 fn remove_outputs(record: &Record, freed: &mut u64, problems: &mut Vec<String>) {
     for published in &record.outputs {
         let path = &published.path;
@@ -370,22 +516,59 @@ fn remove_outputs(record: &Record, freed: &mut u64, problems: &mut Vec<String>) 
             );
             continue;
         }
+        // A first look by path, to say plainly why a file is kept. What decides is checked again
+        // through the handle that deletes.
         match fs::symlink_metadata(path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => problems.push(format!("could not read {} ({e})", path.display())),
-            Ok(meta) if meta.is_file() && is_plain(&meta) && meta.len() == published.bytes => {
-                match output::retry_transient(|| fs::remove_file(path)) {
-                    Ok(()) => *freed += published.bytes,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => problems.push(format!("could not delete {} ({e})", path.display())),
-                }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                problems.push(format!("could not read {} ({e})", path.display()));
+                continue;
             }
-            Ok(_) => eprintln!(
-                "codex-imagegen: cleanup: kept {}: it changed after it was published",
-                path.display()
-            ),
+            Ok(meta) if meta.is_file() && is_plain(&meta) && meta.len() == published.bytes => {}
+            Ok(_) => {
+                eprintln!(
+                    "codex-imagegen: cleanup: kept {}: it changed after it was published",
+                    path.display()
+                );
+                continue;
+            }
         }
+        let Some(fingerprint) = published.fingerprint() else {
+            eprintln!(
+                "codex-imagegen: cleanup: kept {}: its record holds no content fingerprint (an \
+                 earlier build wrote it), so it cannot be shown to be the file published",
+                path.display()
+            );
+            continue;
+        };
+        // Retried as a whole, so each attempt opens and checks the file afresh: one replaced
+        // between attempts is judged as it is then.
+        let outcome = output::retry_transient(|| delete_output(path, published.bytes, fingerprint));
+        settle(path, outcome, freed, problems);
     }
+}
+
+/// Delete a published output through one handle, only while that handle shows a plain file with
+/// the recorded size and content fingerprint. Size and fingerprint are read through the handle,
+/// which admits no other writer or deleter, and the deletion is marked on it, so the file checked
+/// is the file deleted.
+fn delete_output(path: &Path, bytes: u64, fingerprint: u64) -> io::Result<Verdict> {
+    let Some(file) = delete::open(path)? else {
+        return Ok(Verdict::Gone);
+    };
+    if !file.is_plain_file() || file.size() != bytes {
+        return Ok(Verdict::Kept(
+            "it changed after it was published".to_string(),
+        ));
+    }
+    let (content, read) = file.fingerprint()?;
+    if read != bytes || content != fingerprint {
+        return Ok(Verdict::Kept(
+            "its content changed after it was published".to_string(),
+        ));
+    }
+    file.delete()?;
+    Ok(Verdict::Deleted(bytes))
 }
 
 /// Remove `names` from `store` one by one while time remains, then record the outcome as the
@@ -506,8 +689,9 @@ pub fn expire(
 /// the one a server here would start, for its own home, and one with `CODEX_HOME` set for each
 /// other. N defaults to `--session-ttl-days`; 0 means every session not in use.
 ///
-/// Prints what it removed and skipped to `out`. Returns the exit code: 0 when every store could be
-/// read and every home reached (sessions skipped because they are in use are normal), 1 otherwise.
+/// Prints what it removed and skipped to `out`. Returns the exit code: 0 when the state base could
+/// be searched, every store read and every home reached (sessions skipped because they are in use
+/// are normal), 1 otherwise.
 pub fn sweep(
     cfg: &Config,
     launcher: &dyn Launcher,
@@ -527,7 +711,7 @@ pub fn sweep(
         }
         None => cfg.session_ttl_days,
     };
-    let stores = project_stores(cfg);
+    let (stores, unsearched) = project_stores(cfg);
     let rule = match days {
         0 => "every session not in use".to_string(),
         1 => "sessions idle over 1 day".to_string(),
@@ -539,9 +723,14 @@ pub fn sweep(
         stores.len(),
         cfg.state_base.display()
     );
+    // A project that could not be searched is a failure, never an empty project: otherwise its
+    // sessions would drop out of the sweep unseen and the sweep would report success.
+    for why in &unsearched {
+        let _ = writeln!(out, "could not search for project stores: {why}");
+    }
 
     let now = session::now_unix();
-    let mut failed = false;
+    let mut failed = !unsearched.is_empty();
     let mut tallies: Vec<Option<Tally>> = Vec::new();
     // (home, [(store index, session name)]), homes compared as Windows compares paths.
     let mut groups: Vec<(PathBuf, Vec<(usize, String)>)> = Vec::new();
@@ -565,7 +754,15 @@ pub fn sweep(
     }
 
     if groups.is_empty() {
-        let _ = writeln!(out, "nothing to remove");
+        let _ = writeln!(
+            out,
+            "nothing to remove{}",
+            if failed {
+                " in the stores that could be read"
+            } else {
+                ""
+            }
+        );
     } else {
         failed |= sweep_groups(
             cfg,
@@ -595,7 +792,7 @@ pub fn sweep(
     }
     let _ = writeln!(
         out,
-        "done: removed {}, freed {}{}, skipped {}",
+        "done: removed {}, freed {}{}, skipped {}{}",
         sessions(total.removed.len()),
         megabytes(total.freed),
         if total.removed.is_empty() {
@@ -603,7 +800,11 @@ pub fn sweep(
         } else {
             " (not counting the Codex rollouts thread/delete removed)"
         },
-        total.skipped.len()
+        total.skipped.len(),
+        match unsearched.len() {
+            0 => String::new(),
+            n => format!("; {n} place(s) could not be searched for project stores"),
+        }
     );
     i32::from(failed)
 }
@@ -767,23 +968,64 @@ fn start_child(
 }
 
 /// Every project store: each folder directly under the state base that holds a session store,
-/// plus `--state-dir`'s when it lies elsewhere.
-fn project_stores(cfg: &Config) -> Vec<Store> {
-    let mut dirs: Vec<PathBuf> = match fs::read_dir(&cfg.state_base) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|dir| dir.join(STORE_FILE).is_file())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    if cfg.state_dir.join(STORE_FILE).is_file()
-        && !dirs.iter().any(|dir| same_path(dir, &cfg.state_dir))
-    {
-        dirs.push(cfg.state_dir.clone());
+/// plus `--state-dir`'s when it lies elsewhere. Also what could not be searched: only genuine
+/// absence (NotFound) counts as no store, so a project folder that cannot be read is reported
+/// rather than silently missing from the sweep.
+fn project_stores(cfg: &Config) -> (Vec<Store>, Vec<String>) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut unsearched = Vec::new();
+    let base = &cfg.state_base;
+    match fs::read_dir(base) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        unsearched.push(format!("could not list {} ({e})", base.display()));
+                        continue;
+                    }
+                };
+                // A file directly under the state base is not a project folder.
+                match entry.file_type() {
+                    Ok(kind) if kind.is_file() => continue,
+                    Ok(_) => {}
+                    Err(e) => {
+                        unsearched.push(format!("could not read {} ({e})", entry.path().display()));
+                        continue;
+                    }
+                }
+                let dir = entry.path();
+                match holds_store(&dir) {
+                    Ok(true) => dirs.push(dir),
+                    Ok(false) => {}
+                    Err(why) => unsearched.push(why),
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => unsearched.push(format!("could not list {} ({e})", base.display())),
+    }
+    if !dirs.iter().any(|dir| same_path(dir, &cfg.state_dir)) {
+        match holds_store(&cfg.state_dir) {
+            Ok(true) => dirs.push(cfg.state_dir.clone()),
+            Ok(false) => {}
+            Err(why) => unsearched.push(why),
+        }
     }
     dirs.sort();
-    dirs.iter().map(|dir| Store::new(dir)).collect()
+    (dirs.iter().map(|dir| Store::new(dir)).collect(), unsearched)
+}
+
+/// Whether `dir` holds a session store. `Ok(false)` only when there is none; anything that stops
+/// that being told is an error.
+fn holds_store(dir: &Path) -> Result<bool, String> {
+    let path = dir.join(STORE_FILE);
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err(format!("{} is not a file", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("could not read {} ({e})", path.display())),
+    }
 }
 
 /// A store as the sweep's report names it: its project folder's name.
@@ -799,8 +1041,9 @@ fn label(store: &Store) -> String {
 mod tests {
     use super::*;
     use crate::codex::testing::{FakeCodex, CODEX_HOME};
+    use crate::config::Fnv1a64;
     use crate::session::{Output, StoreFile};
-    use crate::testutil::{temp_dir, TempDir};
+    use crate::testutil::{make_junction, temp_dir, TempDir};
     use crate::tools::testing::cfg;
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -851,6 +1094,7 @@ mod tests {
                     version: *v,
                     path,
                     bytes: bytes.len() as u64,
+                    fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(&bytes))),
                 });
             }
             let record = Record {
@@ -978,10 +1222,12 @@ mod tests {
         );
         let skipped = &file.last_cleanup.unwrap().skipped;
         assert!(
-            skipped[0].why.contains("retried next time"),
+            skipped[0].why.contains("retried next time")
+                && skipped[0].why.contains("could not delete"),
             "{:?}",
             skipped
         );
+        assert!(record.outputs[0].path.is_file(), "a held file was deleted");
         assert!(!world.images_dir(THREAD).exists());
 
         // Next time the thread is already gone, and the rest goes.
@@ -1082,6 +1328,224 @@ mod tests {
         assert!(record.outputs[2].path.is_file(), "an unrecorded file");
         assert!(world.images_dir(THREAD).join("notes.txt").is_file());
         assert!(!world.images_dir(THREAD).join("exec-1.png").exists());
+    }
+
+    #[test]
+    fn an_output_replaced_by_other_content_of_the_same_size_is_kept() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1, 2]);
+        // v1 replaced by an edit of exactly the same length: name, type and size all still match.
+        let edited = vec![0xEEu8; record.outputs[0].bytes as usize];
+        fs::write(&record.outputs[0].path, &edited).unwrap();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        assert_eq!(
+            fs::read(&record.outputs[0].path).unwrap(),
+            edited,
+            "a same-size replacement was deleted"
+        );
+        assert!(
+            !record.outputs[1].path.exists(),
+            "the unchanged v2 was kept"
+        );
+        let file = world.file();
+        assert!(
+            file.get("fox").is_none(),
+            "a file kept on purpose kept the session"
+        );
+        // Codex's two copies and our unchanged v2.
+        assert_eq!(file.last_cleanup.unwrap().freed_bytes, 101 + 102 + 102);
+    }
+
+    #[test]
+    fn an_output_whose_record_has_no_fingerprint_is_kept() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        // As an earlier build recorded it.
+        world
+            .store
+            .update(|file| {
+                file.sessions.get_mut("fox").unwrap().outputs[0].fnv1a64 = None;
+                Ok(())
+            })
+            .unwrap();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        assert!(
+            record.outputs[0].path.is_file(),
+            "a file that cannot be shown to be ours was deleted"
+        );
+        assert!(world.file().get("fox").is_none());
+        assert!(!world.images_dir(THREAD).exists());
+    }
+
+    #[test]
+    fn a_matching_output_is_checked_and_deleted_through_one_handle() {
+        let dir = temp_dir("cleanup");
+        let path = dir.join("fox-v1.png");
+        fs::write(&path, b"foobar").unwrap();
+        let fingerprint = Fnv1a64::of(b"foobar");
+        let kept = |verdict: Verdict| matches!(verdict, Verdict::Kept(_));
+        assert!(kept(delete_output(&path, 7, fingerprint).unwrap()));
+        assert!(kept(delete_output(&path, 6, fingerprint ^ 1).unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), b"foobar");
+        assert_eq!(
+            delete_output(&path, 6, fingerprint).unwrap(),
+            Verdict::Deleted(6)
+        );
+        assert!(!path.exists());
+        assert_eq!(delete_output(&path, 6, fingerprint).unwrap(), Verdict::Gone);
+        // A folder at the name is not a file of ours.
+        fs::create_dir(&path).unwrap();
+        assert!(kept(delete_output(&path, 0, Fnv1a64::of(b"")).unwrap()));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn an_output_replaced_while_its_deletion_is_retried_is_checked_again_and_kept() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        let path = record.outputs[0].path.clone();
+        let edited = vec![0xEEu8; record.outputs[0].bytes as usize];
+        // A writer that shares neither writing nor deleting holds the file, so the first attempts
+        // to delete it fail; while it holds it, it writes new content of the same size.
+        let mut held = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0x1)
+            .open(&path)
+            .unwrap();
+        std::thread::scope(|s| {
+            let edited = edited.clone();
+            s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                held.write_all(&edited).unwrap();
+                held.sync_all().unwrap();
+            });
+            expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        });
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            edited,
+            "the replacement was deleted"
+        );
+        assert!(world.file().get("fox").is_none());
+    }
+
+    #[test]
+    fn a_generated_images_junction_is_not_followed_and_the_rest_of_the_session_goes() {
+        let world = World::new();
+        // Codex's image folder reached through a junction at generated_images: the thread's PNGs
+        // really live elsewhere.
+        let elsewhere = world.dir.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        make_junction(&world.home.join("generated_images"), &elsewhere);
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        let behind = elsewhere.join(THREAD).join("exec-1.png");
+        assert!(behind.is_file());
+        let deletes = Deletes::ok();
+        expire_with(&world, 7, &deletes, &|_| false);
+        assert!(behind.is_file(), "a PNG behind the junction was deleted");
+        assert!(world.home.join("generated_images").exists());
+        assert_eq!(deletes.asked(), vec![THREAD.to_string()]);
+        assert!(!record.outputs[0].path.exists(), "the session's own output");
+        let file = world.file();
+        assert!(file.get("fox").is_none(), "the rest of the session went");
+        assert_eq!(file.last_cleanup.unwrap().freed_bytes, 101);
+    }
+
+    #[test]
+    fn a_thread_folder_that_is_a_junction_is_left_alone() {
+        let world = World::new();
+        let elsewhere = world.dir.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(world.home.join("generated_images")).unwrap();
+        make_junction(&world.images_dir(THREAD), &elsewhere);
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        assert!(elsewhere.join("exec-1.png").is_file());
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        assert!(
+            elsewhere.join("exec-1.png").is_file(),
+            "a PNG behind the junction was deleted"
+        );
+        assert!(world.images_dir(THREAD).exists(), "the junction itself");
+        assert!(!record.outputs[0].path.exists());
+        assert!(world.file().get("fox").is_none());
+    }
+
+    #[test]
+    fn a_codex_home_reached_through_a_junction_is_cleaned_like_any_other() {
+        let world = World::new();
+        world.session("fox", THREAD, OLD, &[1]);
+        // The child reports the home by a link to it, and the record names it so.
+        let link = world.dir.join("home-link");
+        make_junction(&link, &world.home);
+        world
+            .store
+            .update(|file| {
+                file.sessions.get_mut("fox").unwrap().codex_home = link.clone();
+                Ok(())
+            })
+            .unwrap();
+        let deletes = Deletes::ok();
+        expire(
+            &world.store,
+            &link,
+            7,
+            &|t| deletes.call(t),
+            &|_| false,
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(!world.images_dir(THREAD).exists());
+        assert!(world.home.join("generated_images").is_dir());
+        assert!(world.file().get("fox").is_none());
+    }
+
+    #[test]
+    fn a_codex_png_is_deleted_only_through_a_handle_that_shows_it_in_the_threads_folder() {
+        let dir = temp_dir("cleanup");
+        let folder = dir.join("generated_images").join(THREAD);
+        fs::create_dir_all(&folder).unwrap();
+        assert!(matches!(
+            check_codex_folder(&dir, THREAD),
+            FolderCheck::Ours(_)
+        ));
+        let canonical = fs::canonicalize(&folder).unwrap();
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep.png"), b"keep").unwrap();
+
+        // A link at the PNG's own name is opened as itself, never followed.
+        make_junction(&folder.join("trap.png"), &target);
+        let verdict = delete_codex_png(&folder.join("trap.png"), &canonical).unwrap();
+        assert!(matches!(verdict, Verdict::Kept(_)), "{verdict:?}");
+        assert!(folder.join("trap.png").exists());
+
+        // A path that reaches a PNG through a link that appeared after the folder was checked:
+        // the handle shows where the file really is, and it is refused.
+        let swapped = dir.join("swapped");
+        make_junction(&swapped, &target);
+        let verdict = delete_codex_png(&swapped.join("keep.png"), &canonical).unwrap();
+        assert!(matches!(verdict, Verdict::Refused(_)), "{verdict:?}");
+        assert_eq!(fs::read(target.join("keep.png")).unwrap(), b"keep");
+
+        // A symbolic link to a file, where this machine lets a test make one (Developer Mode or
+        // the privilege); junctions above cover the rest.
+        let real = dir.join("real.png");
+        fs::write(&real, b"real").unwrap();
+        match std::os::windows::fs::symlink_file(&real, folder.join("link.png")) {
+            Ok(()) => {
+                let verdict = delete_codex_png(&folder.join("link.png"), &canonical).unwrap();
+                assert!(matches!(verdict, Verdict::Kept(_)), "{verdict:?}");
+                assert_eq!(fs::read(&real).unwrap(), b"real");
+            }
+            Err(e) => eprintln!("the symbolic-link case did not run: {e}"),
+        }
+
+        // A plain PNG in the folder is deleted.
+        fs::write(folder.join("exec-1.png"), b"png").unwrap();
+        assert_eq!(
+            delete_codex_png(&folder.join("exec-1.png"), &canonical).unwrap(),
+            Verdict::Deleted(3)
+        );
+        assert!(!folder.join("exec-1.png").exists());
     }
 
     #[test]
@@ -1295,6 +1759,7 @@ mod tests {
                     version: 1,
                     path,
                     bytes: 5,
+                    fnv1a64: Some(Output::fingerprint_text(Fnv1a64::of(b"12345"))),
                 }],
             };
             store
@@ -1407,6 +1872,66 @@ mod tests {
         assert!(record.outputs[0].path.exists());
         assert_eq!(fs::read(broken.join(STORE_FILE)).unwrap(), b"{ not json");
         assert_eq!(ok.read().unwrap().last_cleanup.unwrap().skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_project_folder_that_cannot_be_searched_is_reported_and_fails_the_sweep() {
+        let dir = temp_dir("cleanup-sweep");
+        let cfg = cfg(&dir, &["--cleanup"]);
+        fs::create_dir_all(&cfg.state_base).unwrap();
+        // A project folder whose store cannot even be looked for: a junction to itself, which
+        // Windows cannot resolve. It must not read as a project with no store.
+        let looped = cfg.state_base.join("looped-0000000000000006");
+        make_junction(&looped, &looped);
+        // A readable project beside it, with nothing due, and a stray file, which is no project.
+        Store::new(&cfg.state_base.join("ok-0000000000000007"))
+            .update(|_| Ok(()))
+            .unwrap();
+        fs::write(cfg.state_base.join("notes.txt"), b"x").unwrap();
+        let (stores, unsearched) = project_stores(&cfg);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(unsearched.len(), 1, "{unsearched:?}");
+        assert!(
+            unsearched[0].contains("looped-0000000000000006"),
+            "{unsearched:?}"
+        );
+
+        let launcher = SweepLauncher::new(FakeCodex::default());
+        let (code, text) = sweep_text(&cfg, &launcher, Some(0));
+        assert_eq!(code, 1, "{text}");
+        assert!(
+            text.contains("could not search for project stores: could not read"),
+            "{text}"
+        );
+        assert!(
+            text.contains("nothing to remove in the stores that could be read"),
+            "{text}"
+        );
+        assert!(
+            text.contains("; 1 place(s) could not be searched for project stores"),
+            "{text}"
+        );
+
+        // A state base that cannot be listed at all (here, a file) is a failure too.
+        let file = dir.join("a-file");
+        fs::write(&file, b"x").unwrap();
+        let unlistable = Config {
+            state_base: file,
+            ..cfg.clone()
+        };
+        let (code, text) = sweep_text(&unlistable, &launcher, Some(0));
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains("could not list"), "{text}");
+
+        // One that does not exist is genuinely empty.
+        let missing = Config {
+            state_base: dir.join("missing"),
+            ..cfg.clone()
+        };
+        let (code, text) = sweep_text(&missing, &launcher, Some(0));
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("\nnothing to remove\n"), "{text}");
+        assert_eq!(launcher.spawns.load(Ordering::SeqCst), 0);
     }
 
     #[test]

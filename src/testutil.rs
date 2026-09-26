@@ -78,6 +78,30 @@ impl Drop for TempDir {
     }
 }
 
+/// Make `link` a junction (a directory mount point, a reparse point) to the folder `target`, as
+/// `mklink /J` does. Unlike a symbolic link, a junction needs no privilege or Developer Mode, so
+/// every test run can make one. Removing the test's directory removes the junction, never what it
+/// points at.
+pub fn make_junction(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/D /C mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ))
+        .output()
+        .expect("run mklink");
+    assert!(
+        output.status.success(),
+        "mklink /J {} {}: {}{}",
+        link.display(),
+        target.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Collects what a code path writes, standing in for our stdout.
 #[derive(Clone, Default)]
 pub struct Recorder(Arc<Mutex<Vec<u8>>>);
