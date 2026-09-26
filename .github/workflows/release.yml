@@ -51,11 +51,11 @@ jobs:
       - name: The tag matches the binary's version
         shell: pwsh
         run: |
-          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') { throw "$env:TAG is not a vX.Y.Z tag" }
+          if ($env:TAG -cnotmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') { throw "$env:TAG is not a vX.Y.Z tag" }
           $version = $Matches[1]
           $line = & '.\dist\codex-imagegen.exe' --version
           Write-Host $line
-          if ($line -notlike "codex-imagegen $version (*") { throw "$env:TAG does not match the binary: $line" }
+          if ($line -cnotlike "codex-imagegen $version (*") { throw "$env:TAG does not match the binary: $line" }
 
       - name: Publish the release
         shell: pwsh
