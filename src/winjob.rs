@@ -398,8 +398,20 @@ mod tests {
             cmd.args(["/C", "ping -n 60 127.0.0.1 >NUL"]);
             spawn_in_new_job(&mut cmd).expect("spawn")
         };
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "exited early"
+        );
         assert!(job.terminate());
-        child.wait().expect("wait");
+        // Bounded: an unbounded wait would pass even if terminate did nothing, once ping ran out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "terminate did not kill the child"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         wait_for_empty_job(&job);
     }
 

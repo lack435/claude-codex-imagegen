@@ -139,18 +139,7 @@ impl AppServer {
     /// Spawn the child inside a new kill-on-close job, with piped stdio, and start the threads
     /// that read its stdout and drain its stderr.
     pub fn spawn(spec: &SpawnSpec) -> io::Result<Self> {
-        let mut cmd = Command::new(&spec.program);
-        cmd.args(&spec.args)
-            .current_dir(&spec.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for name in &spec.env_remove {
-            cmd.env_remove(name);
-        }
-        for (name, value) in &spec.env_set {
-            cmd.env(name, value);
-        }
+        let mut cmd = command(spec);
         let (job, mut child) = winjob::spawn_in_new_job(&mut cmd)?;
         let pid = child.id();
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -339,6 +328,26 @@ impl AppServer {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The `Command` a [`SpawnSpec`] describes: its program, arguments and working directory, all
+/// three stdio handles piped, and the environment edits applied. Separate from the spawn so a
+/// test can check what the child would get -- above all, that the API-key variables are gone --
+/// without starting anything.
+pub fn command(spec: &SpawnSpec) -> Command {
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in &spec.env_remove {
+        cmd.env_remove(name);
+    }
+    for (name, value) in &spec.env_set {
+        cmd.env(name, value);
+    }
+    cmd
 }
 
 impl Drop for AppServer {
@@ -1112,6 +1121,22 @@ mod tests {
     }
 
     #[test]
+    fn an_array_line_never_completes_a_request() {
+        // Read positionally, `[<id>]` would be a reply to the waiting request with a null result.
+        let server = connect(|message, out| {
+            let id = &message["id"];
+            out.send_raw(&format!("[{id}]"));
+            out.send_raw(&format!(r#"[{{"id":{id},"result":"batched"}}]"#));
+            out.send(json!({"id": id, "result": "real"}));
+            Flow::Continue
+        });
+        assert_eq!(
+            server.request("x", json!({}), soon(), None),
+            Ok(json!("real"))
+        );
+    }
+
+    #[test]
     fn shutdown_closes_the_transport_and_later_requests_fail() {
         let server = connect(echo);
         server.request("x", json!({}), soon(), None).unwrap();
@@ -1173,6 +1198,35 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while server.is_alive() {
             assert!(Instant::now() < deadline, "the child outlived its shutdown");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_child_that_ignores_its_stdin_closing_is_terminated_after_the_grace() {
+        // PING never reads stdin, so closing it changes nothing: only the job can stop it before
+        // its minute is up.
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let spec = SpawnSpec {
+            program: PathBuf::from(format!(r"{root}\System32\PING.EXE")),
+            args: vec!["-n".into(), "60".into(), "127.0.0.1".into()],
+            env_remove: vec![],
+            env_set: vec![],
+            cwd: std::env::temp_dir(),
+        };
+        let server = AppServer::spawn(&spec).expect("spawn ping");
+        assert!(server.is_alive());
+        let started = Instant::now();
+        server.shutdown(Duration::from_millis(200));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200),
+            "no grace given: {took:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server.is_alive() {
+            assert!(Instant::now() < deadline, "the job was not terminated");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

@@ -1057,6 +1057,59 @@ mod tests {
         );
     }
 
+    /// The environment edits a `Command` carries, as (name, Some(value)) for a set and
+    /// (name, None) for a removal.
+    fn env_edits(cmd: &std::process::Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_child_command_loses_the_api_keys_and_runs_in_the_work_dir() {
+        let bin = Path::new(r"C:\tools\codex.exe");
+        for (flags, home) in [
+            (
+                &["--codex-home", r"D:\codex-home"][..],
+                Some(r"D:\codex-home"),
+            ),
+            (&[][..], None),
+        ] {
+            let cfg = cfg(flags);
+            let cmd = crate::appserver::command(&spawn_spec(bin, &cfg));
+            assert_eq!(cmd.get_program(), bin.as_os_str());
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(args, spawn_args());
+            assert_eq!(cmd.get_current_dir(), Some(cfg.work_dir.as_path()));
+
+            let edits = env_edits(&cmd);
+            for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+                assert!(
+                    edits.contains(&(name.to_string(), None)),
+                    "{name} is not removed: {edits:?}"
+                );
+            }
+            let codex_home: Vec<&Option<String>> = edits
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("CODEX_HOME"))
+                .map(|(_, v)| v)
+                .collect();
+            match home {
+                Some(home) => assert_eq!(codex_home, vec![&Some(home.to_string())]),
+                // Ambient mode leaves CODEX_HOME exactly as the user has it.
+                None => assert!(codex_home.is_empty(), "{edits:?}"),
+            }
+        }
+    }
+
     #[test]
     fn initialize_sends_exactly_the_designs_params_then_initialized() {
         let fake = FakeCodex::default();

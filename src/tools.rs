@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
@@ -40,6 +40,10 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 
 /// Bound on each live read `status` makes of its own (docs/design.md, "codex_imagegen_status").
 const STATUS_READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How often a call waiting for another call's Codex start checks whether it has been cancelled
+/// or run out of time. The same interval a request uses while waiting for its reply.
+const START_LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// How the tool layer gets a Codex child. A trait so tests can hand it a scripted fake; the real
 /// one resolves the CLI and spawns it.
@@ -164,7 +168,7 @@ impl App {
         progress: Option<&Progress>,
         budget: Option<Budget>,
     ) -> Result<Arc<CodexChild>, Box<StartFailure>> {
-        let _starting = lock(&self.start_lock);
+        let _starting = self.acquire_start_lock(cancel, progress, budget)?;
         let existing = lock(&self.child).clone();
         if let Some(child) = existing {
             if child.ready.get().is_some()
@@ -195,6 +199,11 @@ impl App {
                 None,
                 Facts::default(),
             ));
+        }
+        // Checked again here, after anything above that took time: a call that is cancelled or
+        // out of budget must not start a child it can no longer use.
+        if let Err(failure) = abandoned(cancel, budget) {
+            return Err(failed(failure, None, Facts::default()));
         }
         if let Some(progress) = progress {
             progress.set_phase("starting Codex");
@@ -261,6 +270,36 @@ impl App {
         }
         let _ = child.ready.set(Ready { handshake, facts });
         Ok(child)
+    }
+
+    /// Take `start_lock`, giving up as soon as the call is cancelled or its budget runs out.
+    ///
+    /// Another call may hold the lock for a whole spawn, handshake and preflight: tens of seconds
+    /// when Codex is slow. A plain `lock` would make a cancelled call sit that out and then
+    /// start a child of its own, so the wait polls, at the same interval requests use.
+    fn acquire_start_lock(
+        &self,
+        cancel: Option<&RequestCancel>,
+        progress: Option<&Progress>,
+        budget: Option<Budget>,
+    ) -> Result<MutexGuard<'_, ()>, Box<StartFailure>> {
+        let mut announced = false;
+        loop {
+            abandoned(cancel, budget).map_err(|f| Box::new(StartFailure::new(f)))?;
+            match self.start_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    if !announced {
+                        if let Some(progress) = progress {
+                            progress.set_phase("waiting for Codex to start");
+                        }
+                        announced = true;
+                    }
+                    std::thread::sleep(START_LOCK_POLL);
+                }
+            }
+        }
     }
 
     /// A failure caused by shutdown closing the child is reported as the shutdown it was.
@@ -440,11 +479,17 @@ impl App {
             };
             match rpc.call_raw("account/rateLimits/read", json!({})) {
                 Ok(reply) => {
-                    let usage = Usage::from_read(&reply);
+                    // Merged per bucket, not swapped in whole. A read is a full snapshot of each
+                    // bucket it reports, so those are replaced; one it does not report, such as an
+                    // image_gen bucket learned from an update (reads have returned only the codex
+                    // bucket [verified]), is kept.
+                    let fresh = Usage::from_read(&reply);
                     let mut cache = lock(&self.usage);
-                    cache.usage = Some(usage.clone());
+                    let merged = cache.usage.get_or_insert_with(Usage::default);
+                    merged.buckets.extend(fresh.buckets);
+                    let lines = merged.lines();
                     cache.updated = Some(Instant::now());
-                    return usage.lines();
+                    return lines;
                 }
                 Err(e) => why_stale = format!("the live read failed: {e}"),
             }
@@ -495,7 +540,7 @@ impl ToolHost for App {
                 "maxItems": max,
                 "description": format!(
                     "Up to {max} image files (PNG, JPEG or WebP) for Codex to use as \
-                     references, as absolute paths.{extra}"
+                     references: absolute paths, or relative to the project directory.{extra}"
                 ),
             })
         };
@@ -642,6 +687,17 @@ fn notification_handler(
         }
         _ => {}
     })
+}
+
+/// `Err` with the failure to report when the call has been cancelled or has used up its budget.
+fn abandoned(cancel: Option<&RequestCancel>, budget: Option<Budget>) -> Result<(), Failure> {
+    if cancel.is_some_and(RequestCancel::is_cancelled) {
+        return Err(errors::cancelled());
+    }
+    match budget {
+        Some(b) if Instant::now() >= b.deadline => Err(errors::timeout(b.secs)),
+        _ => Ok(()),
+    }
 }
 
 fn version_text(handshake: Option<&Handshake>) -> String {
@@ -1281,6 +1337,83 @@ mod tests {
     }
 
     #[test]
+    fn a_call_waiting_on_another_start_stops_at_its_cancel_or_deadline_and_spawns_nothing() {
+        let f = fixture(FakeCodex::default());
+        let code = |r: Result<Arc<CodexChild>, Box<StartFailure>>| r.err().map(|e| e.failure.code);
+        std::thread::scope(|s| {
+            // Another call is mid-start and holds the lock for as long as this test needs.
+            // Dropped on unwind too, so a failed assertion cannot leave the waiters stuck.
+            let holder = lock(&f.app.start_lock);
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            // Cancelled before it even gets to wait.
+            let early = RequestCancel::new();
+            early.cancel();
+            {
+                let tx = tx.clone();
+                let app = &f.app;
+                s.spawn(move || {
+                    let started = Instant::now();
+                    let r = code(app.ensure_child(Some(&early), None, None));
+                    tx.send(("early", r, started.elapsed())).unwrap();
+                });
+            }
+            // Cancelled while it waits.
+            let late = Arc::new(RequestCancel::new());
+            {
+                let tx = tx.clone();
+                let app = &f.app;
+                let late = Arc::clone(&late);
+                s.spawn(move || {
+                    let r = code(app.ensure_child(Some(&late), None, None));
+                    tx.send(("late", r, Duration::ZERO)).unwrap();
+                });
+            }
+            // Runs out of budget while it waits.
+            {
+                let tx = tx.clone();
+                let app = &f.app;
+                s.spawn(move || {
+                    let started = Instant::now();
+                    let budget = Budget {
+                        deadline: Instant::now() + Duration::from_millis(150),
+                        secs: 300,
+                    };
+                    let r = code(app.ensure_child(None, None, Some(budget)));
+                    tx.send(("budget", r, started.elapsed())).unwrap();
+                });
+            }
+
+            let next = || {
+                rx.recv_timeout(Duration::from_secs(3))
+                    .expect("a waiting call sat out the other call's start")
+            };
+            let mut results = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let (name, r, took) = next();
+                results.insert(name, (r, took));
+            }
+            assert_eq!(results["early"].0, Some("CANCELLED"));
+            assert!(results["early"].1 < Duration::from_secs(1));
+            assert_eq!(results["budget"].0, Some("TIMEOUT"));
+            assert!(results["budget"].1 < Duration::from_secs(2));
+
+            let cancelled_at = Instant::now();
+            late.cancel();
+            let (name, r, _) = next();
+            let late_took = cancelled_at.elapsed();
+            assert_eq!((name, r), ("late", Some("CANCELLED")));
+            assert!(late_took < Duration::from_secs(1), "{late_took:?}");
+            assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "a Codex was started");
+            drop(holder);
+        });
+        // The lock itself is unharmed: the next call starts Codex as usual.
+        let (_, report) = call(&f.app, STATUS, json!({}));
+        assert!(report.contains("image generation: available"), "{report}");
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_failed_preflight_closes_the_child_and_the_next_call_starts_a_fresh_one() {
         let codex = FakeCodex {
             account: json!({"account": null, "requiresOpenaiAuth": true}),
@@ -1396,6 +1529,32 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("backend unavailable"), "{report}");
+    }
+
+    #[test]
+    fn a_usage_read_keeps_an_image_quota_learned_from_an_update() {
+        let f = fixture(FakeCodex::default());
+        call(&f.app, STATUS, json!({}));
+        let handler = notification_handler(Arc::clone(&f.app.usage), Arc::default());
+        handler(
+            "account/rateLimits/updated",
+            &RawValue::from_string(
+                r#"{"rateLimits":{"limitId":"image_gen","primary":{"usedPercent":20,
+                   "windowDurationMins":1440,"resetsAt":null}}}"#
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        // The next read reports only the codex bucket, as the real one does.
+        let (_, report) = call(&f.app, STATUS, json!({}));
+        assert!(
+            report.contains("usage: image quota: 1440-min 20%"),
+            "{report}"
+        );
+        assert!(
+            report.contains("usage: Codex agent usage: weekly 44%"),
+            "{report}"
+        );
     }
 
     #[test]

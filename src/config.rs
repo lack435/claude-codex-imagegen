@@ -43,9 +43,9 @@ pub enum Mode {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub mode: Mode,
-    /// `--codex-bin`, exactly as given. Resolution (and the error when it does not exist) happens
-    /// when the Codex child is first needed, so a bad path surfaces as an in-band CLI_NOT_FOUND
-    /// rather than a server that never starts.
+    /// `--codex-bin`: absolute, checked at parse time. Whether it exists is checked only when the
+    /// Codex child is first needed, so a missing file surfaces as an in-band CLI_NOT_FOUND rather
+    /// than a server that never starts.
     pub codex_bin: Option<PathBuf>,
     /// `--codex-home`: CODEX_HOME for the child. Absolute.
     pub codex_home: Option<PathBuf>,
@@ -159,7 +159,7 @@ impl Config {
             }
 
             match canonical {
-                "--codex-bin" => codex_bin = Some(PathBuf::from(value)),
+                "--codex-bin" => codex_bin = Some(absolute_path(canonical, value)?),
                 "--codex-home" => codex_home = Some(absolute_dir(canonical, value)?),
                 "--model" => model = Some(model_id(value)?),
                 "--effort" => effort = Some(effort_level(value)?),
@@ -244,12 +244,26 @@ const FLAGS: &[&str] = &[
 const SWITCHES: &[&str] = &["--doctor", "--cleanup", "--help", "--version"];
 
 fn absolute_dir(flag: &str, value: &str) -> Result<PathBuf, String> {
+    absolute(flag, value, r"D:\codex-imagegen")
+}
+
+/// `--codex-bin` must be absolute for a sharper reason than the directories: Claude Code starts
+/// the server in each project's directory, so a relative binary would resolve inside whichever
+/// repository is open, and a repository holding a file by that name would get it run with the
+/// user's Codex login.
+fn absolute_path(flag: &str, value: &str) -> Result<PathBuf, String> {
+    absolute(flag, value, r"C:\tools\codex.exe")
+}
+
+/// A relative path would resolve against whichever directory each Claude Code window launched us
+/// from, so two windows would silently use different ones. On Windows `is_absolute` also refuses
+/// the drive-relative `C:x` and the root-relative `\x`, which depend on the current drive or its
+/// current directory.
+fn absolute(flag: &str, value: &str, example: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(value);
-    // Relative would resolve against whichever directory each Claude Code window launched us
-    // from, so two windows would silently use different directories.
     if !path.is_absolute() {
         return Err(format!(
-            "{flag} requires an absolute path (for example D:\\codex-imagegen), got '{value}'"
+            "{flag} requires an absolute path (for example {example}), got '{value}'"
         ));
     }
     Ok(path)
@@ -381,7 +395,7 @@ The server speaks MCP over stdio. Register it with Claude Code:
   claude mcp add --scope user codex-imagegen -- C:\tools\codex-imagegen.exe [OPTIONS]
 
 OPTIONS:
-  --codex-bin <path>          The Codex CLI. Default: PATH, then
+  --codex-bin <abs path>      The Codex CLI. Default: PATH, then
                               %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
   --codex-home <abs dir>      Run Codex with CODEX_HOME set to this directory, a dedicated
                               home that keeps ~/.codex (config, AGENTS.md, MCP servers,
@@ -559,6 +573,26 @@ mod tests {
         assert!(err(&["--max-concurrent", "0"]).contains("between 1"));
         assert!(err(&["--session-ttl-days", "3651"]).contains("between 0 and 3650"));
         assert!(err(&["--cleanup", "--older-than-days", "x"]).contains("whole number"));
+    }
+
+    #[test]
+    fn the_codex_bin_must_be_absolute() {
+        for bad in [
+            &["--codex-bin", r"tools\codex.exe"][..],
+            &["--codex-bin=codex.exe"][..],
+            &["--codex-bin", "C:codex.exe"][..],
+            &["--codex-bin", r"\tools\codex.exe"][..],
+        ] {
+            let e = err(bad);
+            assert!(e.contains("--codex-bin requires an absolute path"), "{e}");
+        }
+        // Absolute is enough: whether it exists is checked when Codex is first needed.
+        assert_eq!(
+            parse(&["--codex-bin", r"C:\nope\codex.exe"])
+                .unwrap()
+                .codex_bin,
+            Some(PathBuf::from(r"C:\nope\codex.exe"))
+        );
     }
 
     #[test]

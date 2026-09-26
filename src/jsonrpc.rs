@@ -222,6 +222,23 @@ fn string_member(raw: &RawValue) -> serde_json::Result<Cow<'_, str>> {
     }
 }
 
+/// The error for a line that is not a JSON object: the real parse error when it is not JSON at
+/// all, so the message matches the `-32700` it is sent with, and otherwise what it is instead.
+/// Only reached on the failure path, so the extra parse costs normal traffic nothing.
+fn not_an_object(line: &str) -> serde_json::Error {
+    use serde::de::Error;
+    if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(line) {
+        return e;
+    }
+    if line.trim_start().starts_with('[') {
+        serde_json::Error::custom(
+            "JSON-RPC batches are not supported; send one message object per line",
+        )
+    } else {
+        serde_json::Error::custom("a JSON-RPC message must be a JSON object")
+    }
+}
+
 /// What kind of JSON-RPC message an [`Envelope`] holds.
 #[derive(Debug)]
 pub enum Kind<'e> {
@@ -238,7 +255,18 @@ pub enum Kind<'e> {
 impl<'a> Envelope<'a> {
     /// Parse the envelope of one line. `Err` means the line is not a JSON object with the
     /// expected member types; [`parse_failure_code`] says which JSON-RPC error that is.
+    ///
+    /// Anything but an object is refused before serde sees it. A derived struct also accepts a
+    /// JSON array, filling its fields by position, so without this check `[7,"ping"]` would read
+    /// as a ping with id 7, and a batch `[{...}]` as a response whose id is the whole request.
+    /// Batches are not supported: the peer gets an error rather than silence.
     pub fn parse(line: &'a str) -> serde_json::Result<Self> {
+        if !line
+            .trim_start_matches([' ', '\t', '\n', '\r'])
+            .starts_with('{')
+        {
+            return Err(not_an_object(line));
+        }
         let raw: RawEnvelope<'a> = serde_json::from_str(line)?;
         Ok(Self {
             id: raw.id,
@@ -407,6 +435,35 @@ mod tests {
         let line_range = line.as_ptr() as usize..line.as_ptr() as usize + line.len();
         assert!(line_range.contains(&(params.as_ptr() as usize)));
         assert!(matches!(envelope.method, Some(Cow::Borrowed(_))));
+    }
+
+    #[test]
+    fn only_a_json_object_is_a_message() {
+        // A derived struct would read each of these positionally: a ping with id 7, a response
+        // whose id is a whole request, and a response to request 3.
+        for line in [
+            r#"[7,"ping"]"#,
+            r#"[{"id":1,"method":"ping"}]"#,
+            "[3]",
+            " \t[3]",
+            "7",
+            r#""ping""#,
+            "null",
+        ] {
+            let e = Envelope::parse(line).expect_err(line);
+            assert_eq!(parse_failure_code(line), -32600, "{line}");
+            if line.trim_start().starts_with('[') {
+                assert!(e.to_string().contains("batches are not supported"), "{e}");
+            } else {
+                assert!(e.to_string().contains("must be a JSON object"), "{e}");
+            }
+        }
+        // Not JSON at all: the real parse error, matching the -32700 it is sent with.
+        let e = Envelope::parse("[not json").unwrap_err();
+        assert!(!e.to_string().contains("batches"), "{e}");
+        assert_eq!(parse_failure_code("[not json"), -32700);
+        // Leading JSON whitespace before an object is fine.
+        assert!(Envelope::parse(" \t{\"method\":\"m\"}").is_ok());
     }
 
     #[test]

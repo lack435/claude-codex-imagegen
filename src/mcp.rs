@@ -347,6 +347,7 @@ fn start_tool_call(
             let mut entry = PendingEntry {
                 pending: &pending_here,
                 key: &thread_key,
+                mine: Arc::clone(&request),
                 released: false,
             };
             let reporter = ProgressReporter::start(&writer, &params, &request, progress_interval);
@@ -453,7 +454,8 @@ fn handle_cancellation(pending: &Pending, params: &Value) {
     let shown = jsonrpc::clamp(&key, 200);
 
     // Removed here rather than by the handler, so a duplicate notification finds nothing and
-    // cancels nothing. The handler's own removal is then a no-op.
+    // cancels nothing. The handler's own removal is then a no-op: it removes only the entry it
+    // inserted, which also leaves alone a newer request that has since reused the id.
     let entry = lock(pending).remove(&key);
     let Some(entry) = entry else {
         // Routine: a cancellation racing a response that already went out lands here, as does one
@@ -539,16 +541,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Normally `release` does it the moment the work is done. The `Drop` is the net for a handler
 /// that unwinds anyway, which would otherwise strand the entry for the life of the process.
+///
+/// It removes only the entry it inserted. A cancellation removes the entry at once while the
+/// handler runs on, so by the time the handler finishes, a new request may have been accepted
+/// under the same id; removing by key alone would delete that request's entry and leave it
+/// uncancellable.
 struct PendingEntry<'a> {
     pending: &'a Pending,
     key: &'a str,
+    mine: Arc<RequestCancel>,
     released: bool,
 }
 
 impl PendingEntry<'_> {
     fn release(&mut self) {
         if !self.released {
-            lock(self.pending).remove(self.key);
+            let mut map = lock(self.pending);
+            if map
+                .get(self.key)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.mine))
+            {
+                map.remove(self.key);
+            }
             self.released = true;
         }
     }
@@ -751,6 +765,8 @@ mod tests {
         hook_ran: Signal,
         hook_runs: AtomicUsize,
         call_running: Signal,
+        release: Signal,
+        released_call_returned: Signal,
     }
 
     impl ToolHost for FakeHost {
@@ -788,6 +804,13 @@ mod tests {
                         self.hook_ran.set();
                     }
                     text_result("finished", false)
+                }
+                // Ignores cancellation: runs on until the test releases it.
+                "block_until_released" => {
+                    self.call_running.set();
+                    let released = self.release.wait(WAIT);
+                    self.released_call_returned.set();
+                    text_result(if released { "released" } else { "timed out" }, false)
                 }
                 "block_until_shutdown" => {
                     self.call_running.set();
@@ -1047,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn an_array_is_rejected_rather_than_run_or_ignored() {
+        let host = host();
+        let harness = Harness::start(Arc::clone(&host), ServeOptions::default());
+        // Read positionally, this would be a ping with id 7.
+        harness.send_raw(b"[7,\"ping\"]\n");
+        // A one-element batch: it must get an answer, not silence.
+        harness.send_raw(b"[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}]\n");
+        // Read positionally, this would start a tool call with id 8.
+        harness.send_raw(b"[8,\"tools/call\",{\"name\":\"block_until_shutdown\"}]\n");
+        harness.send(json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}));
+        let messages = harness.finish();
+
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        for m in &messages[..3] {
+            assert_eq!(m["id"], Value::Null, "{m}");
+            assert_eq!(m["error"]["code"], -32600, "{m}");
+            let text = m["error"]["message"].as_str().unwrap();
+            assert!(text.contains("batches are not supported"), "{text}");
+        }
+        assert_eq!(messages[3]["id"], 9);
+        assert!(!host.call_running.is_set(), "an array started a tool call");
+    }
+
+    #[test]
     fn notifications_and_stray_responses_are_never_answered() {
         let messages = run(
             host(),
@@ -1158,6 +1205,35 @@ mod tests {
         let for_nine = with_id(&messages, &json!(9));
         assert_eq!(for_nine.len(), 1, "{messages:?}");
         assert_eq!(for_nine[0]["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn a_cancelled_handler_finishing_late_leaves_a_reused_ids_entry_alone() {
+        let host = host();
+        let harness = Harness::start(Arc::clone(&host), ServeOptions::default());
+        let cancel_five = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                 "params": {"requestId": 5}});
+        // A call that keeps running after its cancellation.
+        harness.send(call(json!(5), "block_until_released", json!({})));
+        assert!(host.call_running.wait(WAIT));
+        harness.send(cancel_five.clone());
+        harness.send(json!({"jsonrpc": "2.0", "id": 6, "method": "ping"}));
+        harness.wait_until("the ping", |m| !with_id(m, &json!(6)).is_empty());
+        // The client reuses the id for a new call while the old handler is still running.
+        harness.send(call(json!(5), "block_until_cancelled", json!({})));
+        assert!(host.hook_installed.wait(WAIT));
+        // The old handler finishes; its cleanup must not remove the new call's entry.
+        host.release.set();
+        assert!(host.released_call_returned.wait(WAIT));
+        std::thread::sleep(Duration::from_millis(100));
+        // So the new call can still be cancelled.
+        harness.send(cancel_five);
+        assert!(
+            host.hook_ran.wait(WAIT),
+            "the reused id's call could no longer be cancelled"
+        );
+        let messages = harness.finish();
+        assert!(with_id(&messages, &json!(5)).is_empty(), "{messages:?}");
     }
 
     #[test]

@@ -197,7 +197,7 @@ Starts a new session and generates one image.
 | --- | --- | --- |
 | `prompt` | string, required | Passed to the image tool verbatim. |
 | `session` | string, optional | The new session's name. If omitted, the server picks `img-<yyyyMMdd-HHmmss>-<4 hex>`, and picks again if that collides. If an explicit name exists: `SESSION_EXISTS` (agent-correctable). |
-| `reference_images` | string[], optional | Up to 5 paths. Each must open and start with a PNG, JPEG or WebP signature, or the call gets `BAD_REQUEST`. They become the tool's `referenced_image_paths`. |
+| `reference_images` | string[], optional | Up to 5 paths. Each must open and start with a PNG, JPEG or WebP signature, or the call gets `BAD_REQUEST`. Relative paths resolve like output paths: against `CLAUDE_PROJECT_DIR` when it is set, else the server's working directory. They reach Codex as absolute paths, and become the tool's `referenced_image_paths`. |
 | `output_dir` | string, optional | See [Output files](#output-files). |
 
 ### `codex_imagegen_refine`
@@ -760,6 +760,9 @@ case is always a success with warnings.
 - **Threads.** Each `tools/call` runs on its own thread, so `ping` and cancellation keep flowing.
 - **Protocol versions.** Supported: `["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]`. The server
   echoes a supported client version, and otherwise answers with the **newest**, as the MCP spec recommends.
+  JSON-RPC batches, which 2025-03-26 allows, are not supported: a line holding a JSON array gets one `-32600`
+  error with a null id, and none of its elements is dispatched. Only a JSON object is read as a message, on
+  both the MCP side and the `app-server` side.
 - **`initialize` result.** Capabilities `{tools:{}}` and short `instructions`, under 2,048 characters. Tool
   descriptions are also under 2,048 characters. No tool declares `execution.taskSupport`.
 - **Shared framing.** The same framing code (send, line reader, message classification, request keys) serves
@@ -770,7 +773,7 @@ case is always a success with warnings.
 Everything is a command-line argument on the MCP entry. There is no config file of our own.
 
 ```
---codex-bin <path>         Codex CLI; default: PATH, then %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
+--codex-bin <abs path>     Codex CLI; default: PATH, then %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
 --codex-home <abs dir>     Set CODEX_HOME for the child (dedicated home; isolates ~/.codex, see Security posture)
 --model <id>               Agent model, full id. Default gpt-6-astra
 --effort <level>           Agent reasoning effort. Default low
@@ -779,7 +782,8 @@ Everything is a command-line argument on the MCP entry. There is no config file 
 --timeout-seconds <n>      Whole-call limit for generate/refine. Default 300
 --max-concurrent <n>       Concurrent turns across sessions. Default 4
 --session-ttl-days <n>     Expire sessions idle this long (see Cleanup). Default 7; 0 disables
---doctor                   Check CLI, login, plan, capability and model from a terminal (free), then exit
+--doctor                   Check CLI, login, plan, capability and model from a terminal (free), then exit:
+                           0 when ready, 1 otherwise
 --cleanup                  Sweep expired sessions across all projects, then exit
 --older-than-days <n>      With --cleanup: override the TTL (0 = every session not in use)
 --help, --version
