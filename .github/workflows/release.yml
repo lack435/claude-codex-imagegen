@@ -1,0 +1,80 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes a GitHub release holding codex-imagegen.exe and its SHA-256.
+# The binary is the one CI builds and checks for that commit, in this same run: ci.yml is called
+# as a job, so a release goes through the same fmt, clippy, tests, build checks and failure
+# contract as every pull request, with no second build definition to drift from it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      # To create the release and upload its files.
+      contents: write
+    # Passed as variables, never spliced into the scripts: a tag name is text someone typed.
+    env:
+      TAG: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Every branch's history, to check that the tagged commit is on main.
+          fetch-depth: 0
+
+      # Every change reaches main through a reviewed pull request (AGENTS.md), so a release is
+      # made only from a commit main already contains.
+      - name: The tagged commit is on main
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor $env:SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw "$env:TAG points at $env:SHA, which is not on main" }
+
+      # Verifies the download against the digest CI's upload recorded.
+      - name: Download the binary CI built
+        uses: actions/download-artifact@v8
+        with:
+          name: codex-imagegen-${{ github.sha }}
+          path: dist
+
+      # The tag must name the version the binary reports (Cargo.toml's), so a release can never
+      # carry a binary that calls itself something else.
+      - name: The tag matches the binary's version
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') { throw "$env:TAG is not a vX.Y.Z tag" }
+          $version = $Matches[1]
+          $line = & '.\dist\codex-imagegen.exe' --version
+          Write-Host $line
+          if ($line -notlike "codex-imagegen $version (*") { throw "$env:TAG does not match the binary: $line" }
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = 'dist\codex-imagegen.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sumFile = 'dist\codex-imagegen.exe.sha256'
+          [IO.File]::WriteAllText($sumFile, "$hash  codex-imagegen.exe`n", (New-Object System.Text.UTF8Encoding($false)))
+          $notes = @(
+            "codex-imagegen.exe for Windows x64, built and checked by CI from $env:SHA."
+            ''
+            "SHA-256: $hash"
+            ''
+            'Setup is in the README: copy the exe to a folder outside any repository, such as C:\tools\, run it with --doctor, then register it with claude mcp add.'
+          ) -join "`n"
+          $flags = @('--verify-tag', '--title', $env:TAG, '--notes', $notes, '--generate-notes')
+          # A tag with a suffix (v1.2.0-rc.1) is a pre-release.
+          if ($env:TAG.Contains('-')) { $flags += '--prerelease' }
+          gh release create $env:TAG $exe $sumFile @flags
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
