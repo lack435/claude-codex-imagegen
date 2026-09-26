@@ -20,9 +20,11 @@
 //! arrives before `turn/start` has answered is remembered, and the interrupt comes due the moment
 //! the turn id turns up.
 //!
-//! The event type is the caller's; the registry only needs to know which turn an event names and
-//! whether it ends the turn ([`TurnEvent`]).
+//! The event type is the caller's; the registry only needs to know which turn an event names,
+//! whether it ends the turn, and whether it must survive arriving before its thread is attached
+//! ([`TurnEvent`]).
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -36,7 +38,19 @@ pub trait TurnEvent: Send + 'static {
     fn turn_id(&self) -> Option<&str>;
     /// Whether it ends the turn: `turn/completed`.
     fn ends_turn(&self) -> bool;
+    /// Whether to hold on to it when no call has attached its thread yet, and hand it over when
+    /// one does. Codex reports MCP server startups right after answering `thread/start`, so the
+    /// reader can route one before the call has had the reply and attached its thread
+    /// [verified: smoke log]; the canary must not be lost in that gap. Only for small events.
+    fn keep_unrouted(&self) -> bool {
+        false
+    }
 }
+
+/// How many unrouted events are held (see [`TurnEvent::keep_unrouted`]). They only bridge the
+/// moment between a `thread/start` reply and its `attach`, so a handful is plenty; the oldest goes
+/// first.
+const MAX_UNROUTED: usize = 32;
 
 /// Whether the Codex child a thread lives on is still alive. A lingering turn whose child has died
 /// can never complete, so it frees its session instead. Asked with no registry lock held, but on
@@ -83,6 +97,8 @@ struct State<E> {
     shutting_down: bool,
     next_id: u64,
     entries: Vec<Entry<E>>,
+    /// Events kept for a thread no call has attached yet, oldest first.
+    unrouted: VecDeque<(String, E)>,
 }
 
 struct Entry<E> {
@@ -93,8 +109,8 @@ struct Entry<E> {
     phase: String,
     thread_id: Option<String>,
     turn_id: Option<String>,
-    /// The child the thread lives on: its id (for [`Registry::turns_on`]) and its liveness.
-    child: Option<(u64, Liveness)>,
+    /// Whether the child the thread lives on is alive.
+    child: Option<Liveness>,
     /// The call's channel. `None` until attached, and again once the call has given up.
     events: Option<Sender<E>>,
     /// The call has returned without seeing `turn/completed`.
@@ -135,6 +151,7 @@ impl<E: TurnEvent> Registry<E> {
                 shutting_down: false,
                 next_id: 1,
                 entries: Vec::new(),
+                unrouted: VecDeque::new(),
             }),
         }
     }
@@ -191,10 +208,19 @@ impl<E: TurnEvent> Registry<E> {
     /// call that has stopped reading costs nothing.
     pub fn route(&self, thread_id: &str, event: E) -> Option<FollowUp> {
         let mut state = self.lock();
-        let index = state
+        let Some(index) = state
             .entries
             .iter()
-            .position(|e| e.thread_id.as_deref() == Some(thread_id))?;
+            .position(|e| e.thread_id.as_deref() == Some(thread_id))
+        else {
+            if event.keep_unrouted() {
+                if state.unrouted.len() >= MAX_UNROUTED {
+                    state.unrouted.pop_front();
+                }
+                state.unrouted.push_back((thread_id.to_string(), event));
+            }
+            return None;
+        };
         let entry = &mut state.entries[index];
         if entry.lingering && event.ends_turn() {
             state.entries.remove(index);
@@ -242,18 +268,6 @@ impl<E: TurnEvent> Registry<E> {
             .collect()
     }
 
-    /// How many turns run on child `child_id`, lingering ones included. A child marked for
-    /// recycling is closed once this is zero (docs/design.md, "When a turn fails with
-    /// `AUTH_EXPIRED`").
-    pub fn turns_on(&self, child_id: u64) -> usize {
-        self.prune_dead();
-        self.lock()
-            .entries
-            .iter()
-            .filter(|e| matches!(&e.child, Some((id, _)) if *id == child_id))
-            .count()
-    }
-
     /// Free the sessions of lingering turns whose child has died: those turns can never complete.
     /// A call's own entry is left alone, since the call notices the death itself. The liveness
     /// checks run with the lock released, so a slow one never holds up the reader.
@@ -263,7 +277,7 @@ impl<E: TurnEvent> Registry<E> {
             .entries
             .iter()
             .filter(|e| e.lingering)
-            .filter_map(|e| e.child.as_ref().map(|(_, alive)| (e.id, Arc::clone(alive))))
+            .filter_map(|e| e.child.as_ref().map(|alive| (e.id, Arc::clone(alive))))
             .collect();
         let dead: Vec<u64> = lingering
             .into_iter()
@@ -307,16 +321,33 @@ impl<E: TurnEvent> TurnSlot<E> {
             .with_entry(self.id, |e| e.phase = phase.to_string());
     }
 
-    /// Route `thread_id`'s notifications to this call from now on, and say which child the
-    /// thread lives on. Call it as soon as `thread/start` answers, before `turn/start`, so that no
+    /// Route `thread_id`'s notifications to this call from now on, and say how to tell whether the
+    /// child the thread lives on is alive. Call it as soon as `thread/start` answers, before `turn/start`, so that no
     /// notification of the turn can arrive unrouted.
-    pub fn attach(&self, thread_id: &str, child_id: u64, alive: Liveness) -> Receiver<E> {
+    ///
+    /// Events kept for this thread before it was attached (see [`TurnEvent::keep_unrouted`]) are
+    /// delivered first, in the order they arrived. That happens under the same lock `route` takes,
+    /// so every event reaches the call exactly once, whichever side of the attach it arrived on.
+    pub fn attach(&self, thread_id: &str, alive: Liveness) -> Receiver<E> {
         let (events, receiver) = mpsc::channel();
-        self.registry.with_entry(self.id, |e| {
-            e.thread_id = Some(thread_id.to_string());
-            e.child = Some((child_id, alive));
-            e.events = Some(events);
-        });
+        let mut guard = self.registry.lock();
+        let state = &mut *guard;
+        let Some(entry) = state.entries.iter_mut().find(|e| e.id == self.id) else {
+            return receiver;
+        };
+        let mut kept = VecDeque::new();
+        for (thread, event) in state.unrouted.drain(..) {
+            if thread == thread_id {
+                entry.learn_turn(event.turn_id());
+                let _ = events.send(event);
+            } else {
+                kept.push_back((thread, event));
+            }
+        }
+        state.unrouted = kept;
+        entry.thread_id = Some(thread_id.to_string());
+        entry.child = Some(alive);
+        entry.events = Some(events);
         receiver
     }
 
@@ -417,6 +448,9 @@ mod tests {
         }
         fn ends_turn(&self) -> bool {
             self.ends
+        }
+        fn keep_unrouted(&self) -> bool {
+            self.label.starts_with("keep")
         }
     }
 
@@ -537,10 +571,10 @@ mod tests {
     fn shutdown_refuses_new_calls_and_interrupts_every_turn() {
         let r = registry(4);
         let known = r.try_start("known").unwrap();
-        let _rx = known.attach("t1", 1, alive());
+        let _rx = known.attach("t1", alive());
         known.set_turn("u1");
         let pending = r.try_start("pending").unwrap();
-        let rx = pending.attach("t2", 1, alive());
+        let rx = pending.attach("t2", alive());
         assert_eq!(r.begin_shutdown(), vec![interrupt("t1", "u1")]);
         assert_eq!(code(r.try_start("new")), "SERVER_SHUTTING_DOWN");
         // The turn whose id was not known yet is interrupted as soon as it turns up, once.
@@ -559,8 +593,8 @@ mod tests {
         let r = registry(4);
         let a = r.try_start("a").unwrap();
         let b = r.try_start("b").unwrap();
-        let rx_a = a.attach("thread-a", 1, alive());
-        let rx_b = b.attach("thread-b", 1, alive());
+        let rx_a = a.attach("thread-a", alive());
+        let rx_b = b.attach("thread-b", alive());
         assert_eq!(r.route("thread-a", untagged("thread/started")), None);
         assert_eq!(r.route("thread-b", item("tb", "item/started")), None);
         assert_eq!(r.route("thread-a", item("ta", "item/completed")), None);
@@ -575,10 +609,34 @@ mod tests {
     }
 
     #[test]
+    fn an_event_that_beats_the_attach_is_delivered_on_attach_if_it_asks_to_be_kept() {
+        let r = registry(4);
+        let slot = r.try_start("s").unwrap();
+        // Routed before the call has attached its thread: kept, or dropped, as each asks.
+        assert_eq!(r.route("t", untagged("keep: mcp startup")), None);
+        assert_eq!(r.route("t", untagged("thread/started")), None);
+        assert_eq!(r.route("other", untagged("keep: someone else's")), None);
+        let rx = slot.attach("t", alive());
+        assert_eq!(r.route("t", untagged("after")), None);
+        let labels: Vec<&str> = rx.try_iter().map(|e| e.label).collect();
+        assert_eq!(labels, vec!["keep: mcp startup", "after"]);
+        // The other thread's event is still held for whoever attaches it.
+        let other = r.try_start("o").unwrap();
+        let rx = other.attach("other", alive());
+        assert_eq!(rx.try_iter().count(), 1);
+
+        // The buffer is bounded: the oldest go first.
+        for _ in 0..(MAX_UNROUTED + 5) {
+            r.route("nobody", untagged("keep"));
+        }
+        assert_eq!(r.lock().unrouted.len(), MAX_UNROUTED);
+    }
+
+    #[test]
     fn a_call_that_stopped_reading_never_blocks_the_router() {
         let r = registry(1);
         let slot = r.try_start("s").unwrap();
-        let rx = slot.attach("t", 1, alive());
+        let rx = slot.attach("t", alive());
         let started = Instant::now();
         for _ in 0..10_000 {
             r.route("t", item("u", "item/updated"));
@@ -593,7 +651,7 @@ mod tests {
         // Cancelled after the turn started: the hook gets the interrupt at once.
         let r = registry(4);
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 1, alive());
+        let _rx = slot.attach("t", alive());
         assert_eq!(slot.set_turn("u"), None, "nobody asked yet");
         let hook = slot.handle();
         assert_eq!(hook.request_interrupt(), Some(interrupt("t", "u")));
@@ -606,7 +664,7 @@ mod tests {
         // From turn/start's reply...
         let r = registry(4);
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 1, alive());
+        let _rx = slot.attach("t", alive());
         assert_eq!(slot.handle().request_interrupt(), None);
         assert_eq!(slot.set_turn("u"), Some(interrupt("t", "u")));
         assert_eq!(slot.set_turn("u"), None);
@@ -614,7 +672,7 @@ mod tests {
 
         // ...or from a notification that names it, which is still delivered.
         let slot = r.try_start("s").unwrap();
-        let rx = slot.attach("t2", 1, alive());
+        let rx = slot.attach("t2", alive());
         assert_eq!(slot.handle().request_interrupt(), None);
         assert_eq!(r.route("t2", untagged("thread/status/changed")), None);
         assert_eq!(
@@ -629,7 +687,7 @@ mod tests {
     fn a_lingering_turn_keeps_its_session_busy_until_turn_completed() {
         let r = registry(2);
         let slot = r.try_start("fox").unwrap();
-        let rx = slot.attach("t", 7, alive());
+        let rx = slot.attach("t", alive());
         slot.set_turn("u");
         slot.set_phase("generating image");
         assert_eq!(slot.linger(), Some(interrupt("t", "u")));
@@ -640,7 +698,6 @@ mod tests {
         assert!(err.summary.contains("interrupted"), "{}", err.summary);
         let _other = r.try_start("other").unwrap();
         assert_eq!(code(r.try_start("third")), "TOO_MANY_RUNNING");
-        assert_eq!(r.turns_on(7), 1);
         let running = r.running();
         assert_eq!(running.len(), 2);
         assert_eq!(running[0].session, "fox");
@@ -657,7 +714,6 @@ mod tests {
                 thread_id: "t".to_string()
             })
         );
-        assert_eq!(r.turns_on(7), 0);
         assert_eq!(code(r.try_start("fox")), "OK");
     }
 
@@ -665,7 +721,7 @@ mod tests {
     fn a_turn_start_reply_that_came_too_late_is_interrupted_when_the_turn_shows_up() {
         let r = registry(4);
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 1, alive());
+        let _rx = slot.attach("t", alive());
         // The call gave up while turn/start was still unanswered.
         assert_eq!(slot.linger(), None);
         assert_eq!(r.route("t", untagged("thread/status/changed")), None);
@@ -689,13 +745,12 @@ mod tests {
         let r = registry(1);
         let (child_alive, liveness) = switch();
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 3, liveness);
+        let _rx = slot.attach("t", liveness);
         slot.set_turn("u");
         slot.linger();
         assert_eq!(code(r.try_start("s")), "SESSION_BUSY");
-        assert_eq!(r.turns_on(3), 1);
+        assert_eq!(r.running().len(), 1);
         child_alive.store(false, Ordering::SeqCst);
-        assert_eq!(r.turns_on(3), 0);
         assert!(r.running().is_empty());
         assert_eq!(code(r.try_start("s")), "OK");
     }
@@ -706,7 +761,7 @@ mod tests {
         let r = registry(1);
         let (child_alive, liveness) = switch();
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 3, liveness);
+        let _rx = slot.attach("t", liveness);
         child_alive.store(false, Ordering::SeqCst);
         assert_eq!(code(r.try_start("s")), "SESSION_BUSY");
         assert_eq!(r.running().len(), 1);
@@ -723,32 +778,16 @@ mod tests {
     }
 
     #[test]
-    fn turns_are_counted_per_child() {
-        let r = registry(4);
-        let a = r.try_start("a").unwrap();
-        let b = r.try_start("b").unwrap();
-        let c = r.try_start("c").unwrap();
-        let _ra = a.attach("ta", 1, alive());
-        let _rb = b.attach("tb", 2, alive());
-        // `c` has not got a thread yet, so it is on no child.
-        assert_eq!((r.turns_on(1), r.turns_on(2), r.turns_on(3)), (1, 1, 0));
-        drop((a, c));
-        assert_eq!(r.turns_on(1), 0);
-        assert_eq!(r.running().len(), 1);
-        drop(b);
-    }
-
-    #[test]
     fn the_cancel_hook_handle_outlives_the_slot_harmlessly() {
         let r = registry(1);
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 1, alive());
+        let _rx = slot.attach("t", alive());
         let hook = slot.handle();
         slot.finish();
         assert_eq!(hook.request_interrupt(), None);
         // And it works from another thread, as the MCP reader runs it.
         let slot = r.try_start("s").unwrap();
-        let _rx = slot.attach("t", 1, alive());
+        let _rx = slot.attach("t", alive());
         slot.set_turn("u");
         let hook = slot.handle();
         let sent = std::thread::spawn(move || hook.request_interrupt())

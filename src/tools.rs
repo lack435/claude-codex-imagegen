@@ -6,9 +6,11 @@
 //! or changed account. A failed preflight closes the child at once, so a retry after
 //! `codex login` works without restarting anything.
 //!
-//! In this build `generate` and `refine` validate their arguments and bring the child up, so
-//! setup problems surface exactly as they will later, and then stop: image generation itself
-//! arrives in milestone M2.
+//! `generate` validates its arguments, pre-checks the output folder, claims its session in the
+//! registry, brings the child up and hands the turn to `turn.rs`, in the order of docs/design.md's
+//! "Request flow", so nothing is spent until every local check has passed. `refine` validates its
+//! arguments and brings the child up, so setup problems surface exactly as they will later, and
+//! then stops: sessions arrive in milestone M3.
 
 use std::fs::File;
 use std::io::Read;
@@ -20,12 +22,15 @@ use std::time::{Duration, Instant};
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
 
-use crate::appserver::{AppServer, NotificationHandler, RpcError};
+use crate::appserver::{AppServer, DetachedSender, NotificationHandler, RpcError};
 use crate::cancel::RequestCancel;
 use crate::codex::{self, Budget, Facts, Handshake, Rpc, Usage};
 use crate::config::Config;
 use crate::errors::{self, Failure};
 use crate::mcp::{self, CallContext, Progress, ToolHost};
+use crate::output;
+use crate::registry::{Liveness, Registry, TurnSlot};
+use crate::turn::{self, Event};
 
 pub const GENERATE: &str = "codex_imagegen_generate";
 pub const REFINE: &str = "codex_imagegen_refine";
@@ -44,6 +49,10 @@ const STATUS_READ_DEADLINE: Duration = Duration::from_secs(10);
 /// How often a call waiting for another call's Codex start checks whether it has been cancelled
 /// or run out of time. The same interval a request uses while waiting for its reply.
 const START_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// How many automatic session names a call tries before giving up. Each try draws a new random
+/// suffix, so a second collision in one process is already all but impossible.
+const AUTO_NAME_TRIES: usize = 8;
 
 /// How the tool layer gets a Codex child. A trait so tests can hand it a scripted fake; the real
 /// one resolves the CLI and spawns it.
@@ -73,10 +82,12 @@ impl Launcher for CodexLauncher {
 pub struct App {
     cfg: Config,
     launcher: Box<dyn Launcher>,
-    /// What relative paths in tool arguments resolve against: `CLAUDE_PROJECT_DIR` when Claude
-    /// Code sets it, else this server's working directory, the same rule as output directories
-    /// (docs/design.md, "Output files"). Codex runs in its own empty work directory, so a path
-    /// has to be absolute before it reaches it.
+    /// `CLAUDE_PROJECT_DIR`, when Claude Code sets it to an absolute path. The default output
+    /// folder is `generated-images` under it (docs/design.md, "Output files").
+    project_dir: Option<PathBuf>,
+    /// What relative paths in tool arguments resolve against: `project_dir` when set, else this
+    /// server's working directory, the same rule as output directories. Codex runs in its own
+    /// empty work directory, so a path has to be absolute before it reaches it.
     path_base: PathBuf,
     shutting_down: AtomicBool,
     /// Held while a child is brought up, so two calls never start two children.
@@ -86,6 +97,10 @@ pub struct App {
     child: Mutex<Option<Arc<CodexChild>>>,
     /// The latest usage, from `status` reads and `account/rateLimits/updated` notifications.
     usage: Arc<Mutex<UsageCache>>,
+    /// The image turns running in this process, and the routing of their notifications.
+    registry: Arc<Registry<Event>>,
+    /// How long a call waits for `turn/completed` after interrupting its turn.
+    interrupt_wait: Duration,
 }
 
 struct CodexChild {
@@ -93,8 +108,9 @@ struct CodexChild {
     bin: PathBuf,
     /// Set once the handshake and preflight have passed.
     ready: OnceLock<Ready>,
-    /// Set when `account/updated` reports an auth mode other than ChatGPT: the preflight that
-    /// admitted this child no longer holds, so the next call starts a fresh one.
+    /// Set when `account/updated` reports an auth mode other than ChatGPT, or a turn fails with
+    /// `unauthorized`: the login that admitted this child no longer holds, so the next call starts
+    /// a fresh one, and this one is closed once no call is using it.
     stale: Arc<AtomicBool>,
 }
 
@@ -130,22 +146,30 @@ struct UsageCache {
 
 impl App {
     pub fn new(cfg: Config) -> Self {
-        let path_base = std::env::var_os("CLAUDE_PROJECT_DIR")
+        let project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
             .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| cfg.cwd.clone());
-        Self::with_launcher(cfg, Box::new(CodexLauncher), path_base)
+            .filter(|p| p.is_absolute());
+        Self::with_launcher(cfg, Box::new(CodexLauncher), project_dir)
     }
 
-    fn with_launcher(cfg: Config, launcher: Box<dyn Launcher>, path_base: PathBuf) -> Self {
+    fn with_launcher(
+        cfg: Config,
+        launcher: Box<dyn Launcher>,
+        project_dir: Option<PathBuf>,
+    ) -> Self {
+        let path_base = project_dir.clone().unwrap_or_else(|| cfg.cwd.clone());
+        let registry = Arc::new(Registry::new(cfg.max_concurrent));
         Self {
             cfg,
             launcher,
+            project_dir,
             path_base,
             shutting_down: AtomicBool::new(false),
             start_lock: Mutex::new(()),
             child: Mutex::new(None),
             usage: Arc::default(),
+            registry,
+            interrupt_wait: turn::INTERRUPT_WAIT,
         }
     }
 
@@ -177,8 +201,9 @@ impl App {
             {
                 return Ok(child);
             }
-            // Dead, stale, or left over from a start that did not finish: replace it.
-            self.retire(&child);
+            // Dead, stale, or left over from a start that did not finish: replace it. A stale one
+            // may still be running other calls' turns, which keep it until they finish.
+            self.retire_when_idle(child);
         }
 
         let bin = self
@@ -216,6 +241,8 @@ impl App {
         server.set_notification_handler(notification_handler(
             Arc::clone(&self.usage),
             Arc::clone(&stale),
+            Arc::clone(&self.registry),
+            server.detached_sender(),
         ));
         let child = Arc::new(CodexChild {
             server,
@@ -313,18 +340,126 @@ impl App {
 
     /// Close `child`, removing it from the slot if it is still the current one.
     fn retire(&self, child: &Arc<CodexChild>) {
-        {
-            let mut slot = lock(&self.child);
-            if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, child)) {
-                *slot = None;
-            }
-        }
+        self.take_out_of_use(child);
         child.server.shutdown(RETIRE_GRACE);
     }
 
-    /// generate and refine: validate, bring up Codex, then stop short of generating (M2).
-    fn image_call(&self, spec: &ToolSpec, args: &Value, ctx: &CallContext) -> Value {
-        let request = match validate(spec, args, &self.path_base) {
+    /// Take `child` out of use, and close it once no call holds it any more: at once when this is
+    /// the last reference, and otherwise when the last call running a turn on it lets go, since
+    /// dropping it drops its job, which kills its tree (docs/design.md, "When a turn fails with
+    /// `AUTH_EXPIRED`"). Out of the slot, nothing new can pick it up, so a count of one cannot grow.
+    fn retire_when_idle(&self, child: Arc<CodexChild>) {
+        self.take_out_of_use(&child);
+        if Arc::strong_count(&child) == 1 {
+            child.server.shutdown(RETIRE_GRACE);
+        }
+    }
+
+    fn take_out_of_use(&self, child: &Arc<CodexChild>) {
+        let mut slot = lock(&self.child);
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, child)) {
+            *slot = None;
+        }
+    }
+
+    /// generate, in the order of docs/design.md's "Request flow": validate and pre-check (nothing
+    /// spent on any failure), claim the session, bring Codex up, then run the turn.
+    fn generate(&self, args: &Value, ctx: &CallContext) -> Value {
+        let started = Instant::now();
+        let request = match validate(&GENERATE_SPEC, args, &self.path_base) {
+            Ok(request) => request,
+            Err(failure) => return mcp::failure_result(&failure),
+        };
+        let dir = output::resolve_dir(
+            request.output_dir.as_deref(),
+            self.cfg.output_dir.as_deref(),
+            self.project_dir.as_deref(),
+            &self.cfg.cwd,
+            &self.cfg.state_dir,
+        );
+        if let Err(failure) = output::precheck(&dir) {
+            return mcp::failure_result(&failure);
+        }
+        let budget = Budget::starting_now(self.cfg.timeout);
+        let slot = match self.claim_session(request.session.as_deref()) {
+            Ok(slot) => slot,
+            // As in ensure_child: a missing CLI is reported as CLI_NOT_FOUND even for a call that
+            // arrives as the server shuts down, because locating it is local and harmless, and it
+            // is the failure the user can act on (the CI contract check depends on it).
+            Err(failure) if failure.code == "SERVER_SHUTTING_DOWN" => {
+                let missing = self.launcher.resolve(&self.cfg).err();
+                return mcp::failure_result(&missing.unwrap_or(failure));
+            }
+            Err(failure) => return mcp::failure_result(&failure),
+        };
+        let progress = ctx.progress();
+        let child = match self.ensure_child(Some(ctx.cancel()), Some(&progress), Some(budget)) {
+            Ok(child) => child,
+            Err(start) => return mcp::failure_result(&start.failure),
+        };
+        let session = slot.session().to_string();
+        let ready = child.ready.get().expect("a returned child is ready");
+        let weak = Arc::downgrade(&child);
+        let liveness: Liveness =
+            Arc::new(move || weak.upgrade().is_some_and(|c| c.server.is_alive()));
+        let usage = || self.usage_summary();
+        let finished = turn::generate(
+            &turn::Call {
+                cfg: &self.cfg,
+                server: &child.server,
+                liveness,
+                codex_version: ready.handshake.codex_version.as_deref(),
+                cancel: ctx.cancel(),
+                progress: &progress,
+                budget,
+                started,
+                interrupt_wait: self.interrupt_wait,
+                usage: &usage,
+            },
+            slot,
+            &turn::Request {
+                session: &session,
+                prompt: &request.text,
+                reference_images: &request.reference_images,
+                output_dir: &dir.path,
+            },
+        );
+        if finished.auth_expired {
+            // The login this child was admitted with no longer holds. Calls still running on it
+            // keep it until they finish; the next call starts a fresh child, which re-reads
+            // auth.json (docs/design.md, "When a turn fails with `AUTH_EXPIRED`").
+            eprintln!(
+                "codex-imagegen: Codex reported the login as unauthorized; the next call starts a \
+                 fresh Codex"
+            );
+            child.stale.store(true, Ordering::SeqCst);
+            self.retire_when_idle(child);
+        }
+        match finished.result {
+            Ok(result) => result,
+            Err(failure) => mcp::failure_result(&self.during_shutdown(failure)),
+        }
+    }
+
+    /// Claim the call's session in the registry: the name given, or a fresh automatic one, drawn
+    /// again if it happens to be busy.
+    fn claim_session(&self, session: Option<&str>) -> Result<TurnSlot<Event>, Failure> {
+        if let Some(name) = session {
+            return self.registry.try_start(name);
+        }
+        let mut last = None;
+        for _ in 0..AUTO_NAME_TRIES {
+            match self.registry.try_start(&output::auto_session_name()) {
+                Err(failure) if failure.code == "SESSION_BUSY" => last = Some(failure),
+                claimed => return claimed,
+            }
+        }
+        Err(last.unwrap_or_else(|| errors::internal_error("no session name could be claimed")))
+    }
+
+    /// refine: validate and bring Codex up, then stop: sessions arrive in milestone M3.
+    fn refine(&self, args: &Value, ctx: &CallContext) -> Value {
+        let request = match validate(&REFINE_SPEC, args, &self.path_base) {
             Ok(request) => request,
             Err(failure) => return mcp::failure_result(&failure),
         };
@@ -334,13 +469,29 @@ impl App {
             Err(start) => mcp::failure_result(&start.failure),
             Ok(_) => {
                 eprintln!(
-                    "codex-imagegen: {} passed validation ({} reference image(s)) and Codex is \
-                     ready, but this build cannot generate images yet",
-                    spec.name,
+                    "codex-imagegen: {REFINE} passed validation ({} reference image(s)) and Codex \
+                     is ready, but this build cannot refine sessions yet",
                     request.reference_images.len()
                 );
-                mcp::failure_result(&errors::not_implemented_yet())
+                mcp::failure_result(&errors::refine_not_implemented_yet())
             }
+        }
+    }
+
+    /// The usage part of a result's timing line: the Codex agent bucket, plus the image quota
+    /// when Codex has reported one (docs/design.md, "Usage display").
+    fn usage_summary(&self) -> String {
+        let cache = lock(&self.usage);
+        match &cache.usage {
+            Some(usage) => {
+                let lines = usage.lines();
+                if usage.buckets.contains_key("image_gen") {
+                    lines.join("; ")
+                } else {
+                    lines[0].clone()
+                }
+            }
+            None => "Codex agent usage: not reported".to_string(),
         }
     }
 
@@ -442,7 +593,10 @@ impl App {
         for usage_line in usage {
             line(format!("usage: {usage_line}"));
         }
-        line("running turns: none".to_string());
+        line(format!(
+            "running turns: {}",
+            running_text(&self.registry.running())
+        ));
         line("sessions: not implemented yet (milestone M3)".to_string());
         line(format!(
             "settings: --timeout-seconds {}, --max-concurrent {}, --session-ttl-days {}",
@@ -662,8 +816,8 @@ impl ToolHost for App {
 
     fn call_tool(&self, name: &str, args: &Value, ctx: &CallContext) -> Value {
         match name {
-            GENERATE => self.image_call(&GENERATE_SPEC, args, ctx),
-            REFINE => self.image_call(&REFINE_SPEC, args, ctx),
+            GENERATE => self.generate(args, ctx),
+            REFINE => self.refine(args, ctx),
             STATUS => self.status(args, ctx),
             other => mcp::failure_result(&errors::bad_request(format!(
                 "Unknown tool '{}'. codex-imagegen offers {GENERATE}, {REFINE} and {STATUS}.",
@@ -676,18 +830,29 @@ impl ToolHost for App {
         // The flag first, then the slot: a start in progress either sees the flag or has already
         // published its child for this to take.
         self.shutting_down.store(true, Ordering::SeqCst);
+        // Every running turn is interrupted: the ones whose id is known now, the others as soon as
+        // it turns up. Queued before the child's input ends, so they are written first
+        // (docs/design.md, "Lifecycle").
+        let interrupts = self.registry.begin_shutdown();
         let child = lock(&self.child).take();
         if let Some(child) = child {
+            let sender = child.server.detached_sender();
+            for interrupt in &interrupts {
+                turn::send_interrupt(&sender, interrupt);
+            }
             child.server.shutdown(SHUTDOWN_GRACE);
         }
     }
 }
 
-/// What the child's notifications change here: usage updates are merged into the cache, and an
-/// account that stops being a ChatGPT login marks the child stale.
+/// The child's one notification handler. Usage updates are merged into the cache, an account that
+/// stops being a ChatGPT login marks the child stale, and everything about a turn is routed to the
+/// call running it (`turn.rs`). Runs on the reader thread, so nothing here waits.
 fn notification_handler(
     usage: Arc<Mutex<UsageCache>>,
     stale: Arc<AtomicBool>,
+    registry: Arc<Registry<Event>>,
+    sender: DetachedSender,
 ) -> Arc<NotificationHandler> {
     Arc::new(move |method: &str, params: &RawValue| match method {
         "account/rateLimits/updated" => {
@@ -718,8 +883,27 @@ fn notification_handler(
                 stale.store(true, Ordering::SeqCst);
             }
         }
-        _ => {}
+        _ => turn::route_notification(&registry, &sender, method, params),
     })
+}
+
+/// The running turns, for `status`.
+fn running_text(running: &[crate::registry::RunningTurn]) -> String {
+    if running.is_empty() {
+        return "none".to_string();
+    }
+    running
+        .iter()
+        .map(|t| {
+            let state = if t.interrupted {
+                "interrupted; waiting for Codex to confirm it stopped".to_string()
+            } else {
+                t.phase.clone()
+            };
+            format!("{} ({state}, {} s)", t.session, t.elapsed.as_secs())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `Err` with the failure to report when the call has been cancelled or has used up its budget.
@@ -838,8 +1022,6 @@ const REFINE_SPEC: ToolSpec = ToolSpec {
 };
 
 /// A validated generate or refine call.
-// Most fields are read only by generation (M2) and sessions (M3), which do not exist yet.
-#[allow(dead_code)]
 #[derive(Debug)]
 struct ImageRequest {
     text: String,
@@ -1035,19 +1217,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The tool layer over scripted fake children, for the tests here and the turn tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
     use crate::codex::testing::FakeCodex;
     use crate::config::Env;
+    use crate::registry::RunningTurn;
     use crate::testutil::{temp_dir, TempDir};
     use std::ffi::OsString;
     use std::sync::atomic::AtomicUsize;
 
     /// Hands out scripted fake children and counts them.
-    struct FakeLauncher {
-        codex: FakeCodex,
-        spawns: Arc<AtomicUsize>,
+    pub struct FakeLauncher {
+        pub codex: FakeCodex,
+        pub spawns: Arc<AtomicUsize>,
     }
 
     impl Launcher for FakeLauncher {
@@ -1061,7 +1245,7 @@ mod tests {
         }
     }
 
-    fn cfg(dir: &Path, extra: &[&str]) -> Config {
+    pub fn cfg(dir: &Path, extra: &[&str]) -> Config {
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         Config::parse(
             &args,
@@ -1074,30 +1258,73 @@ mod tests {
         .unwrap()
     }
 
-    struct Fixture {
-        app: App,
-        spawns: Arc<AtomicUsize>,
-        dir: TempDir,
+    pub struct Fixture {
+        pub app: App,
+        pub spawns: Arc<AtomicUsize>,
+        /// Also the project directory, so images go to `generated-images` under it by default.
+        pub dir: TempDir,
     }
 
-    fn fixture(codex: FakeCodex) -> Fixture {
+    impl Fixture {
+        pub fn running(&self) -> Vec<RunningTurn> {
+            self.app.registry.running()
+        }
+
+        pub fn has_child(&self) -> bool {
+            lock(&self.app.child).is_some()
+        }
+    }
+
+    pub fn fixture(codex: FakeCodex) -> Fixture {
+        fixture_with(codex, &[], |_, _| {})
+    }
+
+    /// A fixture with extra flags, and a chance to set what flags cannot: a budget under the
+    /// 30-second minimum, and the interrupt wait.
+    pub fn fixture_with(
+        codex: FakeCodex,
+        flags: &[&str],
+        tweak: impl FnOnce(&mut Config, &mut Duration),
+    ) -> Fixture {
         let dir = temp_dir("tools");
+        let mut cfg = cfg(&dir, flags);
+        let mut interrupt_wait = turn::INTERRUPT_WAIT;
+        tweak(&mut cfg, &mut interrupt_wait);
         let spawns = Arc::new(AtomicUsize::new(0));
         let launcher = FakeLauncher {
             codex,
             spawns: Arc::clone(&spawns),
         };
-        let app = App::with_launcher(cfg(&dir, &[]), Box::new(launcher), dir.to_path_buf());
+        let mut app = App::with_launcher(cfg, Box::new(launcher), Some(dir.to_path_buf()));
+        app.interrupt_wait = interrupt_wait;
         Fixture { app, spawns, dir }
     }
 
-    fn call(app: &App, tool: &str, args: Value) -> (bool, String) {
+    /// Whether the result is an error, and its text: the last content block, which is the only
+    /// one for everything but a success with images.
+    pub fn call(app: &App, tool: &str, args: Value) -> (bool, String) {
         let result = app.call_tool(tool, &args, &CallContext::detached());
+        result_text(&result)
+    }
+
+    pub fn result_text(result: &Value) -> (bool, String) {
+        let content = result["content"].as_array().expect("a content list");
         (
             result["isError"].as_bool().unwrap(),
-            result["content"][0]["text"].as_str().unwrap().to_string(),
+            content.last().unwrap()["text"]
+                .as_str()
+                .expect("a text block last")
+                .to_string(),
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::codex::testing::FakeCodex;
+    use crate::testutil::temp_dir;
 
     fn rejected(app: &App, tool: &str, args: Value) -> String {
         let (is_error, text) = call(app, tool, args);
@@ -1332,26 +1559,35 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_generate_brings_codex_up_then_says_generation_is_not_built_yet() {
+    fn a_valid_refine_brings_codex_up_then_says_sessions_are_not_built_yet() {
         let f = fixture(FakeCodex::default());
-        let (is_error, text) = call(&f.app, GENERATE, json!({"prompt": "a red fox"}));
+        let (is_error, text) = call(&f.app, REFINE, json!({"session": "s", "feedback": "bluer"}));
         assert!(is_error);
         assert!(
             text.starts_with("IMAGE GENERATION FAILED\ncode: INTERNAL_ERROR"),
             "{text}"
         );
-        assert!(text.contains("milestone M2"), "{text}");
+        assert!(text.contains("milestone M3"), "{text}");
         assert!(text.contains("ACTION REQUIRED"));
         // The child is kept for the next call.
         let (_, again) = call(&f.app, REFINE, json!({"session": "s", "feedback": "bluer"}));
-        assert!(again.contains("milestone M2"));
+        assert!(again.contains("milestone M3"));
         assert_eq!(f.spawns.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn a_missing_codex_bin_is_cli_not_found_with_the_stop_block() {
         let dir = temp_dir("tools");
-        let app = App::new(cfg(&dir, &["--codex-bin", r"C:\nope\codex.exe"]));
+        // The real launcher, with the project directory given rather than read from
+        // CLAUDE_PROJECT_DIR, so the output pre-check stays inside the test's folder.
+        let real = || {
+            App::with_launcher(
+                cfg(&dir, &["--codex-bin", r"C:\nope\codex.exe"]),
+                Box::new(CodexLauncher),
+                Some(dir.to_path_buf()),
+            )
+        };
+        let app = real();
         let (is_error, text) = call(&app, GENERATE, json!({"prompt": "x"}));
         assert!(is_error);
         assert!(
@@ -1360,6 +1596,17 @@ mod tests {
         );
         assert!(text.contains("=== ACTION REQUIRED ==="));
         assert!(text.contains(r"C:\nope\codex.exe"));
+
+        // Also once shutdown has begun, as when a client pipes its requests and closes stdin at
+        // once (the CI contract check does exactly that).
+        let closing = real();
+        closing.begin_shutdown();
+        let (is_error, text) = call(&closing, GENERATE, json!({"prompt": "x"}));
+        assert!(is_error);
+        assert!(
+            text.starts_with("IMAGE GENERATION FAILED\ncode: CLI_NOT_FOUND"),
+            "{text}"
+        );
 
         // status reports the same failure without being an error itself.
         let (is_error, report) = call(&app, STATUS, json!({}));
@@ -1634,11 +1881,27 @@ mod tests {
         assert_eq!(f.spawns.load(Ordering::SeqCst), 1);
     }
 
+    /// A notification handler as a child gets one, with a registry and a sender of its own. The
+    /// server is returned because the sender only holds it weakly.
+    fn test_handler(
+        usage: &Arc<Mutex<UsageCache>>,
+        stale: &Arc<AtomicBool>,
+    ) -> (Arc<NotificationHandler>, AppServer) {
+        let server = crate::appserver::fake::connect(|_, _| crate::appserver::fake::Flow::Continue);
+        let handler = notification_handler(
+            Arc::clone(usage),
+            Arc::clone(stale),
+            Arc::new(Registry::new(4)),
+            server.detached_sender(),
+        );
+        (handler, server)
+    }
+
     #[test]
     fn a_usage_read_keeps_an_image_quota_learned_from_an_update() {
         let f = fixture(FakeCodex::default());
         call(&f.app, STATUS, json!({}));
-        let handler = notification_handler(Arc::clone(&f.app.usage), Arc::default());
+        let (handler, _server) = test_handler(&f.app.usage, &Arc::default());
         handler(
             "account/rateLimits/updated",
             &RawValue::from_string(
@@ -1710,7 +1973,7 @@ mod tests {
     fn notifications_merge_usage_and_mark_a_non_chatgpt_login_stale() {
         let usage: Arc<Mutex<UsageCache>> = Arc::default();
         let stale = Arc::new(AtomicBool::new(false));
-        let handler = notification_handler(Arc::clone(&usage), Arc::clone(&stale));
+        let (handler, _server) = test_handler(&usage, &stale);
         let raw = |text: &str| RawValue::from_string(text.to_string()).unwrap();
 
         handler(

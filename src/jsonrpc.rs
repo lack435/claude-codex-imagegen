@@ -85,20 +85,23 @@ pub fn strip_bom(line: &str) -> &str {
 /// that are the usual way to make a log line lie. std has no `is_format` and a unicode-tables
 /// dependency is not worth it here, so those blocks are named outright.
 pub fn clamp(text: &str, max: usize) -> String {
-    let mut kept = text.chars().filter(|c| {
-        !c.is_control()
-            && !matches!(c,
-                '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{feff}')
-    });
+    let mut kept = text.chars().filter(|c| !c.is_control() && !hides_text(*c));
     let mut out: String = kept.by_ref().take(max).collect();
     // Marked, so a clipped value is never mistaken for a complete one.
     if kept.next().is_some() {
         out.push('…');
     }
     out
+}
+
+/// The zero-width and bidi-control characters, which can make text render as other than what it
+/// says (see [`clamp`]).
+pub fn hides_text(c: char) -> bool {
+    matches!(c,
+        '\u{200b}'..='\u{200f}'
+        | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{feff}')
 }
 
 /// One read from a [`LineReader`].

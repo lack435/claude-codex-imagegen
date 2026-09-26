@@ -54,8 +54,6 @@ impl RequestCancel {
     /// Install and check happen under one lock. Doing them separately would lose a cancellation
     /// that lands in the gap: it would find no hook to run, and the caller would see a stale "not
     /// cancelled" and carry on generating for nobody.
-    // No caller until a turn exists to interrupt (milestone M2); the tests exercise it now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_hook(&self, hook: CancelHook) -> bool {
         let mut state = self.lock();
         if state.cancelled {
@@ -66,7 +64,6 @@ impl RequestCancel {
     }
 
     /// Remove the hook, for when the work it would stop has finished on its own.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear_hook(&self) {
         let hook = self.lock().hook.take();
         // Dropped outside the lock, in case dropping its captures does anything slow.

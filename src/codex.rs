@@ -1,9 +1,11 @@
 //! What codex-imagegen knows about the Codex CLI: where to find it, the exact line it is started
-//! with, the handshake, the free preflight calls, and the usage snapshot.
+//! with, the handshake, the free preflight calls, the usage snapshot, and the parameters of the
+//! threads and turns it asks for.
 //!
-//! Every call here is free: `initialize`, `account/read`, `modelProvider/capabilities/read`,
-//! `model/list`, `config/read` and `account/rateLimits/read` spend no quota [verified]. Nothing
-//! in this module starts a turn.
+//! Every call made here is free: `initialize`, `account/read`, `modelProvider/capabilities/read`,
+//! `model/list`, `config/read` and `account/rateLimits/read` spend no quota [verified]. This module
+//! builds `thread/start` and `turn/start` parameters but sends neither; running a turn, the only
+//! thing that spends quota, is `turn.rs`.
 //!
 //! The spawn switches and the preflight checks are a security boundary (AGENTS.md): they are
 //! what keeps the child's posture, and its billing, where the design puts them. Change them only
@@ -647,6 +649,68 @@ pub fn overridden_switch(config: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Threads and turns
+// ---------------------------------------------------------------------------
+
+/// The developer instructions every image thread gets, verbatim from docs/design.md
+/// ("developerInstructions"); a test holds the two to the same text.
+pub const DEVELOPER_INSTRUCTIONS: &str = "You are a headless image-generation backend driven by a \
+program, not a person. For each user message, call the image generation tool exactly once. Calling \
+it through `exec` is expected; inside `exec`, call only the image generation tool. Use the text \
+inside `<image_prompt>` or `<edit_request>` as the tool's `prompt`, character for character: do not \
+rewrite, expand, translate or summarise it. Set `referenced_image_paths` to the `<edit_target>` \
+path, if present, followed by every `<reference_images>` path in order. Omit it when there are \
+none, and never use `num_last_images_to_include`. If the tool returns an error, do not call it \
+again; reply with the error text. Do not call shell or file tools, do not create, copy or move \
+files, and do not ask questions. After the tool returns, reply with one short line describing the \
+result.";
+
+/// `thread/start`, exactly as docs/design.md "Thread and turn parameters" lists it. `config` is the
+/// MCP-off map built from a `config/read` made just before (see [`mcp_off_map`]).
+///
+/// The sandbox and approval policy are part of the child's posture, a security boundary
+/// (AGENTS.md): read-only, never ask.
+pub fn thread_start_params(cfg: &Config, mcp_off: &Value) -> Value {
+    json!({
+        "model": cfg.model,
+        "cwd": cfg.work_dir,
+        "sandbox": "read-only",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "developerInstructions": DEVELOPER_INSTRUCTIONS,
+        "config": mcp_off,
+        "ephemeral": false,
+    })
+}
+
+/// The text a generate turn sends: the prompt inside `<image_prompt>`, so it stays apart from
+/// anything else, and the reference images, absolute, one per line (docs/design.md, "Input text
+/// sent to Codex").
+pub fn generate_input_text(prompt: &str, reference_images: &[PathBuf]) -> String {
+    let mut text = format!("<image_prompt>\n{prompt}\n</image_prompt>");
+    if !reference_images.is_empty() {
+        text.push_str("\n<reference_images>");
+        for path in reference_images {
+            text.push('\n');
+            text.push_str(&path.display().to_string());
+        }
+        text.push_str("\n</reference_images>");
+    }
+    text
+}
+
+/// `turn/start`: one text input, and the agent model and effort. The agent only relays the prompt,
+/// so the effort is low by default [decided].
+pub fn turn_start_params(cfg: &Config, thread_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": text, "text_elements": []}],
+        "model": cfg.model,
+        "effort": cfg.effort,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 
@@ -860,6 +924,126 @@ pub(crate) mod testing {
     use crate::appserver::fake::{self, Flow};
     use std::sync::{Arc, Mutex};
 
+    /// The thread and turn ids every fake thread and turn gets.
+    pub const THREAD_ID: &str = "019a0000-0000-7000-8000-00000000cafe";
+    pub const TURN_ID: &str = "019a0000-0000-7000-8000-00000000beef";
+
+    /// One step of a scripted turn, run in order on a thread of its own once `turn/start` has
+    /// arrived, so the fake keeps answering `turn/interrupt` and `thread/unsubscribe` meanwhile.
+    #[derive(Clone)]
+    pub enum Step {
+        Send(Value),
+        Sleep(Duration),
+        /// Answer the `turn/start` request now (with [`TurnScript::answer_turn_start`] false).
+        AnswerTurnStart,
+        /// Run arbitrary test code, such as deleting the output folder mid-turn.
+        Run(Arc<dyn Fn() + Send + Sync>),
+        /// Close the output, as a child that dies does.
+        Exit,
+    }
+
+    /// What the fake does with a turn.
+    #[derive(Clone)]
+    pub struct TurnScript {
+        /// Sent right after the `thread/start` reply, as Codex sends `thread/started` and MCP
+        /// startup statuses there.
+        pub on_thread_start: Vec<Value>,
+        /// The error `thread/start` answers with, for as many calls as there are entries.
+        pub thread_start_errors: Vec<Value>,
+        /// Whether `turn/start` is answered at once. If not, a step answers it, or nothing does.
+        pub answer_turn_start: bool,
+        /// The error `turn/start` answers with instead of a turn.
+        pub turn_start_error: Option<Value>,
+        pub steps: Vec<Step>,
+        /// Sent after `turn/interrupt` is answered. Empty: the interrupt is acknowledged, and the
+        /// turn never completes.
+        pub on_interrupt: Vec<Value>,
+    }
+
+    impl Default for TurnScript {
+        fn default() -> Self {
+            Self {
+                on_thread_start: vec![json!({"method": "thread/started",
+                    "params": {"thread": {"id": THREAD_ID}}})],
+                thread_start_errors: Vec::new(),
+                answer_turn_start: true,
+                turn_start_error: None,
+                steps: Vec::new(),
+                on_interrupt: vec![turn_completed("interrupted", Value::Null)],
+            }
+        }
+    }
+
+    pub fn notification(method: &str, mut params: Value) -> Value {
+        if params.get("threadId").is_none() {
+            params["threadId"] = json!(THREAD_ID);
+        }
+        json!({"method": method, "params": params})
+    }
+
+    pub fn turn_started() -> Value {
+        notification(
+            "turn/started",
+            json!({"turn": {"id": TURN_ID, "items": [], "status": "inProgress", "error": null}}),
+        )
+    }
+
+    pub fn image_started(item_id: &str) -> Value {
+        notification(
+            "item/started",
+            json!({"turnId": TURN_ID, "item": {"type": "imageGeneration", "id": item_id,
+                   "status": "in_progress", "revisedPrompt": null, "result": "",
+                   "transparentBackground": null, "failure": null}}),
+        )
+    }
+
+    /// A completed image item, shaped as codex-cli 0.156.0 sends it [verified: smoke log].
+    /// `saved_path` `None` leaves the field out, as the schema allows.
+    pub fn image_completed(
+        item_id: &str,
+        revised_prompt: &str,
+        result_base64: &str,
+        saved_path: Option<&Path>,
+    ) -> Value {
+        let mut item = json!({"type": "imageGeneration", "id": item_id, "status": "completed",
+                              "revisedPrompt": revised_prompt, "result": result_base64,
+                              "transparentBackground": false, "failure": null});
+        if let Some(path) = saved_path {
+            item["savedPath"] = json!(path);
+        }
+        notification("item/completed", json!({"turnId": TURN_ID, "item": item}))
+    }
+
+    pub fn image_failed(item_id: &str, failure: Value) -> Value {
+        notification(
+            "item/completed",
+            json!({"turnId": TURN_ID, "item": {"type": "imageGeneration", "id": item_id,
+                   "status": "failed", "revisedPrompt": "x", "result": "",
+                   "transparentBackground": null, "failure": failure}}),
+        )
+    }
+
+    pub fn agent_message(text: &str) -> Value {
+        notification(
+            "item/completed",
+            json!({"turnId": TURN_ID, "item": {"type": "agentMessage", "id": "msg_1",
+                   "text": text, "phase": "final_answer", "memoryCitation": null}}),
+        )
+    }
+
+    pub fn turn_completed(status: &str, error: Value) -> Value {
+        notification(
+            "turn/completed",
+            json!({"turn": {"id": TURN_ID, "items": [], "status": status, "error": error}}),
+        )
+    }
+
+    /// A `TurnError` with the given `codexErrorInfo`.
+    pub fn turn_error(info: Value) -> Value {
+        json!({"message": "the turn failed upstream", "codexErrorInfo": info,
+               "additionalDetails": null})
+    }
+
     #[derive(Clone)]
     pub struct FakeCodex {
         pub user_agent: String,
@@ -873,6 +1057,7 @@ pub(crate) mod testing {
         /// A method the fake dies on: it closes its output instead of answering, as a child
         /// that exits while handling the request does.
         pub exits_on: Option<&'static str>,
+        pub turn: TurnScript,
         /// Every message the client sent, in order.
         pub seen: Arc<Mutex<Vec<Value>>>,
     }
@@ -933,6 +1118,7 @@ pub(crate) mod testing {
                         "secondary": null}}
                 })),
                 exits_on: None,
+                turn: TurnScript::default(),
                 seen: Arc::default(),
             }
         }
@@ -973,6 +1159,7 @@ pub(crate) mod testing {
         }
 
         pub fn connect(self) -> AppServer {
+            let mut thread_start_errors = self.turn.thread_start_errors.clone().into_iter();
             fake::connect(move |message, out| {
                 self.seen.lock().unwrap().push(message.clone());
                 if self
@@ -981,11 +1168,76 @@ pub(crate) mod testing {
                 {
                     return Flow::Exit;
                 }
-                if let Some(reply) = self.answer(message) {
-                    out.send(reply);
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                match message["method"].as_str().unwrap_or("") {
+                    "thread/start" => {
+                        if let Some(error) = thread_start_errors.next() {
+                            out.send(json!({"id": id, "error": error}));
+                            return Flow::Continue;
+                        }
+                        out.send(json!({"id": id, "result": {
+                            "thread": {"id": THREAD_ID, "ephemeral": false, "turns": []},
+                            "model": message["params"]["model"], "cwd": message["params"]["cwd"],
+                            "approvalPolicy": "never", "approvalsReviewer": "user",
+                            "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}}));
+                        for note in &self.turn.on_thread_start {
+                            out.send(note.clone());
+                        }
+                    }
+                    "turn/start" => {
+                        if let Some(error) = &self.turn.turn_start_error {
+                            out.send(json!({"id": id, "error": error}));
+                            return Flow::Continue;
+                        }
+                        let reply = json!({"id": id, "result": {"turn": {"id": TURN_ID,
+                            "items": [], "status": "inProgress", "error": null}}});
+                        if self.turn.answer_turn_start {
+                            out.send(reply.clone());
+                        }
+                        let steps = self.turn.steps.clone();
+                        let out = out.clone();
+                        std::thread::spawn(move || {
+                            for step in steps {
+                                match step {
+                                    Step::Send(message) => out.send(message),
+                                    Step::Sleep(pause) => std::thread::sleep(pause),
+                                    Step::AnswerTurnStart => out.send(reply.clone()),
+                                    Step::Run(f) => f(),
+                                    Step::Exit => {
+                                        out.close();
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    "turn/interrupt" => {
+                        out.send(json!({"id": id, "result": {}}));
+                        for note in &self.turn.on_interrupt {
+                            out.send(note.clone());
+                        }
+                    }
+                    "thread/unsubscribe" => {
+                        out.send(json!({"id": id, "result": {"status": "unsubscribed"}}));
+                    }
+                    _ => {
+                        if let Some(reply) = self.answer(message) {
+                            out.send(reply);
+                        }
+                    }
                 }
                 Flow::Continue
             })
+        }
+
+        /// The requests the client sent with `method`, params only, in order.
+        pub fn sent(seen: &Mutex<Vec<Value>>, method: &str) -> Vec<Value> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m["method"] == method)
+                .map(|m| m["params"].clone())
+                .collect()
         }
     }
 }
@@ -1459,6 +1711,66 @@ mod tests {
         assert_eq!(
             mcp_off_map(&json!({"mcp_servers": null})),
             json!({"mcp_servers": {}})
+        );
+    }
+
+    #[test]
+    fn the_developer_instructions_are_the_designs_word_for_word() {
+        let design = include_str!("../docs/design.md");
+        let section = &design[design
+            .find("### developerInstructions")
+            .expect("the design has a developerInstructions section")..];
+        let quoted: Vec<&str> = section
+            .lines()
+            .skip_while(|l| !l.starts_with('>'))
+            .take_while(|l| l.starts_with('>'))
+            .map(|l| l.trim_start_matches('>').trim())
+            .collect();
+        assert_eq!(quoted.join(" "), DEVELOPER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn thread_and_turn_parameters_are_exactly_the_designs() {
+        let cfg = cfg(&[]);
+        let map = json!({"mcp_servers": {"x": {"enabled": false}}});
+        assert_eq!(
+            thread_start_params(&cfg, &map),
+            json!({
+                "model": "gpt-6-astra",
+                "cwd": r"C:\definitely-not-here\state\work",
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                "config": {"mcp_servers": {"x": {"enabled": false}}},
+                "ephemeral": false,
+            })
+        );
+        assert_eq!(
+            turn_start_params(&cfg, "t-1", "hello"),
+            json!({"threadId": "t-1",
+                   "input": [{"type": "text", "text": "hello", "text_elements": []}],
+                   "model": "gpt-6-astra", "effort": "low"})
+        );
+        let medium = super::Config {
+            effort: "medium".to_string(),
+            ..cfg
+        };
+        assert_eq!(turn_start_params(&medium, "t", "x")["effort"], "medium");
+    }
+
+    #[test]
+    fn the_input_text_tags_the_prompt_and_lists_references_only_when_given() {
+        let prompt = "a \"fox\"\nwith a \\ and ü";
+        assert_eq!(
+            generate_input_text(prompt, &[]),
+            format!("<image_prompt>\n{prompt}\n</image_prompt>")
+        );
+        let refs = [PathBuf::from(r"C:\a.png"), PathBuf::from(r"D:\b c\d.jpg")];
+        assert_eq!(
+            generate_input_text("p", &refs),
+            "<image_prompt>\np\n</image_prompt>\n<reference_images>\nC:\\a.png\nD:\\b c\\d.jpg\n\
+             </reference_images>"
         );
     }
 
