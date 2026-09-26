@@ -78,6 +78,41 @@ impl Drop for TempDir {
     }
 }
 
+/// Make `link` a junction (a directory mount point, a reparse point) to the folder `target`, as
+/// `mklink /J` does. Unlike a symbolic link, a junction needs no privilege or Developer Mode, so
+/// every test run can make one. Removing the test's directory removes the junction, never what it
+/// points at.
+pub fn make_junction(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("cmd")
+        .raw_arg(format!(
+            "/D /C mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ))
+        .output()
+        .expect("run mklink");
+    assert!(
+        output.status.success(),
+        "mklink /J {} {}: {}{}",
+        link.display(),
+        target.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Set the read-only attribute on the file or folder at `path`, as a user protecting it would.
+/// Removing the test's directory still removes it: the standard library's `remove_dir_all` deletes
+/// read-only entries.
+pub fn set_read_only(path: &Path) {
+    let mut permissions = std::fs::metadata(path)
+        .expect("read metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions).expect("set read-only");
+}
+
 /// Collects what a code path writes, standing in for our stdout.
 #[derive(Clone, Default)]
 pub struct Recorder(Arc<Mutex<Vec<u8>>>);

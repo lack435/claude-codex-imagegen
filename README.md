@@ -8,8 +8,9 @@ An MCP server that lets Claude Code generate images through your local Codex CLI
 
 Windows only. It ships as a single self-contained executable.
 
-**Status: in development.** Generating a new image works; continuing a session to refine it arrives in
-the next milestone. [`docs/design.md`](docs/design.md) describes what is being built and why.
+**Status: in development.** Generating a new image and refining it in the same session are built; refining
+has been tested only against a scripted Codex so far, not yet against the real one.
+[`docs/design.md`](docs/design.md) describes what is being built and why.
 
 ## Requirements (planned)
 
@@ -27,7 +28,8 @@ This runs the checks and tests, builds the release binary, and stages it at
 `dist\codex-imagegen.exe`.
 
 `.\smoke.ps1` then checks the staged binary against your real Codex CLI. On its own it runs only free
-steps; `.\smoke.ps1 -SpendQuota` also generates about two images, billed to your ChatGPT plan.
+steps; `.\smoke.ps1 -SpendQuota` also generates and refines about three images, billed to your ChatGPT
+plan, and `-Concurrent` adds two more to check two servers generating at once.
 `.\smoke.ps1 -CheckTrace <folder>` re-reads the Codex trace a paid run left behind, and spends nothing.
 
 ## Output files
@@ -37,7 +39,8 @@ project Claude Code has open, unless a call's `output_dir` or the server's `--ou
 folder. Nothing there is ever overwritten.
 
 That folder is scratch space, not a place to keep work: its files expire with their session after
-`--session-ttl-days` idle (7 by default; the expiry itself arrives with sessions in the next milestone).
+`--session-ttl-days` idle (7 by default). The server removes expired sessions of the project it serves
+when it first starts Codex, and `codex-imagegen.exe --cleanup` sweeps every project from a terminal.
 Move or copy the images worth keeping into the project proper,
 and keep the folder out of version control by adding this line to the project's `.gitignore`:
 

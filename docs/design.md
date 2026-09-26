@@ -4,13 +4,26 @@ Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applie
 scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
 and the CI contract check. M2 is implemented: `generate` runs end to end (pre-check, turn, copy and preview on
 each image, progress, cancellation and deadlines, errors), `status` lists running turns, and `smoke.ps1` has its
-first version. M2 has no session store or leases (M3), so `generate` does not yet refuse an existing name with
-`SESSION_EXISTS`, and `refine` still validates its arguments, runs preflight and returns `INTERNAL_ERROR`. Not
-built yet either: recycling the shared child after a missed per-request deadline (see Deadlines). The
-unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
-V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input` tools still offered to
-the agent model. The spawn line now switches those off, and the second paid run passed V1, V2 (generate) and V3
-(34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
+first version. M3 is implemented: the session store, its lock and the per-session leases; `generate` refuses an
+existing name with `SESSION_EXISTS` and records each completed image in its session; `refine` (edit target,
+`thread/resume` with its "is closing", "active writer" and "no rollout found" handling, the M2 turn engine);
+cleanup (automatic expiry, once per server process, and `--cleanup`); `status` lists this project's sessions and
+the last cleanup; and the full `smoke.ps1`, with V9 behind `-Concurrent`. After an independent review of M3,
+cleanup was hardened: each published file records a content fingerprint and its resolved path, every deletion
+goes through the handle its checks were made on (a POSIX delete, so a PNG open in a viewer does not keep Codex's
+folder), an output is deleted only while that handle shows it where it was published, a read-only file is kept
+as the user's protection, a link under the Codex home is never followed, a Codex image folder that cannot be
+removed keeps its session's record so it is retried, and `--cleanup` fails when it cannot search for stores.
+Not built yet: recycling the shared child after a missed per-request deadline (see Deadlines). The unit tests
+use a scripted fake app-server. Beyond them, the paid `smoke.ps1 -SpendQuota -Concurrent` run of 2026-09-26
+(about 5 images) passed 102 of 102 checks: generate, refine with a feedback containing quotes, a backslash, a
+newline and non-ASCII text (verbatim), refine again after killing the server (resume after restart), `status`
+listing the session with 3 turns, V9 (two servers generating at once into one store), V1 and V3 on every image
+call, and `--cleanup --older-than-days 0` removing every record, published file, Codex image folder and
+rollout; that run predates the cleanup hardening above, which unit tests cover. Earlier: the first paid `smoke.ps1` run against real
+Codex (2026-09-25) passed V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input`
+tools still offered to the agent model. The spawn line now switches those off, and the second paid run passed
+V1, V2 (generate) and V3 (34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
 it accurately, both through `claude -p` and in the desktop app, where it appears in the expanded tool row. The
 desktop app shows no progress line; the terminal renderer draws one [verified: bundle]. The TaskStop part of V0 was
 not run.
@@ -220,7 +233,7 @@ Continues a session. It edits the session's latest image and returns the new ver
 | `session` | string, required | Must exist, or `SESSION_NOT_FOUND`. |
 | `feedback` | string, required | Passed to the image tool verbatim as the edit prompt. |
 | `reference_images` | string[], optional | Up to 4 more images, validated like generate's. The first slot is the edit target. |
-| `output_dir` | string, optional | Defaults to the session's recorded output directory. |
+| `output_dir` | string, optional | Defaults to the session's recorded output directory. A folder given here applies to this call only; the record keeps the session's own [decided]. |
 
 ### `codex_imagegen_status`
 
@@ -234,7 +247,9 @@ No arguments and no quota. It reports:
 - whether the pinned model is listed (and whether it is hidden)
 - every usage window (see [Usage display](#usage-display))
 - running turns, with session and elapsed time
-- sessions in this project: name, turns, latest output path, last update
+- sessions in this project, most recently updated first (up to 20): name, turns, latest output path, last
+  update and its age; then the last cleanup (see [Cleanup](#cleanup)), or "not run yet". A store that cannot be
+  read is reported here with the records that still parse, not failed on
 
 Live reads are bounded to about 10 s each. On timeout, the last value is shown with its age.
 
@@ -256,7 +271,8 @@ content: [
      "codex prompt: <revisedPrompt>\n" +
      "codex note: <Codex's closing line, quoted, untrusted>\n" +
      "took 38.1 s; Codex agent usage: weekly 44% (resets 2026-10-01 14:17)\n" +
-     "output files are scratch and expire after 7 days idle; move keepers into the project"}
+     "output files are scratch and expire after 7 days idle; move keepers into the project\n" +
+     "the user may not see this tool result: show them the image, by displaying or sending the file if you have a tool for that, otherwise by giving them its path"}
 ]
 ```
 
@@ -271,6 +287,11 @@ Formatting details [decided]:
 - If Codex makes several images in one turn, each gets its own version and preview, in order; the first line
   reads `versions: 1, 2`, each image line is labelled `image 1 of 2:`, and a warning says so.
 - If the copy failed, the first line reads `version: none published (see the warnings)`.
+
+Every success ends with a line telling the agent to show the user the image, by displaying or sending the file if
+it has a tool for that, otherwise by giving its path, and the `initialize` instructions say the same [decided].
+Many clients fold tool results away: in the Claude desktop app the preview appears only inside the collapsed
+tool row [verified: owner, 2026-09-25], so the preview is often seen by the agent alone.
 
 A result returns success whenever at least one image completed, whatever happened afterwards [decided].
 Anything unusual is added as a `warning:` line:
@@ -288,10 +309,16 @@ Anything unusual is added as a `warning:` line:
 Claude ── tools/call generate|refine
   1. validate: prompt/feedback non-empty, session name, reference image signatures,
      output_dir resolved + created + probe-written              ── any failure: BAD_REQUEST, nothing spent
-  2. registry try_start (busy / concurrency cap / shutdown) and the per-session cross-process lease
-  3. ensure the child: spawn in a kill-on-close job → initialize → preflight (once per child)
+  2. registry try_start (busy / concurrency cap / shutdown), then the per-session cross-process lease
+     (held elsewhere: SESSION_BUSY), then the store read under it (generate: an existing name is
+     SESSION_EXISTS; refine: a missing one is SESSION_NOT_FOUND; a store that cannot be read is
+     STORE_CORRUPT). refine: its output_dir (the argument, else the recorded one) is pre-checked as in
+     step 1, and the edit target picked (see Refine)                                ── nothing spent
+  3. ensure the child: spawn in a kill-on-close job → initialize → preflight (once per child). The
+     first call in a server process that brings one up also starts automatic expiry (see Cleanup).
+     refine: the record's codex_home must be the child's codexHome, else SESSION_NOT_RESUMABLE
   4. config/read → build the MCP-off map for this thread
-  5. generate: thread/start          refine: pick the edit target (see Refine), then thread/resume
+  5. generate: thread/start          refine: thread/resume (with the retries under Refine)
   6. turn/start {threadId, input, model, effort}
          ◀── notifications/progress every ~5 s and on phase changes
      item/started   imageGeneration → phase "generating image"
@@ -302,6 +329,14 @@ Claude ── tools/call generate|refine
   7. thread/unsubscribe {threadId}   (always: completed, failed, interrupted or timed out)
   8. release the lease; return a result built from the completed images, or an error if there were none
 ```
+
+**Unsubscribe.** Step 7 also follows a `thread/resume` that may have subscribed this child without a turn going
+ahead: one cut short by a cancel or the end of the budget, one whose reply cannot be read, and one refused with an
+error not handled under [Refine](#refine). Codex goes on with a request the client has stopped waiting for, and
+runs the requests about one thread in the order they arrive, so the unsubscribe follows the late resume and the
+thread unloads after its delay, releasing its writer lock [verified: source, `request_serialization.rs`,
+`thread_resume_inner`]. A `thread/start` cut short the same way is not unsubscribed: the call never learns its
+thread id, no session records it, and it stays loaded in the child until the child exits [decided: accepted].
 
 **Deadlines.**
 
@@ -319,20 +354,44 @@ Claude ── tools/call generate|refine
 
 ### Refine
 
-1. **Pick the edit target** before any turn: the first of `last_saved_path` and `last_output_path` that exists
-   with the recorded size (they are byte-identical copies). If neither does: `SESSION_NOT_RESUMABLE`, with
-   the remediation "start a new session with `generate(reference_images=[<a surviving copy>])`". Nothing is
-   spent.
-2. **Always call `thread/resume`** with `excludeTurns: true` and the thread parameters, before every
-   `turn/start`. On a thread still loaded in this child, that only re-subscribes. Errors:
-   - "is closing; retry": retry after 250 ms.
+1. **Pick the edit target** before Codex is started: the first of `last_saved_path` and `last_output_path` that
+   exists with the recorded size (they are byte-identical copies, so `last_output_bytes` checks either). When
+   the size was never learned (Codex's file could not be read as the image completed), existing is enough. If
+   neither does: `SESSION_NOT_RESUMABLE`, with the remediation "start a new session with
+   `generate(reference_images=[<a surviving copy>])`", naming the newest published file that still has its
+   recorded size, or saying that none survives. Nothing is spent.
+2. **Check the Codex home.** A record whose `codex_home` is not the child's `codexHome` gets
+   `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare as Windows compares them: case
+   aside, a trailing separator aside, and with or without the `\\?\` prefix Codex puts on a canonicalised
+   `CODEX_HOME` [verified: source, `utils/home-dir`].
+3. **Always call `thread/resume`** with `excludeTurns: true` and the thread parameters, before every
+   `turn/start`, each try after a fresh `config/read` and MCP-off map. Codex counts our `config` and
+   `developerInstructions` as overrides it cannot apply to a loaded thread. So on a thread still loaded in this
+   child with no subscriber, the normal state inside the unload delay after our unsubscribe, it shuts the idle
+   thread down (waiting up to 10 s, out of the resume's budget) and resumes it cold with the fresh parameters;
+   that teardown sends no `thread/closed`. Only when the thread still has a subscriber, or its shutdown fails or
+   times out, does Codex rejoin the loaded thread and ignore the overrides, logging a warning [verified: source,
+   `thread_processor.rs` `collect_resume_override_mismatches`, `resume_running_thread`]. The resume gets
+   whatever remains of the call's budget, and every pause between tries ends at a cancellation or the end of the
+   budget. A resume cut short by a cancel or the end of the budget is followed by `thread/unsubscribe` (see
+   [Unsubscribe](#request-flow)). Errors, by Codex's message:
+   - "is closing; retry": this child is unloading the thread. Retry every 250 ms, within the window below, then
+     `APP_SERVER_FAILED`.
    - "already has an active writer": another process has the thread loaded. It may be another codex-imagegen
-     still inside its unload delay. Retry with backoff for up to `thread_unload_delay_secs + 10` s, with the
-     phase "waiting for the session to be released". Then return `SESSION_OPEN_ELSEWHERE`, agent-correctable:
-     the session is open in another Claude Code window or in the Codex app; close it there, or use a new session.
-   - "no rollout found": `SESSION_NOT_RESUMABLE`.
-   - Any other error: `APP_SERVER_FAILED` with the detail.
-3. **Name the edit target explicitly** in the input. Codex never picks it from memory [decided].
+     still inside its unload delay. Retry with backoff (0.25 s, doubling, at most 2 s) for up to
+     `thread_unload_delay_secs + 10` s (15 s), with the phase "waiting for the session to be released". Then
+     return `SESSION_OPEN_ELSEWHERE`, agent-correctable: the session is open in another Claude Code window or in
+     the Codex app; close it there, or use a new session.
+   - "no rollout found": `SESSION_NOT_RESUMABLE`, naming the edit target as the new session's reference.
+   - A config error naming `mcp_servers`: rebuild the map and retry once, as for `thread/start`.
+   - Any other error: `APP_SERVER_FAILED` with the detail, after `thread/unsubscribe`, because a few of Codex's
+     resume errors come after it has subscribed this child.
+4. **Name the edit target explicitly** in the input. Codex never picks it from memory [decided].
+5. **Run the turn** exactly as generate's: the canary check before `turn/start`, each image published as
+   `<session>-v<next_version>.png` (bumped past a taken name) and recorded at once, the unsubscribe, cancel,
+   deadlines and lingering. `revisedPrompt` is compared with the feedback, and a difference is a warning. A turn
+   that fails with `contextWindowExceeded` or `sessionBudgetExceeded` is `SESSION_NOT_RESUMABLE`, naming the
+   edit target as the new session's reference.
 
 ### Input text sent to Codex
 
@@ -503,7 +562,8 @@ closed, the server keeps a weak reference to it, so shutdown still reaches it an
   - `developerInstructions`
   - `config`: the MCP-off map
   - `ephemeral`: false
-- **`thread/resume`:** the same, plus `threadId` and `excludeTurns: true`.
+- **`thread/resume`:** the same, less `ephemeral` (`ThreadResumeParams` has no such field, and the thread was
+  created persistent), plus `threadId` and `excludeTurns: true`.
 - **`turn/start`:** `threadId`, `input:[{type:"text", text, text_elements:[]}]`, `model`, and `effort: "low"`
   [decided]. The agent model only relays the prompt.
 
@@ -609,18 +669,57 @@ sees the server's tools. A report that comes later interrupts the turn.
   `<state base>\<project-leaf>-<fnv64(lowercased cwd)>\sessions.json`. The state base is
   `%CODEX_IMAGEGEN_HOME%`, or else `%USERPROFILE%\.codex-imagegen` [decided]. It is deliberately not under
   `%LOCALAPPDATA%`, which packaged (MSIX) hosts redirect.
-- **Record fields.** `{thread_id, codex_home, model, created, updated, turns, last_saved_path,
-  last_output_path, last_output_bytes, output_dir, next_version, outputs:[{version, path, bytes}]}`.
-  `outputs` lists every file this server published for the session. [Cleanup](#cleanup) uses it.
+- **The file.** `{version: 1, sessions: {<lowercased name>: <record>}, last_cleanup?}`. Records are keyed by the
+  lowercased name, because names compare case-insensitively. `last_cleanup` is the outcome of the last cleanup
+  that covered this store, `{at, removed, freed_bytes, skipped:[{name, why}]}`, shown by `status`. A file with
+  another `version` is refused like one that cannot be parsed, since rewriting it would drop what a newer build
+  keeps there [decided].
+- **Record fields.** `{name, thread_id, codex_home, model, created, updated, turns, last_saved_path,
+  last_output_path, last_output_bytes, output_dir, next_version,
+  outputs:[{version, path, bytes, fnv1a64, resolved_path}]}`.
+  - `name` is the name as the session was created; file names keep that spelling.
+  - `codex_home` is the child's `codexHome` from its handshake. `created` and `updated` are Unix seconds.
+  - `turns` counts turns that completed at least one image.
+  - `last_saved_path` and `last_output_path` are Codex's copy and ours of the latest image; either is null when
+    that copy does not exist (no `savedPath`, or a failed copy), never an older version's path.
+    `last_output_bytes` is that image's size, which checks either copy.
+  - `outputs` lists every file this server published for the session. [Cleanup](#cleanup) uses it.
+  - `fnv1a64` is the 64-bit FNV-1a of the bytes published, as 16 lowercase hex digits (a string, because many
+    JSON readers would round a 64-bit number). It is accidental-change detection, not a MAC: it tells a file
+    that was edited or replaced, even by one of the same size, from the one published, and is no defence
+    against deliberate forgery [decided]. Records written before it existed have none, and still read;
+    cleanup then cannot show such a file to be ours, and keeps it.
+  - `resolved_path` is where the file really was once published: its final path, with every link on the way
+    resolved, read just after the rename through a handle (`std::fs::canonicalize`, which asks
+    `GetFinalPathNameByHandleW`, as cleanup does for the handle it deletes through), in the `\\?\` form. An
+    output folder that was itself a link when the file was published records the folder behind the link
+    [verified: unit test, with a real junction]. It lets cleanup tell the file published from an identical copy
+    that a folder on the way, since replaced by a link, now reaches. A record written before it existed, or
+    one whose path could not be read at publication (logged), has none, and still reads; cleanup then keeps the
+    file, as with a missing `fnv1a64`.
 - **When the record is written.** When the session's first image completes, not at turn end. It is updated on
   every later completed image, in stream order. A turn that produces no completed image leaves a new name free,
-  and leaves an existing record unchanged.
-- **How it is written.** Atomically: a temp file, then rename with retry. A `LockFileEx` byte-range lock on a
-  sibling lock file serialises access, and the OS releases it if the process dies.
+  and leaves an existing record unchanged. A record is never taken over by a call on another thread. A write
+  that fails after the image was delivered is a `warning:` on the success, saying refine may not find the
+  session.
+- **How it is written.** Atomically: a temp file in the same folder (`.sessions.<pid>-<seq>.tmp`), flushed, then
+  renamed over the live file with retry; the live file is never deleted first. A `LockFileEx` byte-range lock on
+  the sibling `sessions.lock` serialises every read-modify-write, and the OS releases it if the process dies. A
+  writer waits up to 10 s for it; one held longer belongs to a stuck process, and the write fails. Plain reads
+  take no lock, because the rename already makes them safe.
+- **How it is read.** `generate` and `refine` fail closed: a store that exists but cannot be parsed (or read) is
+  `STORE_CORRUPT`, and nothing is spent, because the record written later would replace sessions the call cannot
+  see. It is never overwritten or moved aside automatically. `status` reads tolerantly: it lists the records
+  that still parse and says what is wrong. A missing store is an empty one.
 - **Two kinds of exclusion.**
-  - The per-session **lease** (a `LockFileEx` lock per name, held for the whole call) stops a same-name
-    generate from spending quota twice across processes. It also keeps the record's read, turn and write in
-    order.
+  - The per-session **lease** (a `LockFileEx` lock on `<state dir>\locks\<name>-<fnv64(lowercased name)>.lock`,
+    held for the whole call) stops a same-name generate from spending quota twice across processes: it is taken
+    before the record is read. It also keeps the record's read, turn and write in order. A lease held by
+    another process is not waited for: the call gets `SESSION_BUSY` at once, as a busy session in this process
+    does [decided]. The readable part of the lease file name keeps only letters, digits, `-` and `_`.
+  - Lock files are never deleted. They are opened without delete sharing, so a held one cannot be deleted and
+    replaced by a fresh file that a second process would then lock. So `locks\` keeps one empty file per session
+    name ever used [decided: accepted].
   - **Cross-process exclusion on the thread itself** comes from Codex's writer lock. We release it by
     unsubscribing after every turn, so a session created in one Claude Code window can be refined from another
     about 5 s later.
@@ -630,6 +729,9 @@ sees the server's tools. A report that comes later interrupts the turn.
   (default 4), beyond which calls get `TOO_MANY_RUNNING` [decided].
 - **A different Codex home.** A record whose `codex_home` differs from the child's `codexHome` gets
   `SESSION_NOT_RESUMABLE`.
+- **The session's folder.** `output_dir` is the folder the session was created with. A refine that names
+  another folder publishes there, and the record keeps its own [decided]; cleanup finds every file through
+  `outputs` either way.
 - **Housekeeping.** Sessions expire. See [Cleanup](#cleanup).
 
 ## Output files
@@ -708,24 +810,67 @@ session can no longer be refined. Expiry is therefore per session [decided].
 
 ### Automatic expiry
 
-- **When it runs.** Once per server process, at the start of the first tool call that brings up the Codex child
-  (never during `initialize`). It then runs in the background, bounded to about 60 s, and never fails the call
-  that triggered it.
+- **When it runs.** Once per server process, when the first tool call (any of the three) brings up the Codex
+  child (never during `initialize`, and never for `--doctor`). It runs on a thread of its own, through that
+  child, bounded to about 60 s (each `thread/delete` to 10 s), and never delays or fails the call that
+  triggered it. It holds the child only weakly, so a child retired meanwhile is not kept alive by it, and it
+  stops at shutdown.
 - **What it covers.** Sessions in this project's store whose `updated` is older than `--session-ttl-days`
-  (default 7; 0 disables expiry).
+  (default 7; 0 disables expiry). A store that cannot be read is left alone and the reason logged.
 - **Steps per session.**
-  1. Take the session lease without waiting. If another process holds it, skip the session until next time.
-  2. `thread/delete {threadId}`. "no rollout found" counts as already gone. "active writer" or any other
-     error skips the session until next time.
-  3. Delete Codex's per-thread image folder, `<codex_home>\generated_images\<threadId>\`, with these checks:
-     - `codex_home` must equal the child's `codexHome`;
-     - `threadId` must be a well-formed UUID;
-     - only `*.png` files and then the empty folder are removed.
-  4. Delete each file in `outputs` whose exact path still exists with the recorded size. A file that was
-     edited, replaced or renamed is left alone. Folders are never removed.
-  5. Drop the session record. This is the last step, so a crash part-way through is retried next time.
+  1. Skip a session busy in this process (a returned call's interrupted turn can still hold it in the
+     registry after its lease is released), then take the session lease without waiting. If another process
+     holds it, skip the session until next time.
+  2. Read the record again under the lease. One that a call refreshed since the listing, or that is gone, is
+     left alone.
+  3. A record whose `codex_home` is not the child's `codexHome` (compared exactly, apart from the `\\?\` prefix and
+     a trailing separator: both come from Codex's canonicalised home, so a home differing only by case is another
+     home [decided]), or whose `threadId` is not a well-formed UUID, is skipped whole: nothing of it is deleted, not even its thread (`--cleanup` covers other homes).
+  4. `thread/delete {threadId}`. "no rollout found" (and "thread not found") counts as already gone: for a
+     thread id Codex does not know, `thread/delete` answers `no rollout found for thread id <id>`, in the ambient
+     home and in a fresh dedicated one [verified: live, `--cleanup` on fabricated records, 2026-09-25]. "active
+     writer" or any other error skips the session until next time, and so does a timeout: once, while another
+     Codex process was busy on the same home, a `thread/delete` answered only after 30 s although the rollout was
+     already gone, and the next run found the thread gone and finished the session [verified: live, 2026-09-26].
+     The `--cleanup` sweep therefore waits up to 120 s for each delete; automatic expiry keeps its ~60 s bound.
+  5. Delete Codex's per-thread image folder, `<codex_home>\generated_images\<threadId>\`: only `*.png` entries
+     that are plain files, then the folder once it is empty. First, neither `<codex_home>\generated_images` nor
+     the thread's folder may be a link (a reparse point), and the folder's canonical path must equal the
+     canonical Codex home joined with `generated_images\<threadId>` (compared exactly, without the
+     `\\?\` prefix). Otherwise the whole step is skipped, with the reason logged, and the rest of the session's
+     cleanup goes on: the folder is left alone on purpose, like a changed output. A Codex home that is itself
+     reached through a link passes, since both canonical paths resolve through it [verified: unit test, with
+     real junctions]. Each PNG is then deleted through a handle (see [Safety rules](#safety-rules)) that does
+     not follow a link at its name, and only while that handle shows a plain file, not read-only, whose final
+     path lies directly in that canonical folder; the empty folder is removed the same way. A PNG open in a
+     viewer that shares delete is unlinked at once all the same, so the folder still goes [verified: unit
+     test]. When cleanup kept something in the folder on purpose (anything not a PNG, a PNG that is a link or
+     not a plain file, a read-only PNG), the folder cannot be emptied: its removal is not attempted, and it
+     stays, logged, without keeping the session [verified: unit test, also with the folder held open]. When it
+     kept nothing, the folder should be empty, and a failure to remove it is a failed deletion (step 7), not
+     something kept on purpose: another process holding it open without delete sharing, or, where POSIX
+     deletes are unsupported, a PNG a viewer holds still delete-pending. A read-only folder is kept, logged.
+  6. Delete each file in `outputs` that is still, at its exact path and under the name it was published with
+     (`<name>-v<version>.png`), a plain file with the recorded size and `fnv1a64`, both recomputed through the
+     handle that deletes it, whose final path through that handle is its recorded `resolved_path` (compared
+     exactly, apart from the `\\?\` prefix: both come from `GetFinalPathNameByHandleW` with the on-disk case, and a
+     case-insensitive compare would let a junction reach a sibling whose name differs only by case or by a Unicode
+     case fold NTFS does not apply [verified: unit test]), and that is not read-only. A file that was edited,
+     replaced (even by one of the same size) or renamed is left alone, and so is one now reached somewhere
+     else: an output folder replaced by a junction to an archive holding an identical copy reaches that copy,
+     same name, size and content, and its final path gives it away [verified: unit test, with a real
+     junction]. So is one whose record has no `fnv1a64` or no `resolved_path`, and one made read-only. Folders
+     are never removed.
+  7. Drop the session record, last, so a cleanup cut short is retried next time. A deletion in steps 5 or 6 that
+     fails (as opposed to a file left alone on purpose, such as a changed, moved or read-only one), for example
+     because another process holds the file, or Codex's emptied folder, open without delete sharing, keeps the
+     record for the same reason; the thread is already gone then, so the next run's `thread/delete` answers
+     "no rollout found", files already deleted count as gone, and the rest follows [verified: unit test, for a
+     held output and a held Codex folder]. Were a failed folder removal only logged, the record would go and
+     nothing would ever retry the folder.
 - **Reporting.** The outcome (sessions removed, bytes freed, anything skipped and why) is logged to stderr, and
-  shown in `status` under "last cleanup".
+  kept as the store's `last_cleanup` for `status` under "last cleanup", also when nothing was due. "Freed"
+  counts only the files codex-imagegen deleted itself, not the rollout `thread/delete` removed.
 
 ### Manual sweep
 
@@ -734,20 +879,65 @@ codex-imagegen.exe --cleanup [--older-than-days N]
 ```
 
 - It runs from a terminal and needs no Claude.
-- It covers every project store under the state base, not just one project. N defaults to the configured TTL;
-  0 means every session that is not currently in use.
-- Sessions are grouped by their `codex_home`, with one child spawned per home.
-- It prints what it removed and what it skipped.
+- It covers every project store under the state base (each folder directly under it that holds a
+  `sessions.json`), plus `--state-dir`'s when that lies elsewhere. N defaults to the configured TTL; 0 means
+  every session that is not currently in use. With `--session-ttl-days 0` and no `--older-than-days`, nothing
+  is removed.
+- Sessions are grouped by their `codex_home`, with one child spawned per home: the default child, started as a
+  server here would start it (ambient, or `--codex-home`), for its own home, and one with `CODEX_HOME` set to
+  each other home. A child whose handshake reports another home than the one asked for deletes nothing: its
+  home's sessions are skipped.
+- These children use the server's spawn line and are initialized, but not preflighted: deleting a thread is
+  local to the home, needs no sign-in or model and runs no turn, so a signed-out home can still be cleaned
+  [decided].
+- It prints what it removed and what it skipped, and records each store's outcome as its `last_cleanup`. It
+  exits 0, or 1 when a store could not be read, a home could not be reached, or the search for stores failed:
+  the state base could not be listed, or a project folder's `sessions.json` could not be looked at for any
+  reason other than its absence. Only a store that is genuinely absent counts as none, so an inaccessible
+  project is reported rather than silently missing from the sweep. A session skipped because it is in use is
+  normal.
 - The steps and safety checks are the same as for automatic expiry.
 
 ### Safety rules
 
 - The server deletes only three kinds of thing:
-  - the files it recorded publishing, when the path and size still match;
-  - Codex's per-thread image folder for a thread it created;
+  - the files it recorded publishing, when the path, the final path recorded at publication
+    (`resolved_path`), the size and the content fingerprint (`fnv1a64`) still match;
+  - Codex's per-thread image folder for a thread it created, when neither that folder nor `generated_images`
+    is a link and its canonical path is where it should be;
   - that thread itself, through `thread/delete`.
 - It never deletes by wildcard in an output directory, never deletes a folder in the project, and never
   touches a thread that is not in one of its session records.
+- Every file and folder is deleted through the handle its checks were made on [decided]. The handle is opened
+  with DELETE and read access, sharing with readers only, so no other process can write, rename or delete it
+  while it is open, and a file being written or held without delete sharing is left for next time. It is
+  opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so a link at the name is opened as itself and never followed.
+  Folders on the way are still resolved, so where a link there could redirect the deletion, the handle's final
+  path is checked: a Codex PNG's must lie directly in the thread's canonical folder, and an output's must be
+  its recorded `resolved_path`. Type, attributes, size, fingerprint and final path are read through it, and the
+  deletion is marked on it, so the file verified is the file deleted [verified: unit test, for the sharing, a
+  held file, junctions at the name and on the path, an output folder swapped for a junction, and a same-size
+  replacement].
+- The deletion is a POSIX delete: `SetFileInformationByHandle` with `FileDispositionInfoEx`, flags
+  `FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`. The name is gone as the handle closes,
+  even while a viewer that shares delete still has the file open (it can go on reading it), so Codex's folder
+  can be removed right after its PNGs [verified: unit test, on NTFS]. A file system without POSIX deletes
+  refuses that, and the legacy `FileDispositionInfo` is then marked on the same handle, so the guarantee is the
+  same; there a file a viewer holds stays delete-pending until the viewer closes it, and its folder cannot be
+  removed until then [verified: unit test, with the refusal injected]. That is a failed folder removal, so the
+  session's record is kept and the folder retried next time, by the same path as a folder held open [verified:
+  unit test, for the held folder; the delete-pending case is not exercised at the session level, since NTFS
+  takes the POSIX delete]. The refusals that fall back are
+  ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED and ERROR_INVALID_FUNCTION, expected from FAT, exFAT and some
+  network file systems [assumed: V10]; any other error is a failed deletion.
+- A read-only file or folder is kept [decided]: the attribute is the user's protection, and cleanup honours it.
+  It is read through the handle, and the deletion is never attempted; neither disposition is given
+  `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE`, and both refuse a read-only entry with ERROR_ACCESS_DENIED
+  [verified: unit test]. It is logged as kept, like a changed output, not counted as a failure, so it is not
+  retried, the rest of the session is still removed and the record is dropped [verified: unit test]. A read-only
+  PNG keeps Codex's folder.
+- Out of scope: a process that can already write the user's Codex home or output folder, racing these checks
+  on purpose. It could delete those files itself [decided].
 
 `thread/delete` works on a thread that has turns and has already unloaded. It removes the rollout, and a
 later `thread/resume` then fails with `no rollout found for thread id <id>`. Codex's
@@ -818,6 +1008,11 @@ case is always a success with warnings.
 | Stop and escalate | `CLI_NOT_FOUND`, `SPAWN_FAILED`, `APP_SERVER_FAILED`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED`, `IMAGEGEN_UNAVAILABLE`, `MODEL_UNAVAILABLE`, `RATE_LIMITED`, `UPSTREAM_ERROR`, `CONTENT_REFUSED`, `IMAGE_FAILED`, `NO_IMAGE`, `TIMEOUT`, `STORE_CORRUPT`, `INTERNAL_ERROR` |
 | Agent-correctable (short form) | `BAD_REQUEST`, `SESSION_EXISTS`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `SESSION_BUSY`, `SESSION_OPEN_ELSEWHERE`, `TOO_MANY_RUNNING`, `CANCELLED`, `SERVER_SHUTTING_DOWN` |
 
+`STORE_CORRUPT` covers a session store that exists but cannot be parsed (the remediation: move it aside, and a
+fresh store starts), and one that cannot be used at all: its folder, its lock or a lease failed with an I/O error,
+or another process held the store lock past its wait. `SESSION_BUSY` covers a session busy in this process and
+one whose lease another process holds.
+
 **Which failure is reported** when no image completed, first match wins [decided]: an isolation breach; a
 cancellation; the child dying; a failed turn (by its `codexErrorInfo`); an exhausted image quota; another failed
 image item; the budget running out; a protocol anomaly; then the turn's end state (`NO_IMAGE` for a completed turn
@@ -867,8 +1062,8 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   are checked for an image signature first.
 - **Writes.** The only writes to disk are the image tool's, into `<CODEX_HOME>\generated_images`, and this
   server's new files in the output directory. The server never overwrites. It deletes only what
-  [Cleanup](#cleanup) allows: the files it recorded publishing (path and size must match), Codex's image
-  folder for its own threads, and those threads.
+  [Cleanup](#cleanup) allows: the files it recorded publishing (path, resolved path, size and content
+  fingerprint must match), Codex's image folder for its own threads, and those threads.
 - **User configuration, in ambient mode (the default).** The user's `~/.codex/AGENTS.md` reaches the agent
   model, and nothing short of another home stops it [verified]. Everything else that could act is switched off:
   - apps and connectors
@@ -961,16 +1156,17 @@ Planned modules:
 | `appserver.rs` | Child supervisor: spawn in the job, handshake, pending-reply table with deadlines, detached requests, routing, answers to server requests, shutdown. |
 | `codex.rs` | Binary resolution, preflight, per-thread config map, thread/turn parameters, developer instructions, input text. |
 | `registry.rs` | Running turns per session: busy check, cap, phases, per-thread event routing (holding a canary that beats the thread's registration), lingering-interrupt state, shutdown. |
-| `turn.rs` | One image turn: notification parsing and routing on the reader thread; on the call's thread `thread/start`, `turn/start`, copy and preview per image, cancel hook, deadlines, canary, unsubscribe; result building and the no-image failure choice. |
-| `session.rs` | Session store: atomic JSON, `LockFileEx` store lock and per-name leases, record type. |
+| `turn.rs` | One image turn: notification parsing and routing on the reader thread; on the call's thread `thread/start` or `thread/resume` (with its retries), `turn/start`, copy and preview per image, cancel hook, deadlines, canary, unsubscribe; result building and the no-image failure choice. |
+| `session.rs` | Session store: atomic JSON, strict and tolerant reads, `LockFileEx` store lock and per-name leases, record type, and the per-call writer that records each completed image. |
 | `output.rs` | Output-dir resolution and pre-check, no-replace versioned publish, automatic session names. |
 | `cleanup.rs` | Session expiry and the `--cleanup` sweep, with the deletion safety rules. |
+| `delete.rs` | Deleting through the handle that was checked: opened without following a link or admitting other writers and deleters; attributes, size, fingerprint and final path read through it; the deletion marked on it, as a POSIX delete with the legacy disposition as the fallback. |
 | `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode with the size steps, base64. |
 | `errors.rs` | Failure contract, item-level and `codexErrorInfo` mapping. |
-| `config.rs` | Flags, state directory derivation, `fnv1a64`. |
+| `config.rs` | Flags, state directory derivation, `fnv1a64` (also the output fingerprint). |
 | `winjob.rs` | Job object and suspended spawn. |
-| `tools.rs` | `App`, the three tools, validation and start ordering, the child's notification handler, child retirement. |
-| `testutil.rs` | Test temp directories. |
+| `tools.rs` | `App`, the three tools, validation and start ordering, refine's edit target and home check, the child's notification handler, child retirement, the start of automatic expiry. |
+| `testutil.rs` | Test temp directories, and junctions made with `mklink /J`. |
 
 The estimate is about 3,500 lines without tests.
 
@@ -1006,22 +1202,75 @@ tested against a scripted fake child that replays message sequences for these ca
 - a child seen to exit before its last image line is read, and one that exits while the call is busy with an
   earlier image
 - a deleted edit target, where no turn is sent
+- sessions, through generate: the record written as the first image completes (not at turn end) and not when no
+  image completed; `next_version` after a taken file name; several images in one turn; a failed copy; an existing
+  name, whatever its case, refused with `SESSION_EXISTS` before Codex starts; a lease held by another handle
+  refused with `SESSION_BUSY` before Codex starts; an unreadable store refused with `STORE_CORRUPT` while `status`
+  still reports; a record write that fails as a warning on the success; automatic names drawn again while taken
+- the store itself: concurrent writers on separate handles losing no update while readers never see a partial
+  file; a store that cannot be parsed never overwritten; the tolerant read keeping the records that parse; another
+  store version refused; leases excluding each other across handles whatever the case; the store lock's wait
+- refine: the exact `thread/resume` parameters and the tagged edit input; the recorded output folder, and an
+  `output_dir` argument for one call; the edit target falling back to the published copy, versions carrying on
+  past a taken name; no copy left (nothing sent, a surviving older version named); a foreign `codex_home`;
+  "is closing" retried; "active writer" waited out, and ending in `SESSION_OPEN_ELSEWHERE`; "no rollout found"
+  and another refusal (unsubscribed); a resume abandoned on a cancel or a timeout, then answered late, followed by
+  `thread/unsubscribe`; `contextWindowExceeded`; a revised prompt that is not the feedback; a turn with no image;
+  the canary after a resume; a held lease and an unreadable store before Codex starts; a generated session
+  refined after Codex restarts
 - cleanup:
   - an expired session is removed completely;
-  - a session whose lease is held is skipped;
-  - "no rollout found" still removes the record;
-  - an edited output (size mismatch) is kept;
-  - a malformed `threadId` or a foreign `codex_home` deletes nothing
+  - the record is dropped last, so a deletion that fails is retried;
+  - a session whose lease is held, or that is busy in this process, is skipped;
+  - "no rollout found" still removes the record, and "active writer" skips it;
+  - an edited, replaced or renamed output is kept;
+  - a malformed `threadId` or a foreign `codex_home` deletes nothing;
+  - a session refreshed before its lease was taken is left alone;
+  - automatic expiry runs once per process, and `--session-ttl-days 0` turns it off;
+  - the sweep covers every project store with one child per Codex home, reports an unreadable store and a home
+    that answers for another path, and does nothing when expiry is off and no age is given
 
-**`smoke.ps1`.** The only thing that spends quota, and only with its `-SpendQuota` switch; without it, it runs
-the free steps (`initialize`, `tools/list`, `status`, then the no-stray-process check). The M2 version spends
-about 2 images: `generate` with the quotes, backslash, newline and non-ASCII prompt (V2), then `generate` with
-that image as a reference (V3), each checked for an `image/jpeg` preview of 512,000 bytes or less with a long
-edge of 1024 px or less, and the `<session>-v1.png` file. V2 is compared by the script itself: the `codex prompt`
-line, JSON-decoded, must equal the prompt sent (whitespace at either end aside), and the server must raise no
-prompt warning. It runs the server with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and reads the
-trace. Each thread writes a `trace-*` folder holding `trace.jsonl` and the payload files its events name
-[verified: real trace, 0.156.0]:
+**`smoke.ps1`.** The only thing that spends quota, and only with its `-SpendQuota` switch. It drives
+`dist\codex-imagegen.exe` over MCP, as Claude Code does, and every server it starts runs with
+`CODEX_IMAGEGEN_HOME` pointing at a fresh state folder in the run's working folder, with its own working
+directory and no `CLAUDE_PROJECT_DIR`, so the sessions it makes and removes are its own, never the user's.
+
+Without `-SpendQuota` it runs the free steps: `initialize`, `tools/list`, `status` (which must show no sessions
+under that state folder), the no-stray-process check after closing the server's stdin, then `--cleanup
+--older-than-days 0` on the state folder, which must exit 0 with nothing to remove.
+
+The M3 version spends about 3 images, and is run when protocol, spawning or session code changes, after the
+user is told the cost:
+
+1. `initialize`, `tools/list`, `status`
+2. (a) `generate(session=smoke-<ts>)`, with a prompt holding quotes, a backslash, a newline and non-ASCII text
+3. (b) `refine`, with feedback holding the same kinds of character
+4. (c) kill the exe (the job object must take the Codex tree with it), start a fresh one on the same state
+   folder, and `refine` again: resume after a restart
+5. (d) `status`, which must list the session with three turns and its latest file; then close the server
+6. (e) free, and run whatever the steps before got to: `--cleanup --older-than-days 0` on the state folder
+
+Each result must carry an `image/jpeg` preview of 512,000 bytes or less with a long edge of 1024 px or less, be
+the next version (`session: <name>   version: N`), name `<session>-vN.png` in the output folder, and that file
+must exist. V2 is compared by the script itself on every turn: the `codex prompt` line, JSON-decoded, must equal
+the prompt or feedback sent (whitespace at either end aside), and the server must raise no prompt warning.
+
+Step (e) covers every session the isolated store records, not only those the run kept track of: a result lost
+after its image completed still left a record, and a thread in the real Codex home that nothing else would
+remove. Before it, each session's record must list exactly the files the run published, named independently of
+the record (`<session>-v1..vN`: the output folder is fresh), and those files must exist; a recorded session the
+run lost track of fails the run. After it, each session's record, those files, any other file its record listed
+or of its name in the output folder, Codex's image folder for its thread and the thread's rollout (found by its
+id under `<codex_home>\sessions`, which must exist before) must all be gone, and `--cleanup` must exit 0 and
+report the session removed.
+
+With `-Concurrent` as well (V9, about 2 more images), two server processes on the same state folder, each with
+its own stdin, get their `generate` requests before either is answered; both must succeed, and both sessions
+must be recorded in the shared store. Step (e) then removes them too.
+
+The servers run with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and the script reads the trace.
+Each thread writes a `trace-*` folder holding `trace.jsonl` and the payload files its events name [verified:
+real trace, 0.156.0]:
 
 - V1: the offered tools, from every model request in every trace folder. A full request carries them in its
   first input item (`additional_tools`), grouped in namespaces; a follow-up request in the same turn carries only
@@ -1036,39 +1285,21 @@ trace. Each thread writes a `trace-*` folder holding `trace.jsonl` and the paylo
 - V3: an image call is a `tool_call_started` event of kind `image_generation`. Its `referenced_image_paths` come
   from its invocation payload, or, if the trace has none, from the JavaScript of the `exec` cell that made it
   (the matching `code_cell_started` event's `source_js`, JavaScript string escapes decoded). Some call must list
-  the first image (full path, compared case-insensitively). The event's `input_preview` is truncated and never
+  the first image (full path, compared case-insensitively): for the refine in (b), its edit target, which is
+  Codex's copy of the first image (its `savedPath`, from the server's stderr) or, failing that, ours; either
+  counts. The event's `input_preview` is truncated and never
   used. Text Codex sent to the model never counts: the developer instructions, the tool's declaration and the
   tagged input name both the parameter and the path whatever the agent does.
 - The tool results, which carry each image's base64, are never read.
 
-`smoke.ps1 -CheckTrace <trace folder> [-ReferencePath <png>]` runs only these two checks against the trace of an
-earlier run. It starts nothing and spends nothing.
+`smoke.ps1 -CheckTrace <trace folder> [-ReferencePath <png>[,<png>...]]` runs only these two checks against the
+trace of an earlier run; any of the paths given counts for V3. It starts nothing and spends nothing.
 
-V1's `savedPath` comes from the server's stderr: each image must have logged its `savedPath`, under
-`<CODEX_HOME>\generated_images`, byte-identical to the published copy, and none may have fallen back to the
-base64. The no-stray-process check covers every process of ours alive just before shutdown, and an app-server
-respawned during the run fails. The full version below arrives with sessions in M3.
-
-The full version spends about 3 images. It is run when protocol, spawning or session code changes, and the user
-is told the cost first. It drives `dist\codex-imagegen.exe` over MCP:
-
-1. `initialize`
-2. `tools/list`
-3. `status`
-4. `generate(session=smoke-<ts>)`, with a prompt containing quotes, a backslash, a newline and non-ASCII text
-5. `refine`
-6. kill the exe and start a fresh one
-7. `refine` again (resume after restart)
-8. `status`
-
-It asserts:
-
-- three files, `<session>-v1..v3.png`;
-- `revisedPrompt` equals the sent text exactly on every turn;
-- each result carries an `image/jpeg` preview of 512,000 bytes or less, with a long edge of 1024 px or less,
-  plus the absolute path;
-- `status` lists the session with three turns;
-- no stray `codex` process remains.
+V1's `savedPath` comes from the servers' stderr: each image must have logged its `savedPath`, under
+`<codex_home>\generated_images`, byte-identical to the published copy (a session's k-th image is its version k),
+and none may have fallen back to the base64. These checks run before (e), which deletes what they compare. The
+no-stray-process check covers every process of each server alive just before it stops, whether it was closed
+or killed.
 
 ## Verification plan
 
@@ -1080,11 +1311,12 @@ Each item must pass before the code that depends on it is considered done.
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
 | V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
-| V2 | **Passed 2026-09-25 for generate.** Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. The generate prompt with quotes, a backslash, a newline and non-ASCII text came back verbatim. The refine part is pending M3. | part of smoke | M2 |
+| V2 | **Passed** (generate 2026-09-25; refine 2026-09-26). Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. Both the generate prompt and the refine feedback came back verbatim, and the edit target reached `referenced_image_paths`. | part of smoke | M2/M3 |
 | V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
 | V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
 | V5 | With `--codex-home` pointing at a dedicated home, images land under that home. | 1 image, plus a one-time login by the owner | M4 |
-| V9 | Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeed. | 2 images | M3 |
+| V10 | On a FAT32 or exFAT volume (a USB stick), the POSIX delete is refused with one of the errors that fall back to the legacy disposition, and cleanup still deletes the session's files there. The fallback itself is covered by a unit test with the refusal injected. | free (no turn) | when such a volume is at hand |
+| V9 | **Passed 2026-09-26.** Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeeded (26 s and 30 s), and both sessions were recorded in the shared store. `smoke.ps1 -SpendQuota -Concurrent`. | 2 images | M3 |
 
 ## Milestones
 

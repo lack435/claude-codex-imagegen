@@ -7,7 +7,9 @@
 //! - Publishing a completed image as `<session>-v<N>.png`: written to a temp file in the
 //!   destination directory, then renamed with `MoveFileExW` *without* `MOVEFILE_REPLACE_EXISTING`.
 //!   When the name is taken, N is bumped and the rename retried, so an existing file is never
-//!   overwritten, even when several projects or processes share a folder.
+//!   overwritten, even when several projects or processes share a folder. The published file's
+//!   final path is then read back for the session record, so cleanup can tell it from a copy
+//!   reached later through a link.
 //! - Automatic session names, from local time.
 //!
 //! Writing into the caller's output directory is one of the places rigor belongs (AGENTS.md). This
@@ -60,6 +62,8 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 pub enum DirSource {
     /// The call's `output_dir`.
     Argument,
+    /// For refine, the output folder its session was created with.
+    Recorded,
     /// The server's `--output-dir`.
     Flag,
     /// `%CLAUDE_PROJECT_DIR%\generated-images`.
@@ -72,6 +76,7 @@ impl DirSource {
     fn describe(self) -> &'static str {
         match self {
             Self::Argument => "from the output_dir argument",
+            Self::Recorded => "the session's own output folder, recorded when it was created",
             Self::Flag => "from the server's --output-dir flag",
             Self::Project => "the default: the project's generated-images folder",
             Self::State => {
@@ -90,8 +95,8 @@ pub struct OutputDir {
 }
 
 /// The output directory: the first of the call's `output_dir`, the server's `--output-dir`,
-/// `<project_dir>\generated-images`, and `<state_dir>\images` that applies. (Refine's recorded
-/// directory, milestone M3, slots in after the argument.)
+/// `<project_dir>\generated-images`, and `<state_dir>\images` that applies. (Refine uses its
+/// session's recorded directory, [`DirSource::Recorded`], when the call names none.)
 ///
 /// `project_dir` is `CLAUDE_PROJECT_DIR` when Claude Code sets it to an absolute path. A relative
 /// argument or flag resolves against it, and otherwise against `cwd`, the server's working
@@ -160,6 +165,9 @@ pub struct Published {
     pub path: PathBuf,
     /// The N actually used, which is `first_version` unless that name was taken.
     pub version: u32,
+    /// Where the file really is, read just after it was published ([`resolve`]). `None` when that
+    /// could not be read, and then cleanup keeps the file.
+    pub resolved: Option<PathBuf>,
 }
 
 /// `<session>-v<N>.png`.
@@ -204,8 +212,8 @@ pub fn publish(
 }
 
 /// Create `path`, which must not exist, holding `bytes`, flushed to disk. If anything fails after
-/// the file was created, it is removed again.
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// the file was created, it is removed again. Also writes the session store's temp files.
+pub fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
@@ -229,6 +237,7 @@ fn rename_to_first_free(
         match rename_no_replace(temp, &target) {
             Ok(()) => {
                 return Ok(Published {
+                    resolved: resolve(&target),
                     path: target,
                     version,
                 })
@@ -251,6 +260,24 @@ fn rename_to_first_free(
     }
 }
 
+/// Where a file just published really is: its final path, with every link on the way resolved.
+/// `std::fs::canonicalize` reads it through a handle with `GetFinalPathNameByHandleW`, as cleanup
+/// reads the path of the handle it deletes through, so the two compare (docs/design.md, "Record
+/// fields"). A failure is only logged: the image is published all the same, and cleanup, finding
+/// no resolved path in the record, keeps the file.
+fn resolve(path: &Path) -> Option<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(resolved) => Some(resolved),
+        Err(e) => {
+            eprintln!(
+                "codex-imagegen: could not resolve the published {} ({e}); cleanup will keep it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn name_taken(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -263,6 +290,22 @@ fn transient(e: &io::Error) -> bool {
         e.raw_os_error(),
         Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
     )
+}
+
+/// Run `op`, retrying for about 0.8 s while it fails with a sharing or access error: another
+/// process (typically an antivirus scanner) holding a file this process has just written. The
+/// session store's reads, renames and lock files go through this.
+pub fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut waits = RENAME_RETRY_WAITS_MS.iter();
+    loop {
+        match op() {
+            Err(e) if transient(&e) => match waits.next() {
+                Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                None => return Err(e),
+            },
+            done => return done,
+        }
+    }
 }
 
 /// Rename `from` to `to`, failing with ERROR_ALREADY_EXISTS or ERROR_FILE_EXISTS if `to` exists.
@@ -495,7 +538,8 @@ mod tests {
             published,
             Published {
                 path: dir.join("fox-v1.png"),
-                version: 1
+                version: 1,
+                resolved: Some(fs::canonicalize(dir.join("fox-v1.png")).unwrap()),
             }
         );
         assert_eq!(fs::read(&published.path).unwrap(), b"png bytes");
@@ -504,6 +548,30 @@ mod tests {
         let next = publish(&dir, "fox", 2, b"second").unwrap();
         assert_eq!(next.version, 2);
         assert_eq!(listing(&dir), vec!["fox-v1.png", "fox-v2.png"]);
+    }
+
+    #[test]
+    fn a_file_published_through_a_link_records_where_it_really_is() {
+        let root = temp_dir("output");
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        crate::testutil::make_junction(&link, &real);
+        let published = publish(&link, "fox", 1, b"png bytes").unwrap();
+        assert_eq!(published.path, link.join("fox-v1.png"));
+        // The folder behind the link, not the link.
+        assert_eq!(
+            published.resolved,
+            Some(fs::canonicalize(real.join("fox-v1.png")).unwrap())
+        );
+        assert!(!crate::cleanup::same_path(
+            published.resolved.as_deref().unwrap(),
+            &fs::canonicalize(&root)
+                .unwrap()
+                .join("link")
+                .join("fox-v1.png")
+        ));
+        assert_eq!(listing(&real), vec!["fox-v1.png"]);
     }
 
     #[test]

@@ -11,14 +11,17 @@ compile_error!(
 
 mod appserver;
 mod cancel;
+mod cleanup;
 mod codex;
 mod config;
+mod delete;
 mod errors;
 mod jsonrpc;
 mod mcp;
 mod output;
 mod preview;
 mod registry;
+mod session;
 #[cfg(test)]
 mod testutil;
 mod tools;
@@ -81,11 +84,18 @@ fn main() {
             print!("{report}");
             std::process::exit(if ready { 0 } else { 1 });
         }
-        Mode::Cleanup { .. } => {
-            eprintln!("codex-imagegen: --cleanup is not implemented yet.");
-            std::process::exit(1);
+        Mode::Cleanup { older_than_days } => {
+            // From a terminal, no Claude needed: every project's expired sessions. Prints what it
+            // removed and skipped; exits 1 when a store could not be read or Codex not started.
+            let code = cleanup::sweep(
+                &cfg,
+                &tools::CodexLauncher,
+                older_than_days,
+                &mut std::io::stdout(),
+            );
+            std::process::exit(code);
         }
-        Mode::Serve => mcp::serve(Arc::new(tools::App::new(cfg))),
+        Mode::Serve => mcp::serve(Arc::new(tools::App::serving(cfg))),
     }
 }
 

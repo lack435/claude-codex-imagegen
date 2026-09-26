@@ -6,11 +6,15 @@
 //! or changed account. A failed preflight closes the child at once, so a retry after
 //! `codex login` works without restarting anything.
 //!
-//! `generate` validates its arguments, pre-checks the output folder, claims its session in the
-//! registry, brings the child up and hands the turn to `turn.rs`, in the order of docs/design.md's
-//! "Request flow", so nothing is spent until every local check has passed. `refine` validates its
-//! arguments and brings the child up, so setup problems surface exactly as they will later, and
-//! then stops: sessions arrive in milestone M3.
+//! `generate` validates its arguments, pre-checks the output folder, claims its session (the
+//! registry, then the cross-process lease, then the store's check that the name is new), brings
+//! the child up and hands the turn to `turn.rs`, in the order of docs/design.md's "Request flow",
+//! so nothing is spent until every local check has passed. `refine` claims the existing session
+//! the same way, pre-checks its output folder, picks the edit target, brings the child up and
+//! checks the session's Codex home, then hands `turn.rs` the thread to resume.
+//!
+//! The first tool call that brings a child up in a server process also starts automatic session
+//! expiry on it, on a thread of its own (`cleanup.rs`).
 
 use std::fs::File;
 use std::io::Read;
@@ -24,12 +28,14 @@ use serde_json::{json, Value};
 
 use crate::appserver::{AppServer, DetachedSender, NotificationHandler, RpcError};
 use crate::cancel::RequestCancel;
+use crate::cleanup;
 use crate::codex::{self, Budget, Facts, Handshake, Rpc, Usage};
 use crate::config::Config;
 use crate::errors::{self, Failure};
 use crate::mcp::{self, CallContext, Progress, ToolHost};
 use crate::output;
 use crate::registry::{ChildRef, Liveness, Registry, TurnSlot};
+use crate::session::{self, Lease, NewSession, Record, SessionWriter, Store};
 use crate::turn::{self, Event};
 
 pub const GENERATE: &str = "codex_imagegen_generate";
@@ -54,6 +60,15 @@ const START_LOCK_POLL: Duration = Duration::from_millis(50);
 /// suffix, so a second collision in one process is already all but impossible.
 const AUTO_NAME_TRIES: usize = 8;
 
+/// How many sessions `status` lists, most recently updated first.
+const STATUS_SESSIONS: usize = 20;
+
+/// How long automatic expiry may run (docs/design.md, "Automatic expiry").
+const EXPIRY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Each of automatic expiry's `thread/delete` calls gets at most this long.
+const DELETE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Each child's id (see [`ChildRef`]), unique for the life of the process.
 static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -69,7 +84,7 @@ pub trait Launcher: Send + Sync {
 }
 
 /// The real launcher.
-struct CodexLauncher;
+pub struct CodexLauncher;
 
 impl Launcher for CodexLauncher {
     fn resolve(&self, cfg: &Config) -> Result<PathBuf, Failure> {
@@ -92,7 +107,11 @@ pub struct App {
     /// server's working directory, the same rule as output directories. Codex runs in its own
     /// empty work directory, so a path has to be absolute before it reaches it.
     path_base: PathBuf,
-    shutting_down: AtomicBool,
+    /// Shared with automatic expiry, which stops at shutdown.
+    shutting_down: Arc<AtomicBool>,
+    /// Set in a server process until automatic expiry has been started: once per process, by the
+    /// first tool call that brings a child up. Never set for `--doctor`.
+    expiry_due: AtomicBool,
     /// Held while a child is brought up, so two calls never start two children.
     start_lock: Mutex<()>,
     /// The child that exists now, starting or ready. Shutdown takes it from here, so a child is
@@ -106,8 +125,26 @@ pub struct App {
     usage: Arc<Mutex<UsageCache>>,
     /// The image turns running in this process, and the routing of their notifications.
     registry: Arc<Registry<Event>>,
+    /// This project's session store, in the per-project state directory.
+    store: Store,
     /// How long a call waits for `turn/completed` after interrupting its turn.
     interrupt_wait: Duration,
+    /// How long refine retries `thread/resume` while another process holds the thread.
+    writer_wait: Duration,
+}
+
+/// A generate call's claim on its new session: the registry slot, which names it, and the lease.
+struct Claim {
+    slot: TurnSlot<Event>,
+    lease: Lease,
+}
+
+/// A refine call's claim on an existing session: the slot, the lease, and the record as read with
+/// the lease held.
+struct Existing {
+    slot: TurnSlot<Event>,
+    lease: Lease,
+    record: Record,
 }
 
 struct CodexChild {
@@ -154,11 +191,20 @@ struct UsageCache {
 }
 
 impl App {
+    /// The tool host for `--doctor`: no automatic expiry.
     pub fn new(cfg: Config) -> Self {
         let project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
         Self::with_launcher(cfg, Box::new(CodexLauncher), project_dir)
+    }
+
+    /// The tool host for the MCP server: as [`new`](Self::new), with automatic session expiry
+    /// started by the first tool call that brings Codex up (docs/design.md, "Automatic expiry").
+    pub fn serving(cfg: Config) -> Self {
+        let app = Self::new(cfg);
+        app.expiry_due.store(true, Ordering::SeqCst);
+        app
     }
 
     fn with_launcher(
@@ -168,18 +214,22 @@ impl App {
     ) -> Self {
         let path_base = project_dir.clone().unwrap_or_else(|| cfg.cwd.clone());
         let registry = Arc::new(Registry::new(cfg.max_concurrent));
+        let store = Store::new(&cfg.state_dir);
         Self {
             cfg,
             launcher,
             project_dir,
             path_base,
-            shutting_down: AtomicBool::new(false),
+            shutting_down: Arc::default(),
+            expiry_due: AtomicBool::new(false),
             start_lock: Mutex::new(()),
             child: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
             usage: Arc::default(),
             registry,
+            store,
             interrupt_wait: turn::INTERRUPT_WAIT,
+            writer_wait: turn::WRITER_WAIT,
         }
     }
 
@@ -307,7 +357,68 @@ impl App {
             }
         }
         let _ = child.ready.set(Ready { handshake, facts });
+        self.start_expiry(&child);
         Ok(child)
+    }
+
+    /// Start automatic session expiry on `child`, once per server process (docs/design.md,
+    /// "Automatic expiry"). It runs on a thread of its own, bounded to [`EXPIRY_BUDGET`], so it
+    /// never delays or fails the call that brought the child up. It holds the child only weakly,
+    /// and only for each `thread/delete`, so a child retired meanwhile is not kept alive by it.
+    fn start_expiry(&self, child: &Arc<CodexChild>) {
+        let days = self.cfg.session_ttl_days;
+        if !self.expiry_due.swap(false, Ordering::SeqCst) || days == 0 {
+            return;
+        }
+        let codex_home = child
+            .ready
+            .get()
+            .expect("a started child is ready")
+            .handshake
+            .codex_home
+            .clone();
+        let store = self.store.clone();
+        let registry = Arc::clone(&self.registry);
+        let shutting_down = Arc::clone(&self.shutting_down);
+        let weak = Arc::downgrade(child);
+        let spawned = std::thread::Builder::new()
+            .name("session-expiry".to_string())
+            .spawn(move || {
+                let deadline = Instant::now() + EXPIRY_BUDGET;
+                let delete = |thread_id: &str| -> Result<(), RpcError> {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        return Err(RpcError::Io("codex-imagegen is shutting down".to_string()));
+                    }
+                    let Some(child) = weak.upgrade() else {
+                        return Err(RpcError::ChildExited {
+                            detail: "the Codex app-server was replaced".to_string(),
+                        });
+                    };
+                    let now = Instant::now();
+                    let wait = DELETE_DEADLINE.min(deadline.saturating_duration_since(now));
+                    child
+                        .server
+                        .request(
+                            "thread/delete",
+                            json!({"threadId": thread_id}),
+                            now + wait,
+                            None,
+                        )
+                        .map(|_| ())
+                };
+                // A call that returned while its interrupted turn lingers no longer holds the
+                // lease, but the registry still has the session busy.
+                let busy = |name: &str| {
+                    registry
+                        .running()
+                        .iter()
+                        .any(|t| t.session.eq_ignore_ascii_case(name))
+                };
+                cleanup::expire(&store, &codex_home, days, &delete, &busy, deadline);
+            });
+        if let Err(e) = spawned {
+            eprintln!("codex-imagegen: session expiry did not start: {e}");
+        }
     }
 
     /// Take `start_lock`, giving up as soon as the call is cancelled or its budget runs out.
@@ -401,28 +512,78 @@ impl App {
             return mcp::failure_result(&failure);
         }
         let budget = Budget::starting_now(self.cfg.timeout);
-        let slot = match self.claim_session(request.session.as_deref()) {
-            Ok(slot) => slot,
-            // As in ensure_child: a missing CLI is reported as CLI_NOT_FOUND even for a call that
-            // arrives as the server shuts down, because locating it is local and harmless, and it
-            // is the failure the user can act on (the CI contract check depends on it).
-            Err(failure) if failure.code == "SERVER_SHUTTING_DOWN" => {
-                let missing = self.launcher.resolve(&self.cfg).err();
-                return mcp::failure_result(&missing.unwrap_or(failure));
-            }
-            Err(failure) => return mcp::failure_result(&failure),
-        };
+        let mut auto_name = output::auto_session_name;
+        let Claim { slot, lease } =
+            match self.claim_new_session(request.session.as_deref(), &mut auto_name) {
+                Ok(claim) => claim,
+                Err(failure) => return self.claim_failure(failure),
+            };
         let progress = ctx.progress();
         let child = match self.ensure_child(Some(ctx.cancel()), Some(&progress), Some(budget)) {
             Ok(child) => child,
             Err(start) => return mcp::failure_result(&start.failure),
         };
-        let session = slot.session().to_string();
+        let name = slot.session().to_string();
         let ready = child.ready.get().expect("a returned child is ready");
-        let weak = Arc::downgrade(&child);
+        // The record is created by the session's first image, with the home the thread lives in.
+        let record = SessionWriter::new(
+            self.store.clone(),
+            &name,
+            Some(NewSession {
+                codex_home: ready.handshake.codex_home.clone(),
+                model: self.cfg.model.clone(),
+                output_dir: dir.path.clone(),
+            }),
+        );
+        let finished = self.run_turn(
+            &child,
+            ctx,
+            &progress,
+            budget,
+            started,
+            slot,
+            &turn::Request {
+                session: &name,
+                prompt: &request.text,
+                reference_images: &request.reference_images,
+                output_dir: &dir.path,
+                first_version: 1,
+                record: &record,
+                thread: turn::Thread::Start,
+            },
+        );
+        self.finish(child, finished, lease)
+    }
+
+    /// A claim that failed. As in ensure_child, a missing CLI is reported as CLI_NOT_FOUND even
+    /// for a call that arrives as the server shuts down, because locating it is local and
+    /// harmless, and it is the failure the user can act on (the CI contract check depends on it).
+    fn claim_failure(&self, failure: Failure) -> Value {
+        if failure.code == "SERVER_SHUTTING_DOWN" {
+            if let Err(missing) = self.launcher.resolve(&self.cfg) {
+                return mcp::failure_result(&missing);
+            }
+        }
+        mcp::failure_result(&failure)
+    }
+
+    /// Hand the turn to `turn.rs` on `child`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_turn(
+        &self,
+        child: &Arc<CodexChild>,
+        ctx: &CallContext,
+        progress: &Progress,
+        budget: Budget,
+        started: Instant,
+        slot: TurnSlot<Event>,
+        request: &turn::Request<'_>,
+    ) -> turn::Finished {
+        let ready = child.ready.get().expect("a returned child is ready");
+        let weak = Arc::downgrade(child);
         let alive: Liveness = Arc::new(move || weak.upgrade().is_some_and(|c| c.server.is_alive()));
         let usage = || self.usage_summary();
-        let finished = turn::generate(
+        turn::run(
             &turn::Call {
                 cfg: &self.cfg,
                 server: &child.server,
@@ -432,20 +593,23 @@ impl App {
                 },
                 codex_version: ready.handshake.codex_version.as_deref(),
                 cancel: ctx.cancel(),
-                progress: &progress,
+                progress,
                 budget,
                 started,
                 interrupt_wait: self.interrupt_wait,
+                writer_wait: self.writer_wait,
                 usage: &usage,
             },
             slot,
-            &turn::Request {
-                session: &session,
-                prompt: &request.text,
-                reference_images: &request.reference_images,
-                output_dir: &dir.path,
-            },
-        );
+            request,
+        )
+    }
+
+    /// The end of a generate or refine call: release the lease, retire the child if its login no
+    /// longer holds, and render the result.
+    fn finish(&self, child: Arc<CodexChild>, finished: turn::Finished, lease: Lease) -> Value {
+        // Held for the whole call, then released (docs/design.md, "Request flow").
+        drop(lease);
         if finished.auth_expired {
             // The login this child was admitted with no longer holds. Calls still running on it
             // keep it until they finish; the next call starts a fresh child, which re-reads
@@ -463,41 +627,172 @@ impl App {
         }
     }
 
-    /// Claim the call's session in the registry: the name given, or a fresh automatic one, drawn
-    /// again if it happens to be busy.
-    fn claim_session(&self, session: Option<&str>) -> Result<TurnSlot<Event>, Failure> {
+    /// Claim a new session for generate: the name given, or a fresh automatic one from
+    /// `auto_name`, drawn again while the one drawn is taken. Nothing is spent here.
+    ///
+    /// In order: the registry (busy in this process, the concurrency cap, shutdown), the lease
+    /// (busy in another process), then the store, read with the lease held so no other process
+    /// can create the name meanwhile. A name that exists, whatever its case, is SESSION_EXISTS; a
+    /// store that exists but cannot be read is STORE_CORRUPT, because the record written later
+    /// would replace sessions this call cannot see.
+    fn claim_new_session(
+        &self,
+        session: Option<&str>,
+        auto_name: &mut dyn FnMut() -> String,
+    ) -> Result<Claim, Failure> {
         if let Some(name) = session {
-            return self.registry.try_start(name);
+            return self.try_claim(name)?;
         }
         let mut last = None;
         for _ in 0..AUTO_NAME_TRIES {
-            match self.registry.try_start(&output::auto_session_name()) {
-                Err(failure) if failure.code == "SESSION_BUSY" => last = Some(failure),
-                claimed => return claimed,
+            match self.try_claim(&auto_name())? {
+                Ok(claim) => return Ok(claim),
+                Err(taken) => last = Some(taken),
             }
         }
         Err(last.unwrap_or_else(|| errors::internal_error("no session name could be claimed")))
     }
 
-    /// refine: validate and bring Codex up, then stop: sessions arrive in milestone M3.
+    /// One attempt at claiming `name`. The outer error ends the call; the inner one says the name
+    /// is taken (busy here, busy elsewhere, or recorded), which an automatic name retries.
+    fn try_claim(&self, name: &str) -> Result<Result<Claim, Failure>, Failure> {
+        let slot = match self.registry.try_start(name) {
+            Ok(slot) => slot,
+            Err(busy) if busy.code == "SESSION_BUSY" => return Ok(Err(busy)),
+            Err(failure) => return Err(failure),
+        };
+        let lease = match self.store.try_lease(name) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return Ok(Err(errors::session_busy_elsewhere(name))),
+            Err(e) => return Err(e.failure()),
+        };
+        let store = self.store.read().map_err(|e| e.failure())?;
+        if let Some(existing) = store.get(name) {
+            return Ok(Err(errors::session_exists(name, &existing.name)));
+        }
+        Ok(Ok(Claim { slot, lease }))
+    }
+
+    /// refine, in the order of docs/design.md's "Request flow" and "Refine": validate, claim the
+    /// session (the registry, the lease, then its record, read with the lease held), pre-check
+    /// the output folder, pick the edit target, bring Codex up and check that the session's thread
+    /// lives in its home -- nothing is spent on any failure so far -- then resume the thread and
+    /// run the turn.
     fn refine(&self, args: &Value, ctx: &CallContext) -> Value {
+        let started = Instant::now();
         let request = match validate(&REFINE_SPEC, args, &self.path_base) {
             Ok(request) => request,
             Err(failure) => return mcp::failure_result(&failure),
         };
+        let name = request
+            .session
+            .as_deref()
+            .expect("validate requires refine's session");
         let budget = Budget::starting_now(self.cfg.timeout);
-        let progress = ctx.progress();
-        match self.ensure_child(Some(ctx.cancel()), Some(&progress), Some(budget)) {
-            Err(start) => mcp::failure_result(&start.failure),
-            Ok(_) => {
-                eprintln!(
-                    "codex-imagegen: {REFINE} passed validation ({} reference image(s)) and Codex \
-                     is ready, but this build cannot refine sessions yet",
-                    request.reference_images.len()
-                );
-                mcp::failure_result(&errors::refine_not_implemented_yet())
-            }
+        let Existing {
+            slot,
+            lease,
+            record,
+        } = match self.claim_session(name) {
+            Ok(existing) => existing,
+            Err(failure) => return self.claim_failure(failure),
+        };
+        // The call's own folder, else the one the session was created with. A folder given here
+        // applies to this call only [decided].
+        let dir = match request.output_dir.as_deref() {
+            Some(argument) => output::resolve_dir(
+                Some(argument),
+                self.cfg.output_dir.as_deref(),
+                self.project_dir.as_deref(),
+                &self.cfg.cwd,
+                &self.cfg.state_dir,
+            ),
+            None => output::OutputDir {
+                path: record.output_dir.clone(),
+                source: output::DirSource::Recorded,
+            },
+        };
+        if let Err(failure) = output::precheck(&dir) {
+            return mcp::failure_result(&failure);
         }
+        let Some(edit_target) = edit_target(&record) else {
+            return mcp::failure_result(&errors::session_not_resumable(
+                &record.name,
+                "Neither copy of the session's latest image still exists as it was saved (Codex's \
+                 own copy and the published file are both gone, or were changed), so there is \
+                 nothing to edit. Nothing was spent.",
+                surviving_copy(&record).as_deref(),
+            ));
+        };
+        let progress = ctx.progress();
+        let child = match self.ensure_child(Some(ctx.cancel()), Some(&progress), Some(budget)) {
+            Ok(child) => child,
+            Err(start) => return mcp::failure_result(&start.failure),
+        };
+        let home = &child
+            .ready
+            .get()
+            .expect("a returned child is ready")
+            .handshake
+            .codex_home;
+        if !cleanup::same_resolved_path(&record.codex_home, home) {
+            return mcp::failure_result(&errors::session_not_resumable(
+                &record.name,
+                format!(
+                    "The session's Codex thread lives in the Codex home {}, and codex-imagegen \
+                     now runs Codex with the home {} (its --codex-home setting changed). Nothing \
+                     was spent.",
+                    record.codex_home.display(),
+                    home.display()
+                ),
+                Some(&edit_target),
+            ));
+        }
+        let writer = SessionWriter::new(self.store.clone(), &record.name, None);
+        let finished = self.run_turn(
+            &child,
+            ctx,
+            &progress,
+            budget,
+            started,
+            slot,
+            &turn::Request {
+                session: &record.name,
+                prompt: &request.text,
+                reference_images: &request.reference_images,
+                output_dir: &dir.path,
+                first_version: record.next_version,
+                record: &writer,
+                thread: turn::Thread::Resume {
+                    thread_id: &record.thread_id,
+                    edit_target: &edit_target,
+                },
+            },
+        );
+        self.finish(child, finished, lease)
+    }
+
+    /// Claim an existing session for refine, in generate's order: the registry (busy here, the
+    /// cap, shutdown), the lease (busy in another process), then the record, read with the lease
+    /// held. A store that exists but cannot be read is STORE_CORRUPT; a name it does not hold,
+    /// whatever its case, is SESSION_NOT_FOUND. Nothing is spent here.
+    fn claim_session(&self, name: &str) -> Result<Existing, Failure> {
+        let slot = self.registry.try_start(name)?;
+        let lease = match self.store.try_lease(name) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return Err(errors::session_busy_elsewhere(name)),
+            Err(e) => return Err(e.failure()),
+        };
+        let store = self.store.read().map_err(|e| e.failure())?;
+        let record = store
+            .get(name)
+            .cloned()
+            .ok_or_else(|| errors::session_not_found(name))?;
+        Ok(Existing {
+            slot,
+            lease,
+            record,
+        })
     }
 
     /// The usage part of a result's timing line: the Codex agent bucket, plus the image quota
@@ -619,7 +914,10 @@ impl App {
             "running turns: {}",
             running_text(&self.registry.running())
         ));
-        line("sessions: not implemented yet (milestone M3)".to_string());
+        // Local and free; a store that cannot be read is reported here, not failed on.
+        for session_line in sessions_text(&self.store.read_tolerant(), session::now_unix()) {
+            line(session_line);
+        }
         line(format!(
             "settings: --timeout-seconds {}, --max-concurrent {}, --session-ttl-days {}",
             self.cfg.timeout.as_secs(),
@@ -729,6 +1027,8 @@ impl ToolHost for App {
              anything or using quota.\n\n\
              Each image comes back as a 1024px preview plus the absolute path of the \
              full-resolution PNG. A generation takes about a minute. {}\n\n\
+             The user often cannot see tool results, so show them each image: display or send \
+             the file if you have a tool for that, otherwise give them its path.\n\n\
              If a call fails, no image was produced: relay the remediation in the result to the \
              user and stop the image task. Never substitute an image made another way (SVG, \
              ASCII art, HTML or CSS, code that draws one, or another image tool), and never say \
@@ -753,12 +1053,6 @@ impl ToolHost for App {
                 ),
             })
         };
-        let output_dir = json!({
-            "type": "string",
-            "description": "Folder for the full-resolution PNG. Default: the project's \
-                            generated-images folder. A relative path resolves against the \
-                            project directory.",
-        });
         vec![
             json!({
                 "name": GENERATE,
@@ -783,7 +1077,12 @@ impl ToolHost for App {
                                             '_', '-'; up to 64). Omit to have one picked.",
                         },
                         "reference_images": reference_images(5, ""),
-                        "output_dir": output_dir.clone(),
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Folder for the full-resolution PNG. Default: the \
+                                            project's generated-images folder. A relative path \
+                                            resolves against the project directory.",
+                        },
                     },
                     "required": ["prompt"],
                     "additionalProperties": false,
@@ -814,7 +1113,14 @@ impl ToolHost for App {
                             4,
                             " The session's latest image is always the edit target."
                         ),
-                        "output_dir": output_dir,
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Folder for the new version's full-resolution PNG. \
+                                            Default: the folder the session was created with. A \
+                                            folder given here applies to this call only. A \
+                                            relative path resolves against the project \
+                                            directory.",
+                        },
                     },
                     "required": ["session", "feedback"],
                     "additionalProperties": false,
@@ -824,9 +1130,9 @@ impl ToolHost for App {
                 "name": STATUS,
                 "description": "Check codex-imagegen's setup without generating anything or \
                                 using quota: the Codex CLI and its version, sign-in and plan, \
-                                image-generation availability, the agent model, usage windows \
-                                and running work. Use it when a generation fails, or before \
-                                the first one.",
+                                image-generation availability, the agent model, usage windows, \
+                                running work and this project's sessions. Use it when a \
+                                generation fails, or before the first one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -942,6 +1248,132 @@ fn running_text(running: &[crate::registry::RunningTurn]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// The sessions part of `status`: this project's sessions, most recently updated first, and the
+/// last cleanup. `now` is Unix seconds.
+fn sessions_text(store: &session::Tolerant, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut records: Vec<&session::Record> = store.file.sessions.values().collect();
+    records.sort_by(|a, b| b.updated.cmp(&a.updated).then(a.name.cmp(&b.name)));
+    lines.push(match (&store.problem, records.len()) {
+        (Some(problem), 0) => format!(
+            "sessions in this project: unknown -- {problem}; generate and refine refuse to run \
+             until it is fixed (STORE_CORRUPT)"
+        ),
+        (Some(problem), n) => format!(
+            "sessions in this project: {n} still readable -- {problem}; generate and refine \
+             refuse to run until it is fixed (STORE_CORRUPT)"
+        ),
+        (None, 0) => "sessions in this project: none".to_string(),
+        (None, n) => format!("sessions in this project: {n}"),
+    });
+    for record in records.iter().take(STATUS_SESSIONS) {
+        let turns = match record.turns {
+            1 => "1 turn".to_string(),
+            n => format!("{n} turns"),
+        };
+        let latest = record.latest_path().map_or_else(
+            || "no saved image".to_string(),
+            |p| format!("latest {}", p.display()),
+        );
+        lines.push(format!(
+            "  {}: {turns}, {latest}, updated {} ({} ago)",
+            record.name,
+            codex::local_time(record.updated).unwrap_or_else(|| "at an unknown time".to_string()),
+            age_text(now - record.updated)
+        ));
+    }
+    if records.len() > STATUS_SESSIONS {
+        lines.push(format!(
+            "  ... and {} older",
+            records.len() - STATUS_SESSIONS
+        ));
+    }
+    lines.push(format!(
+        "last cleanup: {}",
+        match &store.file.last_cleanup {
+            None => "not run yet".to_string(),
+            Some(cleanup) => cleanup_text(cleanup, now),
+        }
+    ));
+    lines
+}
+
+/// `<when> -- removed N sessions, freed X MB, skipped M (name: why; ...)`.
+fn cleanup_text(cleanup: &session::LastCleanup, now: i64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let removed = match cleanup.removed {
+        1 => "removed 1 session".to_string(),
+        n => format!("removed {n} sessions"),
+    };
+    let mut text = format!(
+        "{} ({} ago) -- {removed}, freed {:.1} MB",
+        codex::local_time(cleanup.at).unwrap_or_else(|| "at an unknown time".to_string()),
+        age_text(now - cleanup.at),
+        cleanup.freed_bytes as f64 / MB
+    );
+    if !cleanup.skipped.is_empty() {
+        let reasons: Vec<String> = cleanup
+            .skipped
+            .iter()
+            .take(5)
+            .map(|s| format!("{}: {}", s.name, crate::jsonrpc::clamp(&s.why, 120)))
+            .collect();
+        let more = cleanup.skipped.len().saturating_sub(reasons.len());
+        text.push_str(&format!(
+            ", skipped {} ({}{})",
+            cleanup.skipped.len(),
+            reasons.join("; "),
+            if more > 0 {
+                format!("; {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    text
+}
+
+/// A rough age: `under a minute`, `12 min`, `5 h`, `3 days`.
+fn age_text(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => "under a minute".to_string(),
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s < 2 * 86_400 => format!("{} h", s / 3600),
+        s => format!("{} days", s / 86_400),
+    }
+}
+
+/// The image a refine edits: the first of Codex's copy and ours of the session's latest image that
+/// still exists with the recorded size (docs/design.md, "Refine"). The two are byte-identical, so
+/// the one size checks either. When the size was never learned (Codex's file could not be read as
+/// the image completed), that the file exists is all there is to check.
+fn edit_target(record: &Record) -> Option<PathBuf> {
+    [&record.last_saved_path, &record.last_output_path]
+        .into_iter()
+        .flatten()
+        .find(|path| has_size(path, record.last_output_bytes))
+        .cloned()
+}
+
+/// A copy of the session's images that still exists, for a remediation that starts a new session
+/// from it: the edit target, else the newest published file still at its recorded size.
+fn surviving_copy(record: &Record) -> Option<PathBuf> {
+    edit_target(record).or_else(|| {
+        record
+            .outputs
+            .iter()
+            .rev()
+            .find(|o| has_size(&o.path, Some(o.bytes)))
+            .map(|o| o.path.clone())
+    })
+}
+
+/// Whether `path` is a file of `bytes` bytes, or of any size when `bytes` is unknown.
+fn has_size(path: &Path, bytes: Option<u64>) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && bytes.is_none_or(|b| meta.len() == b))
 }
 
 /// `Err` with the failure to report when the call has been cancelled or has used up its budget.
@@ -1311,6 +1743,41 @@ pub(crate) mod testing {
         pub fn has_child(&self) -> bool {
             lock(&self.app.child).is_some()
         }
+
+        pub fn store(&self) -> &Store {
+            &self.app.store
+        }
+
+        pub fn state_dir(&self) -> PathBuf {
+            self.app.cfg.state_dir.clone()
+        }
+
+        /// The session record for `name`, read strictly.
+        pub fn record(&self, name: &str) -> Option<session::Record> {
+            self.app.store.read().unwrap().get(name).cloned()
+        }
+
+        /// How long refine retries while another process holds the thread.
+        pub fn set_writer_wait(&mut self, wait: Duration) {
+            self.app.writer_wait = wait;
+        }
+
+        /// Have the first call that brings Codex up start automatic expiry, as a server does.
+        pub fn arm_expiry(&self) {
+            self.app.expiry_due.store(true, Ordering::SeqCst);
+        }
+
+        /// Stop the current child, as a Codex that dies or a server restart does, and wait until
+        /// it is gone: the next call starts a fresh one.
+        pub fn kill_child(&self) {
+            let child = lock(&self.app.child).clone().expect("a child to stop");
+            child.server.shutdown(Duration::from_millis(100));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.server.is_alive() {
+                assert!(Instant::now() < deadline, "the child outlived its shutdown");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     pub fn fixture(codex: FakeCodex) -> Fixture {
@@ -1402,6 +1869,18 @@ mod tests {
         let refine = &tools[1]["inputSchema"];
         assert_eq!(refine["required"], json!(["session", "feedback"]));
         assert_eq!(refine["properties"]["reference_images"]["maxItems"], 4);
+        // Each tool's own default folder: refine's is the session's, not the project's.
+        assert_eq!(
+            generate["properties"]["output_dir"]["description"],
+            "Folder for the full-resolution PNG. Default: the project's generated-images folder. \
+             A relative path resolves against the project directory."
+        );
+        assert_eq!(
+            refine["properties"]["output_dir"]["description"],
+            "Folder for the new version's full-resolution PNG. Default: the folder the session \
+             was created with. A folder given here applies to this call only. A relative path \
+             resolves against the project directory."
+        );
         assert_eq!(tools[2]["inputSchema"]["properties"], json!({}));
 
         for tool in &tools {
@@ -1597,20 +2076,20 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_refine_brings_codex_up_then_says_sessions_are_not_built_yet() {
+    fn a_refine_of_a_session_that_does_not_exist_is_refused_before_codex_starts() {
         let f = fixture(FakeCodex::default());
         let (is_error, text) = call(&f.app, REFINE, json!({"session": "s", "feedback": "bluer"}));
         assert!(is_error);
         assert!(
-            text.starts_with("IMAGE GENERATION FAILED\ncode: INTERNAL_ERROR"),
+            text.starts_with("REQUEST REJECTED\ncode: SESSION_NOT_FOUND"),
             "{text}"
         );
-        assert!(text.contains("milestone M3"), "{text}");
-        assert!(text.contains("ACTION REQUIRED"));
-        // The child is kept for the next call.
-        let (_, again) = call(&f.app, REFINE, json!({"session": "s", "feedback": "bluer"}));
-        assert!(again.contains("milestone M3"));
-        assert_eq!(f.spawns.load(Ordering::SeqCst), 1);
+        assert!(text.contains("No session named 's'"), "{text}");
+        assert!(!text.contains("ACTION REQUIRED"), "{text}");
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "Codex was started");
+        assert!(f.running().is_empty(), "the session was left claimed");
+        // The lease was released too.
+        assert!(f.store().try_lease("s").unwrap().is_some());
     }
 
     #[test]
@@ -1767,7 +2246,8 @@ mod tests {
             "usage: Codex agent usage: weekly 44% (resets 2026-09-",
             "usage: image quota: not reported",
             "running turns: none",
-            "sessions: not implemented yet",
+            "sessions in this project: none",
+            "last cleanup: not run yet",
         ] {
             assert!(
                 report.contains(expected),
@@ -2154,6 +2634,133 @@ mod tests {
             .store(true, Ordering::SeqCst);
         call(&f.app, STATUS, json!({}));
         assert_eq!(f.spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_automatic_name_is_drawn_again_while_the_one_drawn_is_taken() {
+        let f = fixture(FakeCodex::default());
+        // Taken three ways: recorded in the store, busy in this process, leased by another.
+        f.store()
+            .update(|file| {
+                let record: session::Record = serde_json::from_value(json!({
+                    "name": "img-recorded", "thread_id": "t", "codex_home": r"C:\h",
+                    "model": "m", "created": 1, "updated": 1, "turns": 1,
+                    "last_saved_path": null, "last_output_path": null,
+                    "last_output_bytes": null, "output_dir": r"C:\o", "next_version": 2,
+                    "outputs": []}))
+                .unwrap();
+                file.sessions.insert(session::key("img-recorded"), record);
+                Ok(())
+            })
+            .unwrap();
+        let _busy = f.app.registry.try_start("img-busy").unwrap();
+        let _leased = Store::new(&f.state_dir())
+            .try_lease("img-leased")
+            .unwrap()
+            .unwrap();
+
+        let mut drawn = Vec::new();
+        let mut names = ["IMG-RECORDED", "img-busy", "img-leased", "img-free"]
+            .into_iter()
+            .map(str::to_string);
+        let mut next = || {
+            let name = names.next().unwrap_or_else(|| "img-free".to_string());
+            drawn.push(name.clone());
+            name
+        };
+        let claim = f.app.claim_new_session(None, &mut next).ok().unwrap();
+        assert_eq!(claim.slot.session(), "img-free");
+        drop(claim);
+        assert_eq!(drawn.len(), 4);
+
+        // Every draw taken: the last reason is reported, and nothing is left claimed.
+        let mut always_taken = || "img-recorded".to_string();
+        let failure = f
+            .app
+            .claim_new_session(None, &mut always_taken)
+            .err()
+            .unwrap();
+        assert_eq!(failure.code, "SESSION_EXISTS");
+        assert_eq!(f.running().len(), 1, "only the test's own busy slot");
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn status_lists_sessions_newest_first_and_the_last_cleanup() {
+        let now = 1_790_000_000;
+        let record = |name: &str, turns: u32, updated: i64, latest: Option<&str>| {
+            serde_json::from_value::<session::Record>(json!({
+                "name": name, "thread_id": "t", "codex_home": r"C:\h", "model": "m",
+                "created": updated, "updated": updated, "turns": turns,
+                "last_saved_path": null, "last_output_path": latest,
+                "last_output_bytes": 1, "output_dir": r"C:\o", "next_version": 2,
+                "outputs": []}))
+            .unwrap()
+        };
+        let mut file = session::StoreFile::empty();
+        for r in [
+            record("old", 1, now - 3 * 86_400, None),
+            record("Fox", 3, now - 720, Some(r"C:\o\Fox-v3.png")),
+        ] {
+            file.sessions.insert(session::key(&r.name), r);
+        }
+        let lines = sessions_text(
+            &session::Tolerant {
+                file: file.clone(),
+                problem: None,
+            },
+            now,
+        );
+        assert_eq!(lines[0], "sessions in this project: 2");
+        assert!(
+            lines[1].starts_with(r"  Fox: 3 turns, latest C:\o\Fox-v3.png, updated "),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with(" (12 min ago)"), "{lines:?}");
+        assert!(
+            lines[2].starts_with("  old: 1 turn, no saved image, updated "),
+            "{lines:?}"
+        );
+        assert!(lines[2].ends_with(" (3 days ago)"), "{lines:?}");
+        assert_eq!(lines[3], "last cleanup: not run yet");
+
+        file.last_cleanup = Some(session::LastCleanup {
+            at: now - 7200,
+            removed: 2,
+            freed_bytes: 12 * 1024 * 1024,
+            skipped: vec![session::Skipped {
+                name: "busy".to_string(),
+                why: "in use by another process".to_string(),
+            }],
+        });
+        for i in 0..STATUS_SESSIONS {
+            let r = record(&format!("s{i}"), 1, now - 10, None);
+            file.sessions.insert(session::key(&r.name), r);
+        }
+        let lines = sessions_text(
+            &session::Tolerant {
+                file,
+                problem: None,
+            },
+            now,
+        );
+        assert_eq!(
+            lines[0],
+            format!("sessions in this project: {}", STATUS_SESSIONS + 2)
+        );
+        assert_eq!(lines[STATUS_SESSIONS + 1], "  ... and 2 older");
+        let cleanup = lines.last().unwrap();
+        assert!(cleanup.starts_with("last cleanup: "), "{cleanup}");
+        assert!(
+            cleanup.ends_with(
+                "(2 h ago) -- removed 2 sessions, freed 12.0 MB, skipped 1 (busy: in use by \
+                 another process)"
+            ),
+            "{cleanup}"
+        );
+        assert_eq!(age_text(-5), "under a minute");
+        assert_eq!(age_text(3599), "59 min");
+        assert_eq!(age_text(47 * 3600), "47 h");
     }
 
     #[test]

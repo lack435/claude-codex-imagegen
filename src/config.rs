@@ -378,12 +378,46 @@ fn default_state_dir(base: &Path, cwd: &Path) -> PathBuf {
 /// 64-bit FNV-1a. Stable across Rust versions and platforms, unlike `DefaultHasher`, which is
 /// what a key persisted on disk needs.
 pub fn fnv1a64(s: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
+    let mut hash = Fnv1a64::new();
+    hash.update(s.as_bytes());
+    hash.finish()
+}
+
+/// 64-bit FNV-1a over a byte stream, fed in pieces. Also the content fingerprint of a published
+/// image (docs/design.md, "Record fields"): it detects accidental change, such as an edit or a
+/// replacement of the same size, and is no defence against deliberate forgery, since it is not a
+/// keyed MAC [decided].
+#[derive(Clone, Copy, Debug)]
+pub struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    pub fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
     }
-    hash
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    pub fn finish(self) -> u64 {
+        self.0
+    }
+
+    /// The hash of `bytes` in one go.
+    pub fn of(bytes: &[u8]) -> u64 {
+        let mut hash = Self::new();
+        hash.update(bytes);
+        hash.finish()
+    }
+}
+
+impl Default for Fnv1a64 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub const USAGE: &str = r#"codex-imagegen - MCP server that lets Claude Code generate images through a local Codex CLI
@@ -418,8 +452,9 @@ OPTIONS:
 OTHER:
   --doctor                    Check the Codex CLI, login, plan, image capability and model from
                               a terminal (free: no image is generated), then exit.
-  --cleanup                   Sweep expired sessions across all projects, then exit.
-                              (Not implemented yet.)
+  --cleanup                   Remove expired sessions across all projects (their Codex
+                              threads, Codex's image copies and the published files), print
+                              what was removed and skipped, then exit.
   --older-than-days <n>       With --cleanup: override the TTL (0 = every session not in use).
   --help, -h                  Show this help.
   --version, -V               Show the version.
@@ -698,6 +733,13 @@ mod tests {
         assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
+        // Fed in pieces, the stream hashes as it does whole.
+        let mut pieces = Fnv1a64::new();
+        pieces.update(b"foo");
+        pieces.update(b"");
+        pieces.update(b"bar");
+        assert_eq!(pieces.finish(), 0x8594_4171_f739_67e8);
+        assert_eq!(Fnv1a64::of(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]
@@ -717,6 +759,6 @@ mod tests {
         for flag in FLAGS {
             assert!(USAGE.contains(flag), "USAGE does not mention {flag}");
         }
-        assert!(USAGE.contains("Not implemented yet"));
+        assert!(!USAGE.contains("Not implemented yet"));
     }
 }
