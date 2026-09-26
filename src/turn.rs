@@ -439,18 +439,23 @@ pub fn route_notification(
     let Some((thread_id, event)) = parse_notification(method, params) else {
         return;
     };
-    // How every turn ended, whether or not its call is still waiting: the evidence for an
-    // interrupt (V4) and for a turn that outlived its call.
-    if let Event::TurnCompleted {
-        turn_id, status, ..
-    } = &event
-    {
-        eprintln!(
+    // How every turn ended and every image call that failed, whether or not its call is still
+    // waiting: the evidence for an interrupt (V4) and for a turn that outlived its call.
+    match &event {
+        Event::TurnCompleted {
+            turn_id, status, ..
+        } => eprintln!(
             "codex-imagegen: turn {} on thread {} completed: {}",
             crate::jsonrpc::clamp(turn_id, 100),
             crate::jsonrpc::clamp(&thread_id, 100),
             crate::jsonrpc::clamp(status, 40)
-        );
+        ),
+        Event::ImageFailed { failure, .. } => eprintln!(
+            "codex-imagegen: image item failed on thread {}: {}",
+            crate::jsonrpc::clamp(&thread_id, 100),
+            failure_text(failure)
+        ),
+        _ => {}
     }
     send_follow_up(sender, registry.route(&thread_id, event));
 }
@@ -1081,14 +1086,7 @@ fn apply_event(
             deliver(turn, image, request);
             phase("waiting for Codex");
         }
-        Event::ImageFailed { failure, .. } => {
-            eprintln!(
-                "codex-imagegen: session {}: image item failed: {}",
-                request.session,
-                failure_text(&failure)
-            );
-            turn.failures.push(failure);
-        }
+        Event::ImageFailed { failure, .. } => turn.failures.push(failure),
         Event::AgentMessage { text, .. } => {
             if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
                 turn.note = Some(line.trim().to_string());

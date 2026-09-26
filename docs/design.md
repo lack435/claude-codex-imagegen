@@ -1297,9 +1297,10 @@ cancelled request must get no response within 30 s, and `status` must then show 
 the cancel, the time an image takes, there must be no `<session>-v2.png`, the thread's `generated_images` folder
 must hold only the first image, and the record must still have 1 turn and 1 output. From the server's stderr, it
 must have logged `interrupting turn <turn> on thread <thread>` for the session's thread, and `turn <turn> on
-thread <thread> completed: interrupted` for that turn, and no `image item failed` line for the session. The
-server logs how every turn completed, whether or not its call is still waiting, every failed image item, and a
-call that gives up on an interrupt Codex has not confirmed.
+thread <thread> completed: interrupted` for the refine's turn, which is the second of the thread's two
+completions (the first interrupt seen could be the generate's), and no `image item failed on thread <thread>`
+line. The server logs how every turn completed and every failed image item as they arrive, whether or not their
+call is still waiting, and a call that gives up on an interrupt Codex has not confirmed.
 
 With `-CodexHome <dir>` (V5), every server, and the sweep, runs with `--codex-home <dir>`. `status` must report
 that home as dedicated, each session's record must name it, every logged `savedPath` must be under its

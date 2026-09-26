@@ -1181,8 +1181,9 @@ $store = $null
 if ($SpendQuota) {
     $store = Read-Store
     $record = if ($store) { Get-Record $store $session } else { $null }
-    $codexHome = if ($record) { [string](Get-Field $record 'codex_home') } elseif ($CodexHome) { $CodexHome } else { $ambientHome }
-    $imagesRoot = [IO.Path]::GetFullPath((Join-Path $codexHome 'generated_images')).TrimEnd('\') + '\'
+    # Not $codexHome: PowerShell names ignore case, and that would overwrite -CodexHome.
+    $recordHome = if ($record) { [string](Get-Field $record 'codex_home') } elseif ($CodexHome) { $CodexHome } else { $ambientHome }
+    $imagesRoot = [IO.Path]::GetFullPath((Join-Path $recordHome 'generated_images')).TrimEnd('\') + '\'
     $allStderr = (@($servers | ForEach-Object { $_.Stderr } | Where-Object { $_ }) -join "`n")
 
     # The first image's savedPath is the refine's first choice of edit target; our copy of it is
@@ -1218,22 +1219,25 @@ if ($SpendQuota) {
         }
     }
 
-    # V4, from the servers' stderr: the interrupt the server sent for the session's thread, and the
-    # status Codex completed that turn with (turn.rs, send_interrupt and route_notification).
+    # V4, from the servers' stderr (turn.rs, send_interrupt and route_notification). The session's
+    # thread ran two turns, the generate's and then the refine's, and it is the refine's turn, the
+    # second to complete, that must have been interrupted: named by its completion, not by the first
+    # interrupt seen, which could be the generate's.
     if ($script:v4Cancelled) {
         $threadId = if ($record) { [string](Get-Field $record 'thread_id') } else { '' }
-        $interrupts = @(if ($threadId) { [regex]::Matches($allStderr, '(?m)^codex-imagegen: interrupting turn (\S+) on thread ' + [regex]::Escape($threadId) + '\r?$') })
-        Test-Check 'V4: the server sent turn/interrupt for the refine''s turn' ($interrupts.Count -ge 1) "$($interrupts.Count) interrupt(s) for thread $threadId"
-        if ($interrupts.Count -ge 1) {
-            $turnId = $interrupts[0].Groups[1].Value
-            $ended = [regex]::Match($allStderr, '(?m)^codex-imagegen: turn ' + [regex]::Escape($turnId) + ' on thread ' + [regex]::Escape($threadId) + ' completed: (\S+)\r?$')
-            Test-Check 'V4: Codex completed the interrupted turn as interrupted' ($ended.Success -and $ended.Groups[1].Value -eq 'interrupted') $(
-                if ($ended.Success) { "turn $turnId completed: $($ended.Groups[1].Value)" } else { "no turn/completed logged for turn $turnId" })
+        $completions = @(if ($threadId) { [regex]::Matches($allStderr, '(?m)^codex-imagegen: turn (\S+) on thread ' + [regex]::Escape($threadId) + ' completed: (\S+)\r?$') })
+        Test-Check 'V4: Codex completed the session''s two turns' ($completions.Count -eq 2) "$($completions.Count) turn/completed line(s) for thread $threadId"
+        if ($completions.Count -eq 2) {
+            $turnId = $completions[1].Groups[1].Value
+            $turnStatus = $completions[1].Groups[2].Value
+            $sent = $allStderr -match ('(?m)^codex-imagegen: interrupting turn ' + [regex]::Escape($turnId) + ' on thread ' + [regex]::Escape($threadId) + '\r?$')
+            Test-Check 'V4: the server sent turn/interrupt for the refine''s turn' $sent "turn $turnId"
+            Test-Check 'V4: Codex completed the refine''s turn as interrupted' ($turnStatus -eq 'interrupted') "turn $turnId completed: $turnStatus"
         }
-        # The session's only image item is the first image, completed: a cut-short call must send
-        # no item/completed, failed or not.
-        $itemFailures = @([regex]::Matches($allStderr, '(?m)^codex-imagegen: session ' + [regex]::Escape($session) + ': image item failed: .*$') | ForEach-Object { $_.Value.Trim() })
-        Test-Check 'V4: Codex sent no failed image item for the cut-short call' ($itemFailures.Count -eq 0) ($itemFailures -join ' | ')
+        # The thread's only image item is the first image, completed: a cut-short call must send
+        # no item/completed, failed or not. Logged as it arrives, even after its call gave up.
+        $itemFailures = @(if ($threadId) { [regex]::Matches($allStderr, '(?m)^codex-imagegen: image item failed on thread ' + [regex]::Escape($threadId) + ': .*$') | ForEach-Object { $_.Value.Trim() } })
+        Test-Check 'V4: Codex sent no failed image item for the cut-short call' ($threadId -and $itemFailures.Count -eq 0) ($itemFailures -join ' | ')
     }
 
     # V5: every session the run made is recorded against the dedicated home, every image Codex

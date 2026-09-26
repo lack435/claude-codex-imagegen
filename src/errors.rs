@@ -170,10 +170,12 @@ fn login_instructions(codex_home: Option<&Path>) -> String {
              sign that home in. In PowerShell:\n\n\
              \x20 $env:CODEX_HOME = '{quoted}'; codex login --device-auth; Remove-Item \
              Env:CODEX_HOME\n\n\
-             (in Git Bash: CODEX_HOME='{home}' codex login --device-auth)\n\n\
+             (in Git Bash: CODEX_HOME='{bash}' codex login --device-auth)\n\n\
              Sign in with the ChatGPT account whose plan should pay for the images.",
             home = home.display(),
-            quoted = home.display().to_string().replace('\'', "''")
+            // A quote inside single quotes: doubled for PowerShell, closed and escaped for Bash.
+            quoted = home.display().to_string().replace('\'', "''"),
+            bash = home.display().to_string().replace('\'', r"'\''")
         ),
     }
 }
@@ -990,9 +992,14 @@ mod tests {
             .contains(r"CODEX_HOME='D:\codex-home' codex login --device-auth"));
         let ambient = not_authenticated(None);
         assert!(!ambient.remediation.contains("CODEX_HOME"));
-        // A quote in the path is doubled inside PowerShell's single quotes.
+        // A quote in the path, inside single quotes: doubled for PowerShell, escaped for Bash.
         let quoted = not_authenticated(Some(Path::new(r"D:\o'neil")));
-        assert!(quoted.remediation.contains(r"'D:\o''neil'"));
+        assert!(quoted
+            .remediation
+            .contains(r"$env:CODEX_HOME = 'D:\o''neil';"));
+        assert!(quoted
+            .remediation
+            .contains(r"CODEX_HOME='D:\o'\''neil' codex login"));
         // The plan refusal signs in the same home.
         let plan = imagegen_unavailable_on_plan("free", Some(Path::new(r"D:\codex-home")));
         assert!(plan
