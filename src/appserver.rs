@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::value::RawValue;
@@ -126,12 +126,20 @@ struct Shared {
     /// The child process, for its exit status. `None` for a test transport.
     child: Mutex<Option<Child>>,
     next_id: AtomicU64,
+    /// A test transport's stand-in for its process having exited, set by the fake while its
+    /// output is still open: a real child's exit can be seen before its last lines are read.
+    #[cfg(test)]
+    process_exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
 struct Table {
     /// Requests waiting for a reply, by request key.
     pending: HashMap<String, SyncSender<Reply>>,
+    /// Detached requests (see [`AppServer::detached_sender`]) whose reply has not arrived, by request
+    /// key, with their method: so the reply is recognised, and a refusal logged, rather than
+    /// reported as a late reply to a request that gave up.
+    detached: HashMap<String, String>,
     /// Set, with the failure detail, once the child's output has closed. From then on every
     /// request fails at once instead of waiting out its deadline.
     exited: Option<String>,
@@ -202,15 +210,27 @@ impl AppServer {
         *lock(&self.shared.handler) = Some(handler);
     }
 
-    /// True until the child's output closes or the process exits.
+    /// True until the child's output closes or the process exits. The process can be seen to exit
+    /// before the reader has read its last lines; [`exit_detail`](Self::exit_detail) is set only
+    /// once every line has been routed.
     pub fn is_alive(&self) -> bool {
         if lock(&self.shared.table).exited.is_some() {
+            return false;
+        }
+        #[cfg(test)]
+        if self.shared.process_exited.load(Ordering::SeqCst) {
             return false;
         }
         match lock(&self.shared.child).as_mut() {
             Some(child) => matches!(child.try_wait(), Ok(None)),
             None => true,
         }
+    }
+
+    /// Why the child is gone, once its output has closed and every line it wrote has been routed:
+    /// the exit status and the tail of its stderr. `None` until then.
+    pub fn exit_detail(&self) -> Option<String> {
+        lock(&self.shared.table).exited.clone()
     }
 
     /// Send a request and wait for its reply, until `deadline` or until `cancel` is cancelled.
@@ -306,15 +326,34 @@ impl AppServer {
             })
     }
 
-    /// Stop the child: end its input (the writer thread writes what is still queued, then closes
-    /// the pipe; an idle app-server exits within about 0.07 s of that [verified]), wait up to
-    /// `grace` for it to exit, then terminate its job, which takes every descendant with it.
+    /// A handle for requests whose reply nobody waits for: `turn/interrupt` from a cancel hook,
+    /// which runs on the MCP reader thread, and `thread/unsubscribe`, whose answer changes nothing
+    /// here. Sending only queues the line, so it never blocks, and a reply that reports an error is
+    /// logged. It works from anywhere, including this client's own notification handler on the
+    /// reader thread, and holds the client weakly, so a handler that keeps one does not keep the
+    /// client (and with it the child's job) alive.
+    pub fn detached_sender(&self) -> DetachedSender {
+        DetachedSender {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
+    /// End the child's input: the writer thread writes what is still queued, then closes the pipe.
+    /// Never waits. The first step of [`shutdown`](Self::shutdown), for a caller that ends several
+    /// children's input before waiting on any of them.
+    pub fn end_input(&self) {
+        lock(&self.shared.outbox).take();
+    }
+
+    /// Stop the child: end its input (an idle app-server exits within about 0.07 s of that
+    /// [verified]), wait up to `grace` for it to exit, then terminate its job, which takes every
+    /// descendant with it.
     ///
     /// Never waits on the pipe. If a write is stuck because the child stopped reading, the child
     /// cannot see its input end and the grace runs out; the job kill then fails the stuck write,
     /// which ends the writer thread. Safe to call more than once, and from any thread.
     pub fn shutdown(&self, grace: Duration) {
-        lock(&self.shared.outbox).take();
+        self.end_input();
         let Some(job) = &self.job else {
             return;
         };
@@ -332,8 +371,8 @@ impl AppServer {
             }
             if Instant::now() >= deadline {
                 eprintln!(
-                    "codex-imagegen: the Codex app-server did not exit within {} ms of its input \
-                     ending; terminating it",
+                    "codex-imagegen: the Codex app-server did not exit within its {} ms grace \
+                     after its input ended; terminating it",
                     grace.as_millis()
                 );
                 job.terminate();
@@ -364,11 +403,29 @@ pub fn command(spec: &SpawnSpec) -> Command {
     cmd
 }
 
+/// Sends detached requests to one child (see [`AppServer::detached_sender`]).
+#[derive(Clone)]
+pub struct DetachedSender {
+    shared: Weak<Shared>,
+}
+
+impl DetachedSender {
+    /// Queue the request, or fail with `ChildExited` once the child or the client itself is gone.
+    pub fn send(&self, method: &str, params: Value) -> Result<(), RpcError> {
+        match self.shared.upgrade() {
+            Some(shared) => shared.send_detached(method, params),
+            None => Err(RpcError::ChildExited {
+                detail: "the app-server client was closed".to_string(),
+            }),
+        }
+    }
+}
+
 impl Drop for AppServer {
     fn drop(&mut self) {
         // Ending the child's input first gives it a chance to exit on its own; dropping the job
         // right after kills whatever is left either way. Neither waits.
-        lock(&self.shared.outbox).take();
+        self.end_input();
     }
 }
 
@@ -381,6 +438,8 @@ impl Shared {
             stderr,
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
+            #[cfg(test)]
+            process_exited: Arc::default(),
         })
     }
 
@@ -396,6 +455,31 @@ impl Shared {
                 "the app-server's stdin is closed",
             )),
         }
+    }
+
+    fn send_detached(&self, method: &str, params: Value) -> Result<(), RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let key = jsonrpc::request_key(&json!(id));
+        {
+            let mut table = lock(&self.table);
+            if let Some(detail) = &table.exited {
+                return Err(RpcError::ChildExited {
+                    detail: detail.clone(),
+                });
+            }
+            table.detached.insert(key.clone(), method.to_string());
+        }
+        let message = json!({"id": id, "method": method, "params": params});
+        self.send(&message).map_err(|e| {
+            let mut table = lock(&self.table);
+            table.detached.remove(&key);
+            match &table.exited {
+                Some(detail) => RpcError::ChildExited {
+                    detail: detail.clone(),
+                },
+                None => RpcError::Io(format!("could not send {method}: {e}")),
+            }
+        })
     }
 
     /// Route one line from the child.
@@ -437,13 +521,31 @@ impl Shared {
         let Some(key) = jsonrpc::request_key_raw(id) else {
             return;
         };
-        let Some(waiter) = lock(&self.table).pending.remove(&key) else {
-            // Routine after a deadline or a cancellation: the request stopped waiting and removed
-            // its entry, and this is its reply arriving late.
-            eprintln!(
-                "codex-imagegen: dropped a late app-server reply to request {}",
-                jsonrpc::clamp(&key, 40)
-            );
+        let (waiter, detached) = {
+            let mut table = lock(&self.table);
+            match table.pending.remove(&key) {
+                Some(waiter) => (Some(waiter), None),
+                None => (None, table.detached.remove(&key)),
+            }
+        };
+        let Some(waiter) = waiter else {
+            match detached {
+                // Nobody waits for these; only a refusal is worth a line in the log.
+                Some(method) => {
+                    if let Some(error) = envelope.error {
+                        eprintln!(
+                            "codex-imagegen: the app-server refused {method}: {}",
+                            remote_error(error)
+                        );
+                    }
+                }
+                // Routine after a deadline or a cancellation: the request stopped waiting and
+                // removed its entry, and this is its reply arriving late.
+                None => eprintln!(
+                    "codex-imagegen: dropped a late app-server reply to request {}",
+                    jsonrpc::clamp(&key, 40)
+                ),
+            }
             return;
         };
         let reply = match (envelope.error, envelope.result) {
@@ -493,6 +595,7 @@ impl Shared {
         let waiting: Vec<SyncSender<Reply>> = {
             let mut table = lock(&self.table);
             table.exited = Some(detail.clone());
+            table.detached.clear();
             table.pending.drain().map(|(_, tx)| tx).collect()
         };
         for tx in waiting {
@@ -718,9 +821,12 @@ pub mod fake {
     use std::sync::mpsc::{Receiver, Sender};
 
     /// What the fake server sends back. Cloneable, so a script can hand it to another thread and
-    /// reply later.
+    /// reply later. Every clone shares one output, so any of them can close it.
     #[derive(Clone)]
-    pub struct Outbox(Sender<Vec<u8>>);
+    pub struct Outbox {
+        output: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
+        process_exited: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl Outbox {
         pub fn send(&self, message: Value) {
@@ -729,7 +835,23 @@ pub mod fake {
 
         /// Send one line exactly as given, for whitespace and malformed-input cases.
         pub fn send_raw(&self, line: &str) {
-            let _ = self.0.send(format!("{line}\n").into_bytes());
+            if let Some(output) = lock(&self.output).as_ref() {
+                let _ = output.send(format!("{line}\n").into_bytes());
+            }
+        }
+
+        /// Close the server's output, as a child that exits does, from whichever thread holds
+        /// this.
+        pub fn close(&self) {
+            lock(&self.output).take();
+        }
+
+        /// Make the process count as exited while its output stays open, until [`close`]: the
+        /// order in which a real child's exit can be seen, with its last lines still unread.
+        ///
+        /// [`close`]: Self::close
+        pub fn exit_process(&self) {
+            self.process_exited.store(true, Ordering::SeqCst);
         }
     }
 
@@ -752,8 +874,17 @@ pub mod fake {
     ) -> AppServer {
         let (to_server, server_in) = mpsc::channel::<Vec<u8>>();
         let (server_out, from_server) = mpsc::channel::<Vec<u8>>();
+        let server = AppServer::from_transport(
+            BufReader::new(ChannelReader::new(from_server)),
+            ChannelWriter(to_server),
+            max_line_bytes,
+        );
+        let process_exited = Arc::clone(&server.shared.process_exited);
         std::thread::spawn(move || {
-            let outbox = Outbox(server_out);
+            let outbox = Outbox {
+                output: Arc::new(Mutex::new(Some(server_out))),
+                process_exited,
+            };
             let mut input = BufReader::new(ChannelReader::new(server_in));
             let mut line = String::new();
             loop {
@@ -769,14 +900,11 @@ pub mod fake {
                     break;
                 }
             }
-            // Dropping the outbox here closes the client's input, unless the script kept a
-            // clone to reply from another thread.
+            // The child is gone, so its output closes, even if the script kept a clone to reply
+            // from another thread.
+            outbox.close();
         });
-        AppServer::from_transport(
-            BufReader::new(ChannelReader::new(from_server)),
-            ChannelWriter(to_server),
-            max_line_bytes,
-        )
+        server
     }
 
     /// Bytes written here come out of the paired [`ChannelReader`].
@@ -1005,6 +1133,70 @@ mod tests {
                 ("thread/closed".to_string(), "null".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_detached_request_is_only_queued_and_its_reply_or_refusal_is_recognised() {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let server = {
+            let seen = Arc::clone(&seen);
+            connect(move |message, out| {
+                seen.lock().unwrap().push(message.clone());
+                match message["method"].as_str() {
+                    Some("turn/interrupt") => out.send(json!({"id": message["id"],
+                        "error": {"code": -32600, "message": "no such turn"}})),
+                    Some("thread/unsubscribe") => {
+                        out.send(json!({"id": message["id"], "result": {"status": "unsubscribed"}}))
+                    }
+                    _ => {
+                        echo(message, out);
+                    }
+                }
+                Flow::Continue
+            })
+        };
+        let sender = server.detached_sender();
+        sender
+            .send("turn/interrupt", json!({"threadId": "t", "turnId": "u"}))
+            .unwrap();
+        sender
+            .send("thread/unsubscribe", json!({"threadId": "t"}))
+            .unwrap();
+        // Answered in order, so by this reply both detached replies have been routed: recognised,
+        // not mistaken for this request's, and nothing is left waiting.
+        let reply = server.request("x", json!({}), soon(), None).unwrap();
+        assert_eq!(reply["method"], "x");
+        let table = lock(&server.shared.table);
+        assert!(table.pending.is_empty());
+        assert!(table.detached.is_empty(), "{:?}", table.detached);
+        drop(table);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0]["method"], "turn/interrupt");
+        assert_eq!(seen[0]["params"], json!({"threadId": "t", "turnId": "u"}));
+        assert!(seen[0]["id"].is_u64());
+        assert_eq!(seen[1]["method"], "thread/unsubscribe");
+        assert_ne!(seen[0]["id"], seen[1]["id"]);
+
+        // A sender that outlives its client fails rather than sending: the input is closed, or,
+        // once the reader has seen the output close too, the child counts as exited.
+        drop(server);
+        let err = sender.send("turn/interrupt", json!({}));
+        assert!(
+            matches!(err, Err(RpcError::ChildExited { .. } | RpcError::Io(_))),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_detached_request_to_a_child_that_exited_fails_at_once() {
+        let server = connect(|_, _| Flow::Exit);
+        let _ = server.request("initialize", json!({}), soon(), None);
+        assert!(server.exit_detail().is_some());
+        let sender = server.detached_sender();
+        assert!(matches!(
+            sender.send("thread/unsubscribe", json!({"threadId": "t"})),
+            Err(RpcError::ChildExited { .. })
+        ));
     }
 
     #[test]

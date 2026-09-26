@@ -2,8 +2,18 @@
 
 Status: approved by the owner, 2026-09-25 (revision 3: adversarial review applied; cleanup added). M0 (repo
 scaffold) is in place. M1 is implemented: the MCP layer, `status` and `--doctor`, spawn, handshake and preflight,
-and the CI contract check. `generate` and `refine` validate their arguments and run preflight, then return
-`INTERNAL_ERROR` until M2. V0, V7 and V8 are not yet run.
+and the CI contract check. M2 is implemented: `generate` runs end to end (pre-check, turn, copy and preview on
+each image, progress, cancellation and deadlines, errors), `status` lists running turns, and `smoke.ps1` has its
+first version. M2 has no session store or leases (M3), so `generate` does not yet refuse an existing name with
+`SESSION_EXISTS`, and `refine` still validates its arguments, runs preflight and returns `INTERNAL_ERROR`. Not
+built yet either: recycling the shared child after a missed per-request deadline (see Deadlines). The
+unit tests use a scripted fake app-server. The first paid `smoke.ps1` run against real Codex (2026-09-25) passed
+V2 (the generate part) and V3, and its trace showed the sub-agent and `request_user_input` tools still offered to
+the agent model. The spawn line now switches those off, and the second paid run passed V1, V2 (generate) and V3
+(34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
+it accurately, both through `claude -p` and in the desktop app, where it appears in the expanded tool row. The
+desktop app shows no progress line; the terminal renderer draws one [verified: bundle]. The TaskStop part of V0 was
+not run.
 
 Claims carry one of three tags:
 
@@ -242,13 +252,25 @@ content: [
   {type:"text", text:
      "session: fox-watercolor   version: 2\n" +
      "image: C:\\proj\\generated-images\\fox-watercolor-v2.png  (1312x1199, 2.6 MB PNG)\n" +
-     "preview above is a 1024px JPEG; the file is the full-resolution original\n" +
+     "the preview is a 1024px JPEG; the file is the full-resolution original\n" +
      "codex prompt: <revisedPrompt>\n" +
      "codex note: <Codex's closing line, quoted, untrusted>\n" +
      "took 38.1 s; Codex agent usage: weekly 44% (resets 2026-10-01 14:17)\n" +
      "output files are scratch and expire after 7 days idle; move keepers into the project"}
 ]
 ```
+
+Formatting details [decided]:
+
+- `codex prompt` is JSON-quoted, so a newline in it cannot read as the next line of the result. It is compared
+  with the prompt sent ignoring whitespace at either end: the tags put the prompt on lines of its own, so where
+  it starts and ends is the agent's reading of the layout.
+- `codex note` is the last line of the agent's last message, JSON-quoted and bounded, followed by "(Codex's
+  closing line, untrusted)".
+- The timing line adds `image quota: …` after the agent usage when Codex has reported an `image_gen` bucket.
+- If Codex makes several images in one turn, each gets its own version and preview, in order; the first line
+  reads `versions: 1, 2`, each image line is labelled `image 1 of 2:`, and a warning says so.
+- If the copy failed, the first line reads `version: none published (see the warnings)`.
 
 A result returns success whenever at least one image completed, whatever happened afterwards [decided].
 Anything unusual is added as a `warning:` line:
@@ -289,6 +311,9 @@ Claude ── tools/call generate|refine
   `config/read`, `thread/start` and `turn/start`. `thread/resume` gets whatever remains of the call's budget.
 - A missed deadline returns `APP_SERVER_FAILED`, naming the method, or `TIMEOUT` once the overall budget is
   gone.
+- When the budget runs out mid-turn, the wait of up to about 15 s for the interrupted turn to complete (see
+  [After `turn/interrupt`](#after-turninterrupt)) comes on top of it [decided]. That wait is what lets an image
+  that finishes in those seconds still be kept, and a turn that does not confirm leave its session busy.
 - The shared child is recycled only when it has no other turns running, or when a cheap liveness call
   (`config/read`) also misses a short deadline.
 
@@ -349,20 +374,47 @@ server.
 codex app-server --listen stdio://
   --enable image_generation
   --disable apps --disable plugins --disable hooks --disable memories --disable multi_agent
-  --disable goals --disable shell_tool --disable tool_suggest --disable skill_search
-  --disable browser_use --disable computer_use --disable in_app_browser
+  --disable multi_agent_v2 --disable goals --disable shell_tool --disable tool_suggest
+  --disable skill_search --disable browser_use --disable computer_use --disable in_app_browser
   -c notify=[] -c skills.bundled.enabled=false -c skills.include_instructions=false
+  -c agents.enabled=false -c tools.experimental_request_user_input.enabled=false
   -c web_search="disabled" -c approvals_reviewer="user" -c windows.sandbox="unelevated"
   -c thread_unload_delay_secs=5
 ```
 
 **What has been checked.**
 
-- Every switch was accepted and shows up in `config/read` [verified].
+- Every switch was accepted, and `config/read` shows it in effect [verified]. One is shown differently:
+  `config/read`'s `config` carries only `web_search` under `tools` (app-server-protocol `ToolsV2`), so
+  `tools.experimental_request_user_input.enabled` appears only in the reply's `origins`, as taken from the
+  session-flags layer, which holds our `-c` [verified: `config/read` on 0.156.0; source].
 - For apps, plugins, bundled skills, notify and MCP servers, the effect also shows in `skills/list`,
   `plugin/list` and `mcpServerStatus/list` [verified].
-- For the rest, and for the image tool still being offered through `exec` under these switches, the effect is
-  known from source only [assumed: V1].
+- The first paid smoke run (2026-09-25, before the three switches below were added) recorded the tools the
+  agent model was offered [verified: rollout trace]:
+  - `exec`, with `apply_patch`, `view_image`, `clock__curr_time` and `image_gen__imagegen` nested in it;
+  - `wait` (code mode's wait on a running `exec` cell), `request_user_input` and `request_user_input_async`;
+  - `sleep`, in a `clock` namespace;
+  - six sub-agent tools in a `collaboration` namespace: `spawn_agent`, `send_message`, `followup_task`,
+    `wait_agent`, `list_agents` and `interrupt_agent`;
+  - no shell, stdin, web search, browser, computer-use, skill, tool-suggest or MCP tool.
+- **Sub-agent tools.** `--disable multi_agent` does not remove them. The model catalogue gives `gpt-6-astra`
+  MultiAgentV2, which applies unless `agents.enabled = false`, and an enabled `multi_agent_v2` feature
+  outranks even that [verified: source, `core/src/config/mod.rs` `multi_agent_version_override`]. So both are
+  switched off: under `agents.enabled=false` alone, a user's `[features.multi_agent_v2] enabled = true` stayed
+  in effect, and `--disable multi_agent_v2` turned it off [verified: `config/read` on a test home].
+- **`request_user_input`** is offered unless `tools.experimental_request_user_input.enabled = false`
+  [verified: source, `core/src/config/mod.rs`, `core/src/tools/spec_plan.rs`].
+- **`request_user_input_async` stays.** It is offered because the catalogue lists `send_user_message_async` for
+  `gpt-6-astra`, and no config switch removes it. It only records an agent message holding the questions and
+  returns at once; it never waits for an answer and sends no request to this server [verified: source,
+  `core/src/tools/handlers/request_user_input_async.rs`] [decided: accepted].
+- **`apply_patch` stays.** It is nested in `exec` for every model while the thread has an environment, and the
+  environment cannot go without breaking `referenced_image_paths`. Under the read-only sandbox with
+  `approvalPolicy: never`, Codex rejects every patch [verified: source, `core/src/safety.rs`] [decided: accepted].
+  `view_image` and the clock tools are harmless and allowed.
+- That the sub-agent and `request_user_input` tools are gone from the offered list under the new switches is
+  known from source and `config/read` only [assumed: V1].
 - `--enable image_generation` guards against a user config that turns the tool off.
 
 **Environment.**
@@ -401,8 +453,11 @@ Preflight runs **once per child instance**, and again after every spawn or respa
    `MODEL_UNAVAILABLE`. If it is present but hidden, `status` notes it, since a hidden model is often being
    retired.
 4. **`config/read`**, with `cwd` set to the work directory. The effective config must show every spawn switch
-   in effect: `features.image_generation` true, each switched-off feature false, `web_search`, `notify`,
-   `skills.*`, `approvals_reviewer` and `windows.sandbox` as set. A legacy alias of a switched-off feature
+   in effect: `features.image_generation` true, each switched-off feature false (a feature that also takes
+   settings may read as a table, which counts when its `enabled` is false [verified: `config/read`]),
+   `web_search`, `notify`, `skills.*`, `agents.enabled`, `approvals_reviewer` and `windows.sandbox` as set.
+   `tools.experimental_request_user_input.enabled`, which `config` leaves out, must have the session-flags
+   layer (our `-c`) as its entry in the reply's `origins`. A legacy alias of a switched-off feature
    (`connectors`, `memory_tool`, `collab`, `codex_hooks`) must not be true. Anything else fails with
    `IMAGEGEN_UNAVAILABLE`, naming the setting. Our switches outrank every layer except legacy managed config
    (`managed_config.toml`) [verified: source, `config/src/config_layer_source.rs`]. So this catches that
@@ -419,8 +474,12 @@ Preflight runs **once per child instance**, and again after every spawn or respa
 spawns a fresh one, and that one re-reads `auth.json`. So a retry after `codex login` works without
 restarting Claude Code [decided].
 
-**When a turn fails with `AUTH_EXPIRED`.** The child is marked for recycling and closed once no turns are
-running on it.
+**When a turn fails with `AUTH_EXPIRED`.** The child is marked for recycling: the next call starts a fresh one,
+and this one is closed once no call is using it. Each call running a turn holds the child, so it is closed at
+once when nothing else holds it, and otherwise when the last such call finishes, which drops it and with it the
+job [decided]. A lingering turn on it cannot complete once it is closed, so its session is freed. Until it is
+closed, the server keeps a weak reference to it, so shutdown still reaches it and its turns (see
+[Lifecycle](#lifecycle)). The same holds for a child replaced because `account/updated` reported another login.
 
 **`account/updated`.** An `authMode` other than `chatgpt` invalidates the cached preflight.
 
@@ -430,7 +489,11 @@ running on it.
   `config:{mcp_servers:{<each name present>:{enabled:false}}}`. The map is rebuilt from that read every time,
   so a server the user adds mid-session never loads. A server that was removed never leaves a stale entry
   behind, which would otherwise fail every later config build [verified: source].
-- **If the load fails** with a config error mentioning `mcp_servers`, re-read the config and retry once.
+- **The same read re-checks the spawn switches** (preflight step 4) and fails with `IMAGEGEN_UNAVAILABLE`
+  naming the setting [decided]: the configuration can change under a running child, and a thread started now
+  reads it now.
+- **If `thread/start` fails** with a config error mentioning `mcp_servers`, re-read the config, rebuild the map
+  and retry once.
 - **`thread/start`:**
   - `model`: `gpt-6-astra`, full id [decided]
   - `cwd`: the work directory
@@ -467,24 +530,39 @@ Measured: about 1 ms and under 1 KB allocated per 3.8 MB line, against about 1.3
 
 - Replies are matched by id. They can arrive out of order [verified].
 - Notifications are routed by `threadId` to the running turn's handler.
+- Codex reports MCP server startups right behind the `thread/start` reply [verified: smoke log], which can be
+  before the call has had that reply and registered its thread. Those notifications (the canary's) are held
+  briefly, a bounded few, and handed to the call when it registers the thread, so none is lost in the gap.
 - The reader thread only routes. Copies and previews run on the call's own thread, so one session's 3 MB copy
   never stalls another session's messages.
+- `turn/interrupt` and `thread/unsubscribe` are sent without waiting for their replies: the interrupt from a
+  cancel hook on the MCP reader thread, or from the notification handler on the app-server reader thread, neither
+  of which may wait. A reply that reports an error is logged.
 
 **Image items.**
 
 - Check `status` before reading anything else.
 - Only a `completed` item with a `savedPath` is copied.
 - A `completed` item with no `savedPath` is re-parsed with `result: Cow<str>`, and the base64 is decoded
-  instead.
+  instead. The result reads the same either way, so each completed item logs one stderr line naming its
+  `savedPath`, or saying it had none; `smoke.ps1` reads it for V1.
+- A `completed` item with neither a `savedPath` nor decodable image data leaves no image anywhere, so it counts
+  as a failed item [decided].
 - A `failed` item is handled under [Errors](#errors).
+- A notification about one of our threads that cannot be parsed is a protocol anomaly. If no image completed and
+  nothing else explains it, the call fails with `APP_SERVER_FAILED`, naming the Codex version.
 
 **Server-to-client requests.** These include approvals, `requestUserInput`, elicitation and
 `chatgptAuthTokens/refresh`. Each is answered at once with JSON-RPC error `-32601` and logged, so a turn can
 never hang [decided].
 
-**Canary.** `mcpServer/startupStatus/updated` is deliberately *not* opted out. If it reports on one of our
-threads a server that is not in the disabled map, the turn is interrupted and the call fails with
-`APP_SERVER_FAILED` ("isolation breach: MCP server <name> started").
+**Canary.** `mcpServer/startupStatus/updated` is deliberately *not* opted out. A disabled server reports no
+startup status at all [verified: source, `codex-mcp` `connection_manager.rs` starts only enabled servers], so any
+report on one of our threads means a server is starting there, whether or not it is in the disabled map (a
+`disabled` status is let through, in case a later Codex reports one). The call then fails with
+`APP_SERVER_FAILED` ("isolation breach: MCP server <name> started"). The report usually arrives before the turn
+starts; the call checks for it just before `turn/start`, and then starts no turn at all, so the agent model never
+sees the server's tools. A report that comes later interrupts the turn.
 
 **Usage updates.** `account/rateLimits/updated` is merged into the usage cache under its `limitId` (see
 [Usage display](#usage-display)).
@@ -492,14 +570,21 @@ threads a server that is not in the disabled map, the turn is interrupted and th
 ### Lifecycle
 
 - **Child death.** In-flight turns fail with `APP_SERVER_FAILED`, unless an image already completed (see the
-  success rule). The next call respawns the child and re-runs preflight.
+  success rule). The next call respawns the child and re-runs preflight. The exit can be seen before the
+  reader has read the child's last lines, an image's `item/completed` among them, so a call that finds the
+  child dead first waits, bounded to about 2.5 s, for the reader to reach the end of the output (it marks
+  that only after routing every line), then handles every event already routed to it [decided].
 - **Our stdin closing.** When our stdin closes and we are given time to exit:
-  1. interrupt running turns;
+  1. interrupt running turns, each through the child running it. Besides the current child, that can be a
+     retired one (see [When a turn fails with `AUTH_EXPIRED`](#handshake-and-preflight)) that a call still
+     holds; each child carries an id, and the registry records which child each turn runs on;
   2. let copies already in progress finish;
-  3. end the child's input: the writer thread writes what is still queued, then closes the pipe (an idle child
-     exits in 0.05–0.07 s [verified]);
-  4. wait up to 5 s in total;
-  5. drop the job. This step never waits on the pipe, so a child that stopped reading is killed on time.
+  3. end the input of every live child, the current one and each retired one: the writer thread writes what is
+     still queued, then closes the pipe (an idle child exits in 0.05–0.07 s [verified]);
+  4. wait up to 5 s in total, one grace shared by all of them;
+  5. drop the jobs. This step never waits on the pipe, so a child that stopped reading is killed on time. A call
+     whose child is gone returns soon after, bounded by the ~2.5 s exit settle (see Child death), so no call
+     outlives the grace by more than that.
 
   This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
   straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:
@@ -576,7 +661,10 @@ created in it and deleted. Any failure is `BAD_REQUEST`, naming the path.
 - The copy goes to a temp file in the destination directory, `.<session>-v<N>.<pid>-<seq>.tmp`, and is then
   published with `MoveFileExW` *without* `MOVEFILE_REPLACE_EXISTING`.
 - On `ERROR_ALREADY_EXISTS` or `ERROR_FILE_EXISTS`, N is bumped and the publish retried, and `next_version`
-  records the N actually used plus one.
+  records the N actually used plus one. A folder in the way counts as taken [verified: unit test].
+- The temp file is flushed to disk before the rename, so the published name never shows a partial file. A
+  rename refused with a sharing or access error, typically an antivirus scanner holding the fresh file, is
+  retried for about 0.8 s before it counts as a failed copy.
 - Nothing is ever overwritten, even when several projects or processes share a folder [decided].
 
 **Copy.** A byte-for-byte copy of `savedPath`, so the C2PA chunk survives. It is never re-encoded. If the copy
@@ -585,15 +673,21 @@ fails despite the pre-check, the result is still a success: its image line point
 
 **Preview.** Built from the image bytes:
 
-1. Decode with `png`.
+1. Decode with `png`, normalised to 8 bits per sample.
 2. Downscale with an exact area average to a long edge of at most 1024 px. Never upscale.
 3. Encode as JPEG, quality 85, with `jpeg-encoder` (4:2:0, standard Huffman tables).
 4. Base64.
 
 Measured: 89–317 KB, about 50 ms [verified: benchmark].
 
-If the decoded image has alpha (transparent background), the preview is a PNG. If that PNG is over 500 KB, it
-is flattened onto white instead, and the text says so.
+If the JPEG is over 512,000 bytes, the quality steps down (75, 65, 50, 35) until it fits. Real images fit at 85
+[verified: benchmark]; only noise-like content needs the steps (a 1024 px noise image fits at 50 [verified: unit
+test]). If nothing fits, there is no image block, only the warning line.
+
+If the decoded image has transparency (any pixel less than opaque; an alpha channel that is opaque everywhere
+does not count), the preview is a PNG, downscaled with colour premultiplied by alpha so transparent pixels
+cannot darken the edges. If that PNG is over 500 KB, it is flattened onto white and sent as JPEG instead, and
+the text says so.
 
 **Huffman trap.** `jpeg-encoder`'s `set_optimized_huffman_tables(true)` produces non-interleaved 4:2:0 scans.
 These decoded as garbage in `zune-jpeg`, and were garbled through Claude Code's Read path [verified]. It must
@@ -681,6 +775,8 @@ later `thread/resume` then fails with `no rollout found for thread id <id>`. Cod
 - A cancelled request gets no response.
 - Any image that completed before the interrupt has already been copied and recorded, so `status` and a
   later refine see it.
+- The cancel hook sends the interrupt itself, so Codex can confirm it before the call's own thread has noticed
+  the cancellation. A cancellation therefore counts however the turn ended.
 - There is no cancel tool [decided]. TaskStop already covers backgrounded calls, and a foreground call blocks
   the model, which could not call a cancel tool anyway.
 
@@ -691,8 +787,18 @@ later `thread/resume` then fails with `no rollout found for thread id <id>`. Cod
 
 - Wait up to about 15 s for `turn/completed`.
 - If it does not arrive, return anyway, but keep the session marked busy in the registry until
-  `turn/completed` or child death. No later `turn/start` can then merge into it.
-- If a `turn/start` reply arrives after the call gave up, interrupt that turn at once.
+  `turn/completed` or child death. No later `turn/start` can then merge into it. The lingering turn still
+  counts against `--max-concurrent`, since Codex may still be generating it.
+- That thread's `thread/unsubscribe` is sent when its `turn/completed` arrives, not when the call returns:
+  unsubscribing earlier would also stop the notification that frees the session.
+- `turn/completed` can arrive just as the call gives up, after its last look at its events but before it leaves
+  the session lingering. No second one would come, so the registry records a `turn/completed` whenever it routes
+  one, and a call giving up on a turn that has already completed frees the session at once and sends the
+  unsubscribe itself.
+- If the turn starts after the call gave up (its `turn/start` reply came too late), interrupt that turn as soon
+  as its id is known. A late reply is dropped, but the `turn/started` notification that follows it names the
+  turn [verified: smoke log]. The same holds for a cancel that arrives while `turn/start` is still unanswered.
+- The registry hands out each turn's interrupt once, whichever of these paths asks first.
 
 **Timeout.** When `--timeout-seconds` runs out mid-turn, the turn is interrupted. The call returns `TIMEOUT`,
 or success with a warning if an image had already completed.
@@ -711,6 +817,11 @@ case is always a success with warnings.
 | --- | --- |
 | Stop and escalate | `CLI_NOT_FOUND`, `SPAWN_FAILED`, `APP_SERVER_FAILED`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED`, `IMAGEGEN_UNAVAILABLE`, `MODEL_UNAVAILABLE`, `RATE_LIMITED`, `UPSTREAM_ERROR`, `CONTENT_REFUSED`, `IMAGE_FAILED`, `NO_IMAGE`, `TIMEOUT`, `STORE_CORRUPT`, `INTERNAL_ERROR` |
 | Agent-correctable (short form) | `BAD_REQUEST`, `SESSION_EXISTS`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `SESSION_BUSY`, `SESSION_OPEN_ELSEWHERE`, `TOO_MANY_RUNNING`, `CANCELLED`, `SERVER_SHUTTING_DOWN` |
+
+**Which failure is reported** when no image completed, first match wins [decided]: an isolation breach; a
+cancellation; the child dying; a failed turn (by its `codexErrorInfo`); an exhausted image quota; another failed
+image item; the budget running out; a protocol anomaly; then the turn's end state (`NO_IMAGE` for a completed turn
+that never started an image call, `IMAGE_FAILED` for one that started it but never completed it).
 
 **Item-level outcomes.** These apply when no image completed.
 
@@ -747,8 +858,11 @@ case is always a success with warnings.
 
 - **Commands.** Codex runs with a read-only sandbox, `approvalPolicy: never` and the shell tool disabled. Its
   only code execution is the code-mode `exec` isolate: V8 with no Node, no filesystem and no network, able
-  only to call the nested tools that remain [verified: source]. The hardened tool list is confirmed in V1.
-  Nothing asks the user for approval.
+  only to call the nested tools that remain [verified: source]. `apply_patch` is among them, offered to every
+  model, but the read-only sandbox with `approvalPolicy: never` refuses every write it attempts [verified:
+  trace + source]. The sub-agent and `request_user_input` tools are switched off (see [Spawn](#spawn)); that
+  they are gone from the offered list is re-checked in V1. `request_user_input_async` remains and cannot wait
+  for an answer. Nothing asks the user for approval.
 - **Reads.** Codex can read any file the user can: the image tool reads referenced paths. `reference_images`
   are checked for an image signature first.
 - **Writes.** The only writes to disk are the image tool's, into `<CODEX_HOME>\generated_images`, and this
@@ -762,6 +876,7 @@ case is always a success with warnings.
   - MCP servers, rebuilt per thread and guarded by the canary
   - `notify`
   - web search
+  - sub-agents and `request_user_input`
   - the auto-review subagent
 - **Dedicated home (`--codex-home <dir>`).** One-time setup: `CODEX_HOME=<dir> codex login --device-auth`.
   - It avoids everything under `~/.codex`: config, `AGENTS.md`, MCP servers, plugins, user skills.
@@ -843,17 +958,18 @@ Planned modules:
 | `jsonrpc.rs` | Shared line framing, message classification, request keys, log clamping. |
 | `mcp.rs` | MCP server loop, per-call threads, progress reporter, protocol negotiation. |
 | `cancel.rs` | Per-request arbitration between a cancel and the response. |
-| `appserver.rs` | Child supervisor: spawn in the job, handshake, pending-reply table with deadlines, routing, answers to server requests, respawn and recycle. |
+| `appserver.rs` | Child supervisor: spawn in the job, handshake, pending-reply table with deadlines, detached requests, routing, answers to server requests, shutdown. |
 | `codex.rs` | Binary resolution, preflight, per-thread config map, thread/turn parameters, developer instructions, input text. |
-| `registry.rs` | Running turns per session: busy check, cap, phases, lingering-interrupt state, shutdown. |
+| `registry.rs` | Running turns per session: busy check, cap, phases, per-thread event routing (holding a canary that beats the thread's registration), lingering-interrupt state, shutdown. |
+| `turn.rs` | One image turn: notification parsing and routing on the reader thread; on the call's thread `thread/start`, `turn/start`, copy and preview per image, cancel hook, deadlines, canary, unsubscribe; result building and the no-image failure choice. |
 | `session.rs` | Session store: atomic JSON, `LockFileEx` store lock and per-name leases, record type. |
-| `output.rs` | Output-dir pre-check, no-replace versioned publish. |
+| `output.rs` | Output-dir resolution and pre-check, no-replace versioned publish, automatic session names. |
 | `cleanup.rs` | Session expiry and the `--cleanup` sweep, with the deletion safety rules. |
-| `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode, base64. |
+| `preview.rs` | PNG decode, area-average downscale, JPEG/PNG encode with the size steps, base64. |
 | `errors.rs` | Failure contract, item-level and `codexErrorInfo` mapping. |
 | `config.rs` | Flags, state directory derivation, `fnv1a64`. |
 | `winjob.rs` | Job object and suspended spawn. |
-| `tools.rs` | `App`, the three tools, validation and start ordering. |
+| `tools.rs` | `App`, the three tools, validation and start ordering, the child's notification handler, child retirement. |
 | `testutil.rs` | Test temp directories. |
 
 The estimate is about 3,500 lines without tests.
@@ -887,6 +1003,8 @@ tested against a scripted fake child that replays message sequences for these ca
 - an MCP canary breach
 - an oversized line
 - a missing `savedPath`
+- a child seen to exit before its last image line is read, and one that exits while the call is busy with an
+  earlier image
 - a deleted edit target, where no turn is sent
 - cleanup:
   - an expired session is removed completely;
@@ -895,8 +1013,44 @@ tested against a scripted fake child that replays message sequences for these ca
   - an edited output (size mismatch) is kept;
   - a malformed `threadId` or a foreign `codex_home` deletes nothing
 
-**`smoke.ps1`.** The only thing that spends quota: about 3 images. It is run when protocol, spawning or
-session code changes, and the user is told the cost first. It drives `dist\codex-imagegen.exe` over MCP:
+**`smoke.ps1`.** The only thing that spends quota, and only with its `-SpendQuota` switch; without it, it runs
+the free steps (`initialize`, `tools/list`, `status`, then the no-stray-process check). The M2 version spends
+about 2 images: `generate` with the quotes, backslash, newline and non-ASCII prompt (V2), then `generate` with
+that image as a reference (V3), each checked for an `image/jpeg` preview of 512,000 bytes or less with a long
+edge of 1024 px or less, and the `<session>-v1.png` file. V2 is compared by the script itself: the `codex prompt`
+line, JSON-decoded, must equal the prompt sent (whitespace at either end aside), and the server must raise no
+prompt warning. It runs the server with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and reads the
+trace. Each thread writes a `trace-*` folder holding `trace.jsonl` and the payload files its events name
+[verified: real trace, 0.156.0]:
+
+- V1: the offered tools, from every model request in every trace folder. A full request carries them in its
+  first input item (`additional_tools`), grouped in namespaces; a follow-up request in the same turn carries only
+  the new input, the image's multi-MB result among it, and no tools, so it is not parsed. The tools nested in
+  `exec` are the "### `name`" headings in its description, not the calls it shows as examples. V1 passes when
+  `exec` is offered with `image_gen__imagegen` nested in it, and no shell, stdin, web-search, browser,
+  computer-use, sub-agent (the `collaboration` namespace or its tool names), `request_user_input`, skill,
+  tool-suggest or MCP tool is offered. `apply_patch`, `view_image`, `wait`, the clock tools and
+  `request_user_input_async` are listed as allowed (documented; see [Spawn](#spawn)), and anything else fails
+  V1 until it is classified. A model request whose payload is missing or cannot be parsed also fails V1, and the
+  tool-surface checks are then not run: the tools that request carried were never checked. V3 is still run.
+- V3: an image call is a `tool_call_started` event of kind `image_generation`. Its `referenced_image_paths` come
+  from its invocation payload, or, if the trace has none, from the JavaScript of the `exec` cell that made it
+  (the matching `code_cell_started` event's `source_js`, JavaScript string escapes decoded). Some call must list
+  the first image (full path, compared case-insensitively). The event's `input_preview` is truncated and never
+  used. Text Codex sent to the model never counts: the developer instructions, the tool's declaration and the
+  tagged input name both the parameter and the path whatever the agent does.
+- The tool results, which carry each image's base64, are never read.
+
+`smoke.ps1 -CheckTrace <trace folder> [-ReferencePath <png>]` runs only these two checks against the trace of an
+earlier run. It starts nothing and spends nothing.
+
+V1's `savedPath` comes from the server's stderr: each image must have logged its `savedPath`, under
+`<CODEX_HOME>\generated_images`, byte-identical to the published copy, and none may have fallen back to the
+base64. The no-stray-process check covers every process of ours alive just before shutdown, and an app-server
+respawned during the run fails. The full version below arrives with sessions in M3.
+
+The full version spends about 3 images. It is run when protocol, spawning or session code changes, and the user
+is told the cost first. It drives `dist\codex-imagegen.exe` over MCP:
 
 1. `initialize`
 2. `tools/list`
@@ -922,12 +1076,12 @@ Each item must pass before the code that depends on it is considered done.
 
 | # | Check | Cost | When |
 | --- | --- | --- | --- |
-| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
+| V0 | **Passed 2026-09-25 for rendering.** Claude Code renders the JPEG preview and shows the progress line; TaskStop on a backgrounded call produces `notifications/cancelled`. Run against the real server rather than a stub. Through `claude -p` (1 image), Claude described the preview accurately and reported it intact, matching the saved file. In the desktop app's Code tab the image appears in the expanded tool row, the text block is shown above it (so the preview note is worded order-neutrally), and no progress line is drawn; the terminal renderer draws progress [verified: bundle]. The TaskStop part was not run. | 1 image + Claude usage | M2 |
 | V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
 | V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
-| V1 | The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, multi-agent, skill and tool-suggest tools. The item is reported and `savedPath` is populated. | 1 image (part of smoke) | M2 |
-| V2 | Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. | part of smoke | M2 |
-| V3 | `reference_images` on generate reach `referenced_image_paths` and influence the output. | 1 image | M2 |
+| V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
+| V2 | **Passed 2026-09-25 for generate.** Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. The generate prompt with quotes, a backslash, a newline and non-ASCII text came back verbatim. The refine part is pending M3. | part of smoke | M2 |
+| V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
 | V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
 | V5 | With `--codex-home` pointing at a dedicated home, images land under that home. | 1 image, plus a one-time login by the owner | M4 |
 | V9 | Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeed. | 2 images | M3 |

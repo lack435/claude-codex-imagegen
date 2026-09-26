@@ -376,14 +376,15 @@ pub fn internal_error(summary: impl Into<String>) -> Failure {
     )
 }
 
-/// Generation is declared but not built yet in this milestone.
-pub fn not_implemented_yet() -> Failure {
+/// Refining a session is declared but not built yet in this milestone.
+pub fn refine_not_implemented_yet() -> Failure {
     Failure::new(
         "INTERNAL_ERROR",
-        "Image generation is not implemented in this build of codex-imagegen yet (milestone M2).",
-        "This build of codex-imagegen can check its setup (codex_imagegen_status) but cannot \
-         generate images yet. Tell the user that image generation needs a newer codex-imagegen \
-         build.",
+        "Refining a session is not implemented in this build of codex-imagegen yet (milestone \
+         M3).",
+        "This build of codex-imagegen can generate new images (codex_imagegen_generate) but cannot \
+         continue a session yet. Tell the user that refining needs a newer codex-imagegen build; \
+         a new generate call, with the previous image passed in reference_images, works today.",
     )
 }
 
@@ -405,6 +406,217 @@ pub fn server_shutting_down() -> Failure {
         "No image was produced and nothing was spent. Reconnect the codex-imagegen MCP server \
          (for example with /mcp in Claude Code) and call the tool again.",
     )
+}
+
+/// Another call in this process is using the session. `interrupted` is the case where that call
+/// has already returned, but its turn was interrupted and Codex has not yet confirmed that it
+/// stopped: a new turn on the thread would merge into it (docs/design.md, "After `turn/interrupt`").
+pub fn session_busy(session: &str, interrupted: bool) -> Failure {
+    let why = if interrupted {
+        "its previous turn was interrupted and Codex has not yet confirmed that it stopped"
+    } else {
+        "another call on it is still running"
+    };
+    Failure::new(
+        "SESSION_BUSY",
+        format!("The session '{session}' is busy: {why}."),
+        "Nothing was spent. Wait for the other call to finish and call again, or use a different \
+         session name.",
+    )
+}
+
+/// `--max-concurrent` image calls are already running in this process.
+pub fn too_many_running(max: usize) -> Failure {
+    Failure::new(
+        "TOO_MANY_RUNNING",
+        format!(
+            "codex-imagegen is already running {max} image call(s), its limit (--max-concurrent \
+             {max})."
+        ),
+        "Nothing was spent. Wait for one of the running calls to finish, then call again.",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// A turn that produced no image (docs/design.md, "Errors"). Every one of these is returned only
+// when no image completed: once one has, the call is a success with warnings.
+// ---------------------------------------------------------------------------
+
+/// How much of Codex's closing message a failure quotes. It is untrusted model text, kept only to
+/// help a person diagnose; never used to classify anything.
+const MAX_QUOTED_NOTE_CHARS: usize = 500;
+
+/// The agent's closing message, for a failure's detail: truncated, stripped of characters that
+/// hide text, quoted, and labelled as untrusted.
+pub fn untrusted_note_detail(note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!(
+            "Codex's closing message (untrusted model text, quoted; not a diagnosis): {}",
+            quote_untrusted(note, MAX_QUOTED_NOTE_CHARS)
+        ),
+        None => "Codex sent no closing message.".to_string(),
+    }
+}
+
+/// Untrusted text as one JSON-quoted line: bounded, with control, zero-width and bidi characters
+/// removed, so it cannot pass for anything but a quotation.
+pub fn quote_untrusted(text: &str, max_chars: usize) -> String {
+    // Line breaks and tabs become spaces first: clamp drops control characters, which would
+    // otherwise run the words on either side together.
+    let flat: String = text
+        .trim()
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    serde_json::to_string(&crate::jsonrpc::clamp(&flat, max_chars))
+        .unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// The image tool hit the `image_gen` usage limit: an item-level `failure` of type
+/// `usageLimitExceeded`. `resets` is the reset time already formatted, `None` when Codex gave none.
+pub fn image_quota_exhausted(limit_id: &str, resets: Option<&str>) -> Failure {
+    let when = match resets {
+        Some(at) => format!("It resets at {at}."),
+        None => "Codex did not say when it resets (reset time unknown).".to_string(),
+    };
+    Failure::new(
+        "RATE_LIMITED",
+        format!("The ChatGPT plan's image quota is used up (Codex limit '{limit_id}'). {when}"),
+        format!(
+            "Image generation is metered in its own quota on the user's ChatGPT plan, and it is \
+             exhausted. {when} Retry after that; codex_imagegen_status shows the usage codex-imagegen \
+             knows about. A plan with a larger image allowance also lifts it."
+        ),
+    )
+}
+
+/// A failed image item with no `failure` set: a refusal, a backend error or no image data. Codex
+/// sends the reason only to its agent model, so it cannot be told apart here [verified: source].
+pub fn image_failed(note: Option<&str>) -> Failure {
+    Failure::new(
+        "IMAGE_FAILED",
+        "Codex's image tool reported that the image failed. The image backend refused the prompt, \
+         hit a server error, or returned no image; Codex does not say which.",
+        "Retry once. If it fails again, the prompt may have been refused by image moderation: tell \
+         the user, who may want to rephrase it.",
+    )
+    .with_detail(untrusted_note_detail(note))
+}
+
+/// The turn completed without any image item: the agent never called the image tool, or the tool
+/// failed before it started, as it does for a reference image it cannot read.
+pub fn no_image(note: Option<&str>, had_references: bool) -> Failure {
+    let references = if had_references {
+        " Check that every reference image still exists and is readable: Codex reads them itself, \
+         after codex-imagegen checked them."
+    } else {
+        ""
+    };
+    Failure::new(
+        "NO_IMAGE",
+        "Codex finished the turn without making an image: its image tool never ran.",
+        format!(
+            "Retry once.{references} If it happens again, run codex-imagegen.exe --doctor in a \
+             terminal and report the detail below."
+        ),
+    )
+    .with_detail(untrusted_note_detail(note))
+}
+
+/// The turn ended in a state codex-imagegen did not ask for and cannot classify, such as
+/// `interrupted` with no interrupt sent.
+pub fn turn_ended_without_image(status: &str, note: Option<&str>) -> Failure {
+    Failure::new(
+        "IMAGE_FAILED",
+        format!("The Codex turn ended as '{status}' before an image completed."),
+        "Retry once. If it happens again, run codex-imagegen.exe --doctor in a terminal and check \
+         OpenAI's service status.",
+    )
+    .with_detail(untrusted_note_detail(note))
+}
+
+/// What a failed turn's `codexErrorInfo` means (docs/design.md, "Turn-level failures"). `info` is
+/// its variant name (`unauthorized`, `httpConnectionFailed`, ...), `None` when Codex sent none;
+/// `message` is `TurnError.message`, kept as detail. Never decided from model text.
+pub fn turn_failed(info: Option<&str>, message: &str, codex_home: Option<&Path>) -> Failure {
+    let named = info.unwrap_or("none");
+    let detail = format!("codexErrorInfo: {named}\nCodex's error message: {message}");
+    match info {
+        Some("usageLimitExceeded" | "rateLimitExceeded" | "serverOverloaded") => Failure::new(
+            "RATE_LIMITED",
+            format!("Codex stopped the turn on a usage or rate limit (codexErrorInfo {named})."),
+            "Codex's agent model is rate-limited or over its usage allowance on the user's ChatGPT \
+             plan, or OpenAI is overloaded. Wait a few minutes and retry; codex_imagegen_status \
+             shows the usage windows.",
+        ),
+        Some("unauthorized") => Failure::new(
+            "AUTH_EXPIRED",
+            "Codex's ChatGPT sign-in is no longer accepted (codexErrorInfo unauthorized).",
+            format!(
+                "The Codex login expired or was revoked. Sign in again in a terminal:\n\n{}\n\n\
+                 Then retry: codex-imagegen starts a fresh Codex for the next call, which picks up \
+                 the new login.",
+                login_instructions(codex_home)
+            ),
+        ),
+        Some("cyberPolicy" | "misalignmentPolicyViolation") => Failure::new(
+            "CONTENT_REFUSED",
+            format!(
+                "Codex's agent model refused the request under its usage policy (codexErrorInfo \
+                 {named}). This is the agent model's policy check, not image moderation."
+            ),
+            "Tell the user that the request was refused. Do not retry the same prompt; the user may \
+             want to rephrase it.",
+        ),
+        Some("contextWindowExceeded" | "sessionBudgetExceeded") => Failure::new(
+            "SESSION_NOT_RESUMABLE",
+            format!("The Codex session has run out of room (codexErrorInfo {named})."),
+            "Nothing more can be done in this session. Start a new one with \
+             codex_imagegen_generate, passing the last image as reference_images.",
+        ),
+        Some(name)
+            if name == "internalServerError"
+                || name == "httpConnectionFailed"
+                || name.starts_with("responseStream") =>
+        {
+            Failure::new(
+                "UPSTREAM_ERROR",
+                format!("Codex could not get an answer from OpenAI (codexErrorInfo {named})."),
+                "Retry once. If it fails again, check OpenAI's service status: during an outage \
+                 Codex fails for reasons codex-imagegen cannot fix.",
+            )
+        }
+        _ => Failure::new(
+            "IMAGE_FAILED",
+            format!("The Codex turn failed before an image completed (codexErrorInfo {named})."),
+            "Retry once. If it fails again, run codex-imagegen.exe --doctor in a terminal and check \
+             OpenAI's service status.",
+        ),
+    }
+    .with_detail(detail)
+}
+
+/// An MCP server started on one of codex-imagegen's Codex threads, although every one is turned
+/// off for them: the isolation the design depends on did not hold, so the turn was stopped
+/// (docs/design.md, "Canary").
+pub fn isolation_breach(server: &str) -> Failure {
+    Failure::new(
+        "APP_SERVER_FAILED",
+        format!(
+            "isolation breach: MCP server {} started on codex-imagegen's Codex thread, so the \
+             turn was stopped.",
+            crate::jsonrpc::clamp(server, 100)
+        ),
+        "codex-imagegen turns off every MCP server for the Codex threads it runs, and one started \
+         anyway. Check the Codex configuration (the mcp_servers entries in config.toml, and any \
+         managed configuration), or run codex-imagegen with --codex-home pointing at a dedicated \
+         Codex home. Do not retry until the cause is understood.",
+    )
+}
+
+/// The Codex app-server stopped in the middle of a turn, before an image completed.
+pub fn child_died_mid_turn(detail: impl Into<String>) -> Failure {
+    app_server_failed("the image turn", detail)
 }
 
 /// The request was cancelled before an image completed. A cancelled request normally gets no
@@ -468,9 +680,25 @@ mod tests {
             model_unavailable("gpt-6-astra", ""),
             bad_request("'prompt' must not be empty."),
             internal_error("boom"),
-            not_implemented_yet(),
+            refine_not_implemented_yet(),
+            image_quota_exhausted("image_gen", Some("2026-09-26 14:00")),
+            image_quota_exhausted("image_gen", None),
+            image_failed(Some("the backend refused")),
+            no_image(None, true),
+            turn_ended_without_image("interrupted", None),
+            turn_failed(Some("unauthorized"), "401", None),
+            turn_failed(Some("usageLimitExceeded"), "limit", None),
+            turn_failed(Some("cyberPolicy"), "no", None),
+            turn_failed(Some("contextWindowExceeded"), "full", None),
+            turn_failed(Some("responseStreamDisconnected"), "gone", None),
+            turn_failed(None, "odd", None),
+            isolation_breach("rogue"),
+            child_died_mid_turn("exit code 1"),
             timeout(300),
             server_shutting_down(),
+            session_busy("fox", false),
+            session_busy("fox", true),
+            too_many_running(4),
             cancelled(),
         ]
     }
@@ -611,6 +839,70 @@ mod tests {
         assert!(explicit.summary.contains(r"C:\nope\codex.exe"));
         let missing = cli_not_found(None, &[]);
         assert!(!missing.summary.contains("--codex-bin"));
+    }
+
+    #[test]
+    fn every_codex_error_info_maps_to_the_designs_code() {
+        // docs/design.md, "Turn-level failures", row by row.
+        for (info, code) in [
+            ("usageLimitExceeded", "RATE_LIMITED"),
+            ("rateLimitExceeded", "RATE_LIMITED"),
+            ("serverOverloaded", "RATE_LIMITED"),
+            ("unauthorized", "AUTH_EXPIRED"),
+            ("cyberPolicy", "CONTENT_REFUSED"),
+            ("misalignmentPolicyViolation", "CONTENT_REFUSED"),
+            ("contextWindowExceeded", "SESSION_NOT_RESUMABLE"),
+            ("sessionBudgetExceeded", "SESSION_NOT_RESUMABLE"),
+            ("internalServerError", "UPSTREAM_ERROR"),
+            ("httpConnectionFailed", "UPSTREAM_ERROR"),
+            ("responseStreamConnectionFailed", "UPSTREAM_ERROR"),
+            ("responseStreamDisconnected", "UPSTREAM_ERROR"),
+            ("responseTooManyFailedAttempts", "IMAGE_FAILED"),
+            ("badRequest", "IMAGE_FAILED"),
+            ("sandboxError", "IMAGE_FAILED"),
+            ("other", "IMAGE_FAILED"),
+            ("somethingNew", "IMAGE_FAILED"),
+        ] {
+            let failure = turn_failed(Some(info), "upstream said no", None);
+            assert_eq!(failure.code, code, "{info}");
+            let detail = failure.detail.unwrap();
+            assert!(
+                detail.contains(&format!("codexErrorInfo: {info}")),
+                "{detail}"
+            );
+            assert!(detail.contains("upstream said no"), "{detail}");
+        }
+        let none = turn_failed(None, "no info", None);
+        assert_eq!(none.code, "IMAGE_FAILED");
+        assert!(none.summary.contains("codexErrorInfo none"));
+    }
+
+    #[test]
+    fn an_untrusted_note_is_quoted_bounded_and_labelled() {
+        let detail = untrusted_note_detail(Some("line one\n\u{202e}\"quoted\" and more"));
+        assert!(
+            detail.starts_with("Codex's closing message (untrusted model text"),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with(r#""line one \"quoted\" and more""#),
+            "{detail}"
+        );
+        let long = untrusted_note_detail(Some(&"x".repeat(2000)));
+        assert!(long.chars().count() < 700, "{long}");
+        assert_eq!(
+            untrusted_note_detail(None),
+            "Codex sent no closing message."
+        );
+    }
+
+    #[test]
+    fn an_exhausted_image_quota_says_when_it_resets_or_that_it_is_unknown() {
+        let known = image_quota_exhausted("image_gen", Some("2026-09-26 14:00"));
+        assert!(known.summary.contains("resets at 2026-09-26 14:00"));
+        let unknown = image_quota_exhausted("image_gen", None);
+        assert!(unknown.summary.contains("reset time unknown"));
+        assert!(unknown.summary.contains("'image_gen'"));
     }
 
     #[test]

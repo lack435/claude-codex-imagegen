@@ -1,9 +1,11 @@
 //! What codex-imagegen knows about the Codex CLI: where to find it, the exact line it is started
-//! with, the handshake, the free preflight calls, and the usage snapshot.
+//! with, the handshake, the free preflight calls, the usage snapshot, and the parameters of the
+//! threads and turns it asks for.
 //!
-//! Every call here is free: `initialize`, `account/read`, `modelProvider/capabilities/read`,
-//! `model/list`, `config/read` and `account/rateLimits/read` spend no quota [verified]. Nothing
-//! in this module starts a turn.
+//! Every call made here is free: `initialize`, `account/read`, `modelProvider/capabilities/read`,
+//! `model/list`, `config/read` and `account/rateLimits/read` spend no quota [verified]. This module
+//! builds `thread/start` and `turn/start` parameters but sends neither; running a turn, the only
+//! thing that spends quota, is `turn.rs`.
 //!
 //! The spawn switches and the preflight checks are a security boundary (AGENTS.md): they are
 //! what keeps the child's posture, and its billing, where the design puts them. Change them only
@@ -48,12 +50,20 @@ pub const OPT_OUT_NOTIFICATIONS: &[&str] = &[
 ];
 
 /// Features the child is started with switched off (`--disable <name>`).
+///
+/// `multi_agent` alone does not remove the sub-agent tools: the model catalogue gives
+/// `gpt-6-astra` MultiAgentV2, which applies unless `agents.enabled = false` (a `-c` switch in
+/// [`spawn_args`]), and an enabled `multi_agent_v2` feature outranks that setting
+/// (core/src/config/mod.rs `multi_agent_version_override` at rust-v0.156.0). So `multi_agent_v2`
+/// is switched off too: a user config with `[features.multi_agent_v2] enabled = true` left it in
+/// effect under `agents.enabled=false` [verified: config/read on a test home].
 pub const DISABLED_FEATURES: &[&str] = &[
     "apps",
     "plugins",
     "hooks",
     "memories",
     "multi_agent",
+    "multi_agent_v2",
     "goals",
     "shell_tool",
     "tool_suggest",
@@ -195,6 +205,11 @@ pub fn spawn_args() -> Vec<String> {
         "notify=[]",
         "skills.bundled.enabled=false",
         "skills.include_instructions=false",
+        // The sub-agent ("collaboration") tools: see DISABLED_FEATURES.
+        "agents.enabled=false",
+        // `request_user_input`, which is otherwise offered (core/src/config/mod.rs
+        // `resolve_experimental_request_user_input_enabled` at rust-v0.156.0).
+        "tools.experimental_request_user_input.enabled=false",
         r#"web_search="disabled""#,
         r#"approvals_reviewer="user""#,
         r#"windows.sandbox="unelevated""#,
@@ -502,7 +517,7 @@ pub fn preflight(
     // 4. The effective configuration: readable, and showing every switch the child was started
     //    with still in effect.
     let config = read_config(rpc, &cfg.work_dir)?;
-    facts.mcp_off_map = Some(mcp_off_map(&config));
+    facts.mcp_off_map = Some(mcp_off_map(&config.config));
     if let Some(setting) = overridden_switch(&config) {
         return Err(errors::imagegen_unavailable_setting(&setting));
     }
@@ -556,15 +571,32 @@ fn find_model(rpc: &Rpc<'_>, model: &str, version: Option<&str>) -> Result<Model
     Err(errors::model_unavailable(model, listed))
 }
 
+/// What `config/read` reports: the effective config object, and `origins`, which names for each
+/// dotted key path the config layer its value was taken from.
+#[derive(Clone, Debug)]
+pub struct EffectiveConfig {
+    pub config: Value,
+    /// `{"<dotted.path>": {"name": {"type": "sessionFlags" | "user" | ...}, "version"}}`, or an
+    /// empty object when the reply has none.
+    pub origins: Value,
+}
+
 /// `config/read` as a thread in the work directory would see it. An error reply means Codex
 /// cannot resolve its own configuration -- for example a legacy top-level `profile` key, which
 /// codex-cli 0.156.0 rejects here while its app-server logs "using defaults" and keeps serving
 /// [verified] -- so nothing about the switches can be confirmed, and preflight fails closed.
-pub fn read_config(rpc: &Rpc<'_>, work_dir: &Path) -> Result<Value, Failure> {
+pub fn read_config(rpc: &Rpc<'_>, work_dir: &Path) -> Result<EffectiveConfig, Failure> {
     let method = "config/read";
     match rpc.call_raw(method, json!({"cwd": work_dir})) {
         Ok(reply) => match reply.get("config") {
-            Some(config) if config.is_object() => Ok(config.clone()),
+            Some(config) if config.is_object() => Ok(EffectiveConfig {
+                config: config.clone(),
+                origins: reply
+                    .get("origins")
+                    .filter(|origins| origins.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            }),
             _ => Err(errors::app_server_failed(
                 method,
                 "the reply has no config object",
@@ -593,6 +625,15 @@ pub fn mcp_off_map(config: &Value) -> Value {
     json!({"mcp_servers": servers})
 }
 
+/// Switches whose value `config/read` leaves out of its config object: its `tools` carries only
+/// `web_search` (app-server-protocol `ToolsV2` at rust-v0.156.0), and
+/// `tools.experimental_request_user_input.enabled` was missing from it under the switch
+/// [verified: config/read, 0.156.0]. `origins` still names the layer each one was taken from, so
+/// it must be the child's own switches (`sessionFlags`), which hold the value it was started with.
+/// This checks the layer, not the value: that the value in our layer is `false` is guaranteed by
+/// the spawn line itself, which `the_spawn_line_is_exactly_the_designs` pins.
+const SWITCHES_CHECKED_BY_ORIGIN: &[&str] = &["tools.experimental_request_user_input.enabled"];
+
 /// The first spawn switch that the effective configuration does not show in effect, named as
 /// the setting that beat it, or `None` when every one holds.
 ///
@@ -601,7 +642,8 @@ pub fn mcp_off_map(config: &Value) -> Value {
 /// requirements overriding one, or a legacy alias that Codex applies after the canonical key.
 /// Compared exactly: a value that is merely absent is not the value the child was started with,
 /// so it fails too, rather than being assumed to be a harmless default.
-pub fn overridden_switch(config: &Value) -> Option<String> {
+pub fn overridden_switch(effective: &EffectiveConfig) -> Option<String> {
+    let config = &effective.config;
     let at = |path: &[&str]| {
         path.iter()
             .try_fold(config, |value, key| value.get(*key))
@@ -619,7 +661,11 @@ pub fn overridden_switch(config: &Value) -> Option<String> {
     }
     for feature in DISABLED_FEATURES {
         let value = at(&["features", feature]);
-        if value != Value::Bool(false) {
+        // A feature that also takes settings reads as a table once a config sets any of them:
+        // `--disable multi_agent_v2` over a user's `[features.multi_agent_v2]` table showed
+        // `{"enabled": false, ...}` [verified: config/read on a test home].
+        let off = value == Value::Bool(false) || value.get("enabled") == Some(&Value::Bool(false));
+        if !off {
             return Some(describe(&format!("features.{feature}"), &value));
         }
     }
@@ -629,11 +675,12 @@ pub fn overridden_switch(config: &Value) -> Option<String> {
             return Some(describe(&format!("features.{alias}"), &value));
         }
     }
-    let expected: [(&[&str], Value); 6] = [
+    let expected: [(&[&str], Value); 7] = [
         (&["web_search"], json!("disabled")),
         (&["notify"], json!([])),
         (&["skills", "bundled", "enabled"], json!(false)),
         (&["skills", "include_instructions"], json!(false)),
+        (&["agents", "enabled"], json!(false)),
         (&["approvals_reviewer"], json!("user")),
         (&["windows", "sandbox"], json!("unelevated")),
     ];
@@ -643,7 +690,89 @@ pub fn overridden_switch(config: &Value) -> Option<String> {
             return Some(describe(&path.join("."), &value));
         }
     }
+    for path in SWITCHES_CHECKED_BY_ORIGIN {
+        let layer = effective
+            .origins
+            .get(*path)
+            .and_then(|origin| origin.get("name"));
+        match layer {
+            Some(layer) if layer.get("type") == Some(&json!("sessionFlags")) => {}
+            Some(layer) => {
+                return Some(format!(
+                    "{path} (taken from the config layer {layer}, not from the switch \
+                     codex-imagegen starts Codex with)"
+                ))
+            }
+            None => {
+                return Some(format!(
+                    "{path} (not in effect: Codex reports no origin for it)"
+                ))
+            }
+        }
+    }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Threads and turns
+// ---------------------------------------------------------------------------
+
+/// The developer instructions every image thread gets, verbatim from docs/design.md
+/// ("developerInstructions"); a test holds the two to the same text.
+pub const DEVELOPER_INSTRUCTIONS: &str = "You are a headless image-generation backend driven by a \
+program, not a person. For each user message, call the image generation tool exactly once. Calling \
+it through `exec` is expected; inside `exec`, call only the image generation tool. Use the text \
+inside `<image_prompt>` or `<edit_request>` as the tool's `prompt`, character for character: do not \
+rewrite, expand, translate or summarise it. Set `referenced_image_paths` to the `<edit_target>` \
+path, if present, followed by every `<reference_images>` path in order. Omit it when there are \
+none, and never use `num_last_images_to_include`. If the tool returns an error, do not call it \
+again; reply with the error text. Do not call shell or file tools, do not create, copy or move \
+files, and do not ask questions. After the tool returns, reply with one short line describing the \
+result.";
+
+/// `thread/start`, exactly as docs/design.md "Thread and turn parameters" lists it. `config` is the
+/// MCP-off map built from a `config/read` made just before (see [`mcp_off_map`]).
+///
+/// The sandbox and approval policy are part of the child's posture, a security boundary
+/// (AGENTS.md): read-only, never ask.
+pub fn thread_start_params(cfg: &Config, mcp_off: &Value) -> Value {
+    json!({
+        "model": cfg.model,
+        "cwd": cfg.work_dir,
+        "sandbox": "read-only",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "developerInstructions": DEVELOPER_INSTRUCTIONS,
+        "config": mcp_off,
+        "ephemeral": false,
+    })
+}
+
+/// The text a generate turn sends: the prompt inside `<image_prompt>`, so it stays apart from
+/// anything else, and the reference images, absolute, one per line (docs/design.md, "Input text
+/// sent to Codex").
+pub fn generate_input_text(prompt: &str, reference_images: &[PathBuf]) -> String {
+    let mut text = format!("<image_prompt>\n{prompt}\n</image_prompt>");
+    if !reference_images.is_empty() {
+        text.push_str("\n<reference_images>");
+        for path in reference_images {
+            text.push('\n');
+            text.push_str(&path.display().to_string());
+        }
+        text.push_str("\n</reference_images>");
+    }
+    text
+}
+
+/// `turn/start`: one text input, and the agent model and effort. The agent only relays the prompt,
+/// so the effort is low by default [decided].
+pub fn turn_start_params(cfg: &Config, thread_id: &str, text: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": text, "text_elements": []}],
+        "model": cfg.model,
+        "effort": cfg.effort,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -791,17 +920,18 @@ struct FileTime {
     high: u32,
 }
 
+/// SYSTEMTIME. Also filled by `GetLocalTime` for automatic session names (output.rs).
 #[repr(C)]
 #[derive(Default)]
-struct SystemTime {
-    year: u16,
-    month: u16,
-    day_of_week: u16,
-    day: u16,
-    hour: u16,
-    minute: u16,
-    second: u16,
-    milliseconds: u16,
+pub(crate) struct SystemTime {
+    pub year: u16,
+    pub month: u16,
+    pub day_of_week: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub milliseconds: u16,
 }
 
 extern "system" {
@@ -859,6 +989,129 @@ pub(crate) mod testing {
     use crate::appserver::fake::{self, Flow};
     use std::sync::{Arc, Mutex};
 
+    /// The thread and turn ids every fake thread and turn gets.
+    pub const THREAD_ID: &str = "019a0000-0000-7000-8000-00000000cafe";
+    pub const TURN_ID: &str = "019a0000-0000-7000-8000-00000000beef";
+
+    /// One step of a scripted turn, run in order on a thread of its own once `turn/start` has
+    /// arrived, so the fake keeps answering `turn/interrupt` and `thread/unsubscribe` meanwhile.
+    #[derive(Clone)]
+    pub enum Step {
+        Send(Value),
+        Sleep(Duration),
+        /// Answer the `turn/start` request now (with [`TurnScript::answer_turn_start`] false).
+        AnswerTurnStart,
+        /// Run arbitrary test code, such as deleting the output folder mid-turn.
+        Run(Arc<dyn Fn() + Send + Sync>),
+        /// Close the output, as a child that dies does.
+        Exit,
+        /// The process exits as the client's liveness check sees it, while its output stays open
+        /// until an `Exit` step: a real child's exit can be seen before its last lines are read.
+        ProcessExits,
+    }
+
+    /// What the fake does with a turn.
+    #[derive(Clone)]
+    pub struct TurnScript {
+        /// Sent right after the `thread/start` reply, as Codex sends `thread/started` and MCP
+        /// startup statuses there.
+        pub on_thread_start: Vec<Value>,
+        /// The error `thread/start` answers with, for as many calls as there are entries.
+        pub thread_start_errors: Vec<Value>,
+        /// Whether `turn/start` is answered at once. If not, a step answers it, or nothing does.
+        pub answer_turn_start: bool,
+        /// The error `turn/start` answers with instead of a turn.
+        pub turn_start_error: Option<Value>,
+        pub steps: Vec<Step>,
+        /// Sent after `turn/interrupt` is answered. Empty: the interrupt is acknowledged, and the
+        /// turn never completes.
+        pub on_interrupt: Vec<Value>,
+    }
+
+    impl Default for TurnScript {
+        fn default() -> Self {
+            Self {
+                on_thread_start: vec![json!({"method": "thread/started",
+                    "params": {"thread": {"id": THREAD_ID}}})],
+                thread_start_errors: Vec::new(),
+                answer_turn_start: true,
+                turn_start_error: None,
+                steps: Vec::new(),
+                on_interrupt: vec![turn_completed("interrupted", Value::Null)],
+            }
+        }
+    }
+
+    pub fn notification(method: &str, mut params: Value) -> Value {
+        if params.get("threadId").is_none() {
+            params["threadId"] = json!(THREAD_ID);
+        }
+        json!({"method": method, "params": params})
+    }
+
+    pub fn turn_started() -> Value {
+        notification(
+            "turn/started",
+            json!({"turn": {"id": TURN_ID, "items": [], "status": "inProgress", "error": null}}),
+        )
+    }
+
+    pub fn image_started(item_id: &str) -> Value {
+        notification(
+            "item/started",
+            json!({"turnId": TURN_ID, "item": {"type": "imageGeneration", "id": item_id,
+                   "status": "in_progress", "revisedPrompt": null, "result": "",
+                   "transparentBackground": null, "failure": null}}),
+        )
+    }
+
+    /// A completed image item, shaped as codex-cli 0.156.0 sends it [verified: smoke log].
+    /// `saved_path` `None` leaves the field out, as the schema allows.
+    pub fn image_completed(
+        item_id: &str,
+        revised_prompt: &str,
+        result_base64: &str,
+        saved_path: Option<&Path>,
+    ) -> Value {
+        let mut item = json!({"type": "imageGeneration", "id": item_id, "status": "completed",
+                              "revisedPrompt": revised_prompt, "result": result_base64,
+                              "transparentBackground": false, "failure": null});
+        if let Some(path) = saved_path {
+            item["savedPath"] = json!(path);
+        }
+        notification("item/completed", json!({"turnId": TURN_ID, "item": item}))
+    }
+
+    pub fn image_failed(item_id: &str, failure: Value) -> Value {
+        notification(
+            "item/completed",
+            json!({"turnId": TURN_ID, "item": {"type": "imageGeneration", "id": item_id,
+                   "status": "failed", "revisedPrompt": "x", "result": "",
+                   "transparentBackground": null, "failure": failure}}),
+        )
+    }
+
+    pub fn agent_message(text: &str) -> Value {
+        notification(
+            "item/completed",
+            json!({"turnId": TURN_ID, "item": {"type": "agentMessage", "id": "msg_1",
+                   "text": text, "phase": "final_answer", "memoryCitation": null}}),
+        )
+    }
+
+    pub fn turn_completed(status: &str, error: Value) -> Value {
+        notification(
+            "turn/completed",
+            json!({"turn": {"id": TURN_ID, "items": [], "status": status, "error": error}}),
+        )
+    }
+
+    /// A `TurnError` with the given `codexErrorInfo`.
+    pub fn turn_error(info: Value) -> Value {
+        json!({"message": "the turn failed upstream", "codexErrorInfo": info,
+               "additionalDetails": null})
+    }
+
     #[derive(Clone)]
     pub struct FakeCodex {
         pub user_agent: String,
@@ -868,10 +1121,13 @@ pub(crate) mod testing {
         pub model_pages: Vec<Vec<Value>>,
         /// The `config/read` config object, or the error it answers with.
         pub config: Result<Value, Value>,
+        /// The `origins` object of the `config/read` reply.
+        pub origins: Value,
         pub rate_limits: Result<Value, Value>,
         /// A method the fake dies on: it closes its output instead of answering, as a child
         /// that exits while handling the request does.
         pub exits_on: Option<&'static str>,
+        pub turn: TurnScript,
         /// Every message the client sent, in order.
         pub seen: Arc<Mutex<Vec<Value>>>,
     }
@@ -890,20 +1146,35 @@ pub(crate) mod testing {
                 "network_proxy": null, "apps": false, "browser_use": false, "chronicle": false,
                 "computer_use": false, "goals": false, "hooks": false, "image_generation": true,
                 "in_app_browser": false, "js_repl": false, "memories": false,
-                "multi_agent": false, "plugins": false, "shell_tool": false,
-                "skill_search": false, "tool_suggest": false, "api_key_model_discovery": false,
-                "auth_elicitation": true, "mentions_v2": true, "remote_control": false,
-                "remote_plugin": true, "windows_sandbox_service": false
+                "multi_agent": false, "multi_agent_v2": false, "plugins": false,
+                "shell_tool": false, "skill_search": false, "tool_suggest": false,
+                "api_key_model_discovery": false, "auth_elicitation": true, "mentions_v2": true,
+                "remote_control": false, "remote_plugin": true, "windows_sandbox_service": false
             },
             "web_search": "disabled",
             "notify": [],
             "skills": {"bundled": {"enabled": false}, "include_instructions": false},
+            "agents": {"enabled": false, "max_concurrent_threads_per_session": null,
+                       "max_depth": null, "default_subagent_model": null,
+                       "default_subagent_reasoning_effort": null,
+                       "job_max_runtime_seconds": null, "interrupt_message": null},
+            "tools": {"web_search": null},
             "approvals_reviewer": "user",
             "windows": {"sandbox": "unelevated"},
             "thread_unload_delay_secs": 5,
             "profile": null,
             "profiles": {},
             "mcp_servers": {"node_repl": {"enabled": true}, "cua_repl": {"enabled": true}}
+        })
+    }
+
+    /// `origins` from the same reply, trimmed to the entry preflight reads.
+    pub fn healthy_origins() -> Value {
+        json!({
+            "tools.experimental_request_user_input.enabled": {
+                "name": {"type": "sessionFlags"},
+                "version": "sha256:82c64ff791dafc9ad598a4f0e798195e08ad6d72e71d5f4b4a1fed569481e88f"
+            }
         })
     }
 
@@ -923,6 +1194,7 @@ pub(crate) mod testing {
                     model("gpt-5.6-sol", false),
                 ]],
                 config: Ok(healthy_config()),
+                origins: healthy_origins(),
                 rate_limits: Ok(json!({
                     "ordinaryUsageAllowed": true,
                     "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 44,
@@ -932,6 +1204,7 @@ pub(crate) mod testing {
                         "secondary": null}}
                 })),
                 exits_on: None,
+                turn: TurnScript::default(),
                 seen: Arc::default(),
             }
         }
@@ -960,7 +1233,8 @@ pub(crate) mod testing {
                     ok(json!({"data": data, "nextCursor": next}))
                 }
                 "config/read" => match &self.config {
-                    Ok(config) => ok(json!({"config": config, "origins": {}, "layers": null})),
+                    Ok(config) => ok(json!({"config": config, "origins": self.origins,
+                                            "layers": null})),
                     Err(error) => err(error),
                 },
                 "account/rateLimits/read" => match &self.rate_limits {
@@ -972,6 +1246,7 @@ pub(crate) mod testing {
         }
 
         pub fn connect(self) -> AppServer {
+            let mut thread_start_errors = self.turn.thread_start_errors.clone().into_iter();
             fake::connect(move |message, out| {
                 self.seen.lock().unwrap().push(message.clone());
                 if self
@@ -980,18 +1255,84 @@ pub(crate) mod testing {
                 {
                     return Flow::Exit;
                 }
-                if let Some(reply) = self.answer(message) {
-                    out.send(reply);
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                match message["method"].as_str().unwrap_or("") {
+                    "thread/start" => {
+                        if let Some(error) = thread_start_errors.next() {
+                            out.send(json!({"id": id, "error": error}));
+                            return Flow::Continue;
+                        }
+                        out.send(json!({"id": id, "result": {
+                            "thread": {"id": THREAD_ID, "ephemeral": false, "turns": []},
+                            "model": message["params"]["model"], "cwd": message["params"]["cwd"],
+                            "approvalPolicy": "never", "approvalsReviewer": "user",
+                            "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}}));
+                        for note in &self.turn.on_thread_start {
+                            out.send(note.clone());
+                        }
+                    }
+                    "turn/start" => {
+                        if let Some(error) = &self.turn.turn_start_error {
+                            out.send(json!({"id": id, "error": error}));
+                            return Flow::Continue;
+                        }
+                        let reply = json!({"id": id, "result": {"turn": {"id": TURN_ID,
+                            "items": [], "status": "inProgress", "error": null}}});
+                        if self.turn.answer_turn_start {
+                            out.send(reply.clone());
+                        }
+                        let steps = self.turn.steps.clone();
+                        let out = out.clone();
+                        std::thread::spawn(move || {
+                            for step in steps {
+                                match step {
+                                    Step::Send(message) => out.send(message),
+                                    Step::Sleep(pause) => std::thread::sleep(pause),
+                                    Step::AnswerTurnStart => out.send(reply.clone()),
+                                    Step::Run(f) => f(),
+                                    Step::Exit => {
+                                        out.close();
+                                        return;
+                                    }
+                                    Step::ProcessExits => out.exit_process(),
+                                }
+                            }
+                        });
+                    }
+                    "turn/interrupt" => {
+                        out.send(json!({"id": id, "result": {}}));
+                        for note in &self.turn.on_interrupt {
+                            out.send(note.clone());
+                        }
+                    }
+                    "thread/unsubscribe" => {
+                        out.send(json!({"id": id, "result": {"status": "unsubscribed"}}));
+                    }
+                    _ => {
+                        if let Some(reply) = self.answer(message) {
+                            out.send(reply);
+                        }
+                    }
                 }
                 Flow::Continue
             })
+        }
+
+        /// The requests the client sent with `method`, params only, in order.
+        pub fn sent(seen: &Mutex<Vec<Value>>, method: &str) -> Vec<Value> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m["method"] == method)
+                .map(|m| m["params"].clone())
+                .collect()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{healthy_config, model, FakeCodex};
+    use super::testing::{healthy_config, healthy_origins, model, FakeCodex};
     use super::*;
     use crate::config::Env;
     use std::sync::Arc;
@@ -1032,12 +1373,13 @@ mod tests {
     fn the_spawn_line_is_exactly_the_designs() {
         let expected = "app-server --listen stdio:// --enable image_generation \
             --disable apps --disable plugins --disable hooks --disable memories \
-            --disable multi_agent --disable goals --disable shell_tool --disable tool_suggest \
-            --disable skill_search --disable browser_use --disable computer_use \
-            --disable in_app_browser -c notify=[] -c skills.bundled.enabled=false \
-            -c skills.include_instructions=false -c web_search=\"disabled\" \
-            -c approvals_reviewer=\"user\" -c windows.sandbox=\"unelevated\" \
-            -c thread_unload_delay_secs=5";
+            --disable multi_agent --disable multi_agent_v2 --disable goals --disable shell_tool \
+            --disable tool_suggest --disable skill_search --disable browser_use \
+            --disable computer_use --disable in_app_browser -c notify=[] \
+            -c skills.bundled.enabled=false -c skills.include_instructions=false \
+            -c agents.enabled=false -c tools.experimental_request_user_input.enabled=false \
+            -c web_search=\"disabled\" -c approvals_reviewer=\"user\" \
+            -c windows.sandbox=\"unelevated\" -c thread_unload_delay_secs=5";
         assert_eq!(
             spawn_args(),
             expected.split_whitespace().collect::<Vec<_>>()
@@ -1406,6 +1748,73 @@ mod tests {
         assert!(run(fake, &cfg(&[])).0.is_err());
     }
 
+    fn summary_of(fake: FakeCodex) -> String {
+        let (result, _) = run(fake, &cfg(&[]));
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, "IMAGEGEN_UNAVAILABLE");
+        failure.summary
+    }
+
+    #[test]
+    fn the_sub_agent_switches_are_checked() {
+        // A config that turns sub-agents back on, or a layer that leaves the setting out.
+        let fake = with_config(|c| c["agents"]["enabled"] = json!(true));
+        assert!(summary_of(fake).contains("agents.enabled = true"));
+        let fake = with_config(|c| {
+            c.as_object_mut().unwrap().remove("agents");
+        });
+        assert!(summary_of(fake).contains("agents.enabled (not in effect"));
+
+        // An enabled multi_agent_v2 outranks agents.enabled = false, so it fails as a bare
+        // value (the loop in a_switched_off_feature_turned_back_on_is_named) or as a table,
+        // which is what a user's `[features.multi_agent_v2]` becomes...
+        let fake = with_config(|c| {
+            c["features"]["multi_agent_v2"] =
+                json!({"enabled": true, "max_concurrent_threads_per_session": 3})
+        });
+        assert!(summary_of(fake).contains("features.multi_agent_v2 = {"));
+        // ...while the table codex-cli 0.156.0 reported for `--disable multi_agent_v2` over such
+        // a user table is off.
+        let fake = with_config(|c| {
+            c["features"]["multi_agent_v2"] =
+                json!({"enabled": false, "max_concurrent_threads_per_session": 3})
+        });
+        run(fake, &cfg(&[])).0.unwrap();
+    }
+
+    #[test]
+    fn the_user_input_switch_is_checked_by_its_origin() {
+        // config/read's config object never carries the setting, so its origin must be the
+        // child's own switches.
+        let managed = FakeCodex {
+            origins: json!({"tools.experimental_request_user_input.enabled": {
+                "name": {"type": "legacyManagedConfigTomlFromFile",
+                         "file": r"C:\ProgramData\OpenAI\Codex\managed_config.toml"},
+                "version": "sha256:0"}}),
+            ..FakeCodex::default()
+        };
+        let summary = summary_of(managed);
+        assert!(
+            summary.contains("tools.experimental_request_user_input.enabled (taken from")
+                && summary.contains("legacyManagedConfigTomlFromFile"),
+            "{summary}"
+        );
+
+        let missing = FakeCodex {
+            origins: json!({}),
+            ..FakeCodex::default()
+        };
+        assert!(summary_of(missing)
+            .contains("tools.experimental_request_user_input.enabled (not in effect"));
+
+        // What codex-cli 0.156.0 reported under the spawn line passes.
+        let healthy = FakeCodex {
+            origins: healthy_origins(),
+            ..FakeCodex::default()
+        };
+        run(healthy, &cfg(&[])).0.unwrap();
+    }
+
     #[test]
     fn a_configuration_codex_cannot_read_fails_closed() {
         // What codex-cli 0.156.0 answered for a config.toml with a legacy `profile` key.
@@ -1458,6 +1867,66 @@ mod tests {
         assert_eq!(
             mcp_off_map(&json!({"mcp_servers": null})),
             json!({"mcp_servers": {}})
+        );
+    }
+
+    #[test]
+    fn the_developer_instructions_are_the_designs_word_for_word() {
+        let design = include_str!("../docs/design.md");
+        let section = &design[design
+            .find("### developerInstructions")
+            .expect("the design has a developerInstructions section")..];
+        let quoted: Vec<&str> = section
+            .lines()
+            .skip_while(|l| !l.starts_with('>'))
+            .take_while(|l| l.starts_with('>'))
+            .map(|l| l.trim_start_matches('>').trim())
+            .collect();
+        assert_eq!(quoted.join(" "), DEVELOPER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn thread_and_turn_parameters_are_exactly_the_designs() {
+        let cfg = cfg(&[]);
+        let map = json!({"mcp_servers": {"x": {"enabled": false}}});
+        assert_eq!(
+            thread_start_params(&cfg, &map),
+            json!({
+                "model": "gpt-6-astra",
+                "cwd": r"C:\definitely-not-here\state\work",
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                "config": {"mcp_servers": {"x": {"enabled": false}}},
+                "ephemeral": false,
+            })
+        );
+        assert_eq!(
+            turn_start_params(&cfg, "t-1", "hello"),
+            json!({"threadId": "t-1",
+                   "input": [{"type": "text", "text": "hello", "text_elements": []}],
+                   "model": "gpt-6-astra", "effort": "low"})
+        );
+        let medium = super::Config {
+            effort: "medium".to_string(),
+            ..cfg
+        };
+        assert_eq!(turn_start_params(&medium, "t", "x")["effort"], "medium");
+    }
+
+    #[test]
+    fn the_input_text_tags_the_prompt_and_lists_references_only_when_given() {
+        let prompt = "a \"fox\"\nwith a \\ and ü";
+        assert_eq!(
+            generate_input_text(prompt, &[]),
+            format!("<image_prompt>\n{prompt}\n</image_prompt>")
+        );
+        let refs = [PathBuf::from(r"C:\a.png"), PathBuf::from(r"D:\b c\d.jpg")];
+        assert_eq!(
+            generate_input_text("p", &refs),
+            "<image_prompt>\np\n</image_prompt>\n<reference_images>\nC:\\a.png\nD:\\b c\\d.jpg\n\
+             </reference_images>"
         );
     }
 

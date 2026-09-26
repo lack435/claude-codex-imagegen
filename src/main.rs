@@ -16,9 +16,13 @@ mod config;
 mod errors;
 mod jsonrpc;
 mod mcp;
+mod output;
+mod preview;
+mod registry;
 #[cfg(test)]
 mod testutil;
 mod tools;
+mod turn;
 mod winjob;
 
 use std::sync::Arc;
