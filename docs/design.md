@@ -109,8 +109,9 @@ These facts constrain the design.
   `<CODEX_HOME>\thread-writer-locks\<id>.lock`. The lock is held until the thread unloads.
 - A thread unloads only when no connection is subscribed to it and it has been idle for
   `thread_unload_delay_secs` (60 s by default). The caller of start or resume is subscribed automatically.
-- A second process's `thread/resume` fails with `-32600 "thread <id> already has an active writer"`
-  [verified: source and Codex's own test; not yet live, see V7].
+- A second process's `thread/resume` fails with `-32600 "thread <id> already has an active writer"`.
+  After the holder unsubscribes, `thread/closed` arrives once the unload delay has passed (5.0 s with
+  `thread_unload_delay_secs=5`), and the second resume then succeeds [verified: live, V7].
 - `turn/start` on a thread whose turn is still running is merged into that turn, not queued
   [verified: source].
 
@@ -479,12 +480,18 @@ threads a server that is not in the disabled map, the turn is interrupted and th
 
 - **Child death.** In-flight turns fail with `APP_SERVER_FAILED`, unless an image already completed (see the
   success rule). The next call respawns the child and re-runs preflight.
-- **Our stdin closing.** When Claude Code closes our stdin:
+- **Our stdin closing.** When our stdin closes and we are given time to exit:
   1. interrupt running turns;
   2. let copies already in progress finish;
   3. close the child's stdin (an idle child exits in 0.05–0.07 s [verified]);
   4. wait up to 5 s in total;
   5. drop the job.
+
+  This sequence is best-effort. Claude Code 2.1.280 closes stdin and then kills the server's process tree
+  straight away [verified: bundle], so under Claude Code it usually does not run. Nothing depends on it:
+  - the job object reaps the Codex tree however we die;
+  - session records are written atomically as each image completes;
+  - cleanup is safe to retry after a crash.
 
 ### Codex version pinning
 
@@ -634,8 +641,9 @@ codex-imagegen.exe --cleanup [--older-than-days N]
 - It never deletes by wildcard in an output directory, never deletes a folder in the project, and never
   touches a thread that is not in one of its session records.
 
-`thread/delete` on a thread that has turns and has already unloaded is expected to work, because it deletes
-by rollout lookup [assumed: V8].
+`thread/delete` works on a thread that has turns and has already unloaded. It removes the rollout, and a
+later `thread/resume` then fails with `no rollout found for thread id <id>`. Codex's
+`generated_images\<threadId>` folder is left behind, which is why we remove it ourselves [verified: live, V8].
 
 ## Progress and cancellation
 
@@ -900,9 +908,9 @@ Each item must pass before the code that depends on it is considered done.
 
 | # | Check | Cost | When |
 | --- | --- | --- | --- |
-| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. | Claude usage only | M1 |
-| V7 | Two app-server children on one home: B's `thread/resume` of the existing smoke thread fails with "active writer" while A holds it, and succeeds after A unsubscribes and `thread/closed` arrives. Both children can also start threads at the same time. | free (no turn) | M1 |
-| V8 | After V7, `thread/delete` on the unloaded smoke thread, which has turns: the rollout and thread-history rows are gone, and `generated_images\<threadId>` remains for us to remove. | free | M1 |
+| V0 | A stub MCP server returning a fixed preview from the real pipeline, plus progress: Claude Code renders the JPEG and shows the progress line. TaskStop on a backgrounded call produces `notifications/cancelled`. Moved from M1 because the preview pipeline arrives in M2; it gates M2. | Claude usage only | M2 |
+| V7 | **Passed 2026-09-25.** Two app-server children on one home: B's `thread/resume` of the existing smoke thread failed with "active writer" while A held it. After A unsubscribed, `thread/closed` arrived at 5.0 s and B's resume succeeded. Both children also started threads at the same time. | free (no turn) | M1 |
+| V8 | **Passed 2026-09-25.** After V7, `thread/delete` on the unloaded smoke thread (3 turns) removed the rollout; resume then failed with "no rollout found". `generated_images\<threadId>` (3 PNGs) remained. | free | M1 |
 | V1 | The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded request's tools include `exec` with the nested image tool, and exclude shell, `write_stdin`, web search, browser, computer-use, multi-agent, skill and tool-suggest tools. The item is reported and `savedPath` is populated. | 1 image (part of smoke) | M2 |
 | V2 | Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. | part of smoke | M2 |
 | V3 | `reference_images` on generate reach `referenced_image_paths` and influence the output. | 1 image | M2 |
@@ -915,8 +923,8 @@ Each item must pass before the code that depends on it is considered done.
 | # | Scope |
 | --- | --- |
 | M0 | Repo scaffold: Cargo, toolchain, `.gitattributes`/`.gitignore`, `AGENTS.md` + `CLAUDE.md`, `build.ps1`, CI. |
-| M1 | MCP layer, `status`, spawn, handshake and preflight (all free), the CI contract check, V0, V7, V8. |
-| M2 | `generate` end to end: pre-check, copy on item, preview, progress, errors. `smoke.ps1` first version (V1, V2), V3. |
+| M1 | MCP layer, `status`, spawn, handshake and preflight (all free), the CI contract check, V7, V8. |
+| M2 | `generate` end to end: pre-check, copy on item, preview, progress, errors. V0, `smoke.ps1` first version (V1, V2), V3. |
 | M3 | Sessions: store, leases, `refine`, resume and unsubscribe, writer-lock handling, the full smoke, V9. Cleanup: expiry and `--cleanup`. |
 | M4 | Cancel and timeout (V4), `--codex-home` (V5). |
 | M5 | README: setup, a "verify it works" checklist in Claude Code, the IJG notice, the `.gitignore` tip. Release workflow when wanted. |
