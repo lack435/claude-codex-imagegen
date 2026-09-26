@@ -60,6 +60,8 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 pub enum DirSource {
     /// The call's `output_dir`.
     Argument,
+    /// For refine, the output folder its session was created with.
+    Recorded,
     /// The server's `--output-dir`.
     Flag,
     /// `%CLAUDE_PROJECT_DIR%\generated-images`.
@@ -72,6 +74,7 @@ impl DirSource {
     fn describe(self) -> &'static str {
         match self {
             Self::Argument => "from the output_dir argument",
+            Self::Recorded => "the session's own output folder, recorded when it was created",
             Self::Flag => "from the server's --output-dir flag",
             Self::Project => "the default: the project's generated-images folder",
             Self::State => {
@@ -90,8 +93,8 @@ pub struct OutputDir {
 }
 
 /// The output directory: the first of the call's `output_dir`, the server's `--output-dir`,
-/// `<project_dir>\generated-images`, and `<state_dir>\images` that applies. (Refine's recorded
-/// directory, milestone M3, slots in after the argument.)
+/// `<project_dir>\generated-images`, and `<state_dir>\images` that applies. (Refine uses its
+/// session's recorded directory, [`DirSource::Recorded`], when the call names none.)
 ///
 /// `project_dir` is `CLAUDE_PROJECT_DIR` when Claude Code sets it to an absolute path. A relative
 /// argument or flag resolves against it, and otherwise against `cwd`, the server's working

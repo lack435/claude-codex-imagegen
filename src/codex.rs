@@ -748,11 +748,46 @@ pub fn thread_start_params(cfg: &Config, mcp_off: &Value) -> Value {
     })
 }
 
+/// `thread/resume`: the thread parameters again, with the MCP-off map built from a fresh
+/// `config/read`, plus `threadId` and `excludeTurns: true` (docs/design.md, "Thread and turn
+/// parameters"). `ephemeral` is left out: `ThreadResumeParams` has no such field, and the thread
+/// was created persistent.
+pub fn thread_resume_params(cfg: &Config, thread_id: &str, mcp_off: &Value) -> Value {
+    let mut params = thread_start_params(cfg, mcp_off);
+    let object = params
+        .as_object_mut()
+        .expect("thread parameters are an object");
+    object.remove("ephemeral");
+    object.insert("threadId".to_string(), json!(thread_id));
+    object.insert("excludeTurns".to_string(), json!(true));
+    params
+}
+
 /// The text a generate turn sends: the prompt inside `<image_prompt>`, so it stays apart from
 /// anything else, and the reference images, absolute, one per line (docs/design.md, "Input text
 /// sent to Codex").
 pub fn generate_input_text(prompt: &str, reference_images: &[PathBuf]) -> String {
     let mut text = format!("<image_prompt>\n{prompt}\n</image_prompt>");
+    push_references(&mut text, reference_images);
+    text
+}
+
+/// The text a refine turn sends: the feedback inside `<edit_request>`, the image to edit named in
+/// `<edit_target>` (Codex never picks it from memory [decided]), then the reference images.
+pub fn refine_input_text(
+    feedback: &str,
+    edit_target: &Path,
+    reference_images: &[PathBuf],
+) -> String {
+    let mut text = format!(
+        "<edit_request>\n{feedback}\n</edit_request>\n<edit_target>{}</edit_target>",
+        edit_target.display()
+    );
+    push_references(&mut text, reference_images);
+    text
+}
+
+fn push_references(text: &mut String, reference_images: &[PathBuf]) {
     if !reference_images.is_empty() {
         text.push_str("\n<reference_images>");
         for path in reference_images {
@@ -761,7 +796,6 @@ pub fn generate_input_text(prompt: &str, reference_images: &[PathBuf]) -> String
         }
         text.push_str("\n</reference_images>");
     }
-    text
 }
 
 /// `turn/start`: one text input, and the agent model and effort. The agent only relays the prompt,
@@ -1018,6 +1052,10 @@ pub(crate) mod testing {
         pub on_thread_start: Vec<Value>,
         /// The error `thread/start` answers with, for as many calls as there are entries.
         pub thread_start_errors: Vec<Value>,
+        /// The error `thread/resume` answers with, for as many calls as there are entries.
+        pub resume_errors: Vec<Value>,
+        /// Sent right after a `thread/resume` reply.
+        pub on_thread_resume: Vec<Value>,
         /// Whether `turn/start` is answered at once. If not, a step answers it, or nothing does.
         pub answer_turn_start: bool,
         /// The error `turn/start` answers with instead of a turn.
@@ -1034,6 +1072,8 @@ pub(crate) mod testing {
                 on_thread_start: vec![json!({"method": "thread/started",
                     "params": {"thread": {"id": THREAD_ID}}})],
                 thread_start_errors: Vec::new(),
+                resume_errors: Vec::new(),
+                on_thread_resume: Vec::new(),
                 answer_turn_start: true,
                 turn_start_error: None,
                 steps: Vec::new(),
@@ -1127,10 +1167,17 @@ pub(crate) mod testing {
         /// A method the fake dies on: it closes its output instead of answering, as a child
         /// that exits while handling the request does.
         pub exits_on: Option<&'static str>,
+        /// The `codexHome` the handshake reports.
+        pub codex_home: String,
+        /// The error `thread/delete` answers with, by thread id. Any other thread is deleted.
+        pub delete_errors: std::collections::HashMap<String, Value>,
         pub turn: TurnScript,
         /// Every message the client sent, in order.
         pub seen: Arc<Mutex<Vec<Value>>>,
     }
+
+    /// The `codexHome` a default fake reports.
+    pub const CODEX_HOME: &str = r"C:\Users\someone\.codex";
 
     pub fn model(id: &str, hidden: bool) -> Value {
         json!({"id": id, "model": id, "upgrade": null, "displayName": id, "description": "",
@@ -1204,6 +1251,8 @@ pub(crate) mod testing {
                         "secondary": null}}
                 })),
                 exits_on: None,
+                codex_home: CODEX_HOME.to_string(),
+                delete_errors: std::collections::HashMap::new(),
                 turn: TurnScript::default(),
                 seen: Arc::default(),
             }
@@ -1218,8 +1267,15 @@ pub(crate) mod testing {
             let err = |error: &Value| Some(json!({"id": id, "error": error}));
             match method {
                 "initialize" => ok(json!({"userAgent": self.user_agent,
-                                          "codexHome": r"C:\Users\someone\.codex",
+                                          "codexHome": self.codex_home,
                                           "platformFamily": "windows", "platformOs": "windows"})),
+                "thread/delete" => {
+                    let thread = message["params"]["threadId"].as_str().unwrap_or("");
+                    match self.delete_errors.get(thread) {
+                        Some(error) => err(error),
+                        None => ok(json!({})),
+                    }
+                }
                 "account/read" => ok(self.account.clone()),
                 "modelProvider/capabilities/read" => ok(self.capabilities.clone()),
                 "model/list" => {
@@ -1247,6 +1303,7 @@ pub(crate) mod testing {
 
         pub fn connect(self) -> AppServer {
             let mut thread_start_errors = self.turn.thread_start_errors.clone().into_iter();
+            let mut resume_errors = self.turn.resume_errors.clone().into_iter();
             fake::connect(move |message, out| {
                 self.seen.lock().unwrap().push(message.clone());
                 if self
@@ -1268,6 +1325,21 @@ pub(crate) mod testing {
                             "approvalPolicy": "never", "approvalsReviewer": "user",
                             "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}}));
                         for note in &self.turn.on_thread_start {
+                            out.send(note.clone());
+                        }
+                    }
+                    "thread/resume" => {
+                        if let Some(error) = resume_errors.next() {
+                            out.send(json!({"id": id, "error": error}));
+                            return Flow::Continue;
+                        }
+                        out.send(json!({"id": id, "result": {
+                            "thread": {"id": message["params"]["threadId"], "ephemeral": false,
+                                       "turns": []},
+                            "model": message["params"]["model"], "cwd": message["params"]["cwd"],
+                            "approvalPolicy": "never", "approvalsReviewer": "user",
+                            "sandbox": {"type": "readOnly"}, "reasoningEffort": "low"}}));
+                        for note in &self.turn.on_thread_resume {
                             out.send(note.clone());
                         }
                     }
@@ -1903,6 +1975,20 @@ mod tests {
             })
         );
         assert_eq!(
+            thread_resume_params(&cfg, "t-1", &map),
+            json!({
+                "threadId": "t-1",
+                "excludeTurns": true,
+                "model": "gpt-6-astra",
+                "cwd": r"C:\definitely-not-here\state\work",
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                "config": {"mcp_servers": {"x": {"enabled": false}}},
+            })
+        );
+        assert_eq!(
             turn_start_params(&cfg, "t-1", "hello"),
             json!({"threadId": "t-1",
                    "input": [{"type": "text", "text": "hello", "text_elements": []}],
@@ -1927,6 +2013,20 @@ mod tests {
             generate_input_text("p", &refs),
             "<image_prompt>\np\n</image_prompt>\n<reference_images>\nC:\\a.png\nD:\\b c\\d.jpg\n\
              </reference_images>"
+        );
+        let target = Path::new(r"C:\codex\generated_images\t\exec-1.png");
+        assert_eq!(
+            refine_input_text(prompt, target, &[]),
+            format!(
+                "<edit_request>\n{prompt}\n</edit_request>\n\
+                 <edit_target>C:\\codex\\generated_images\\t\\exec-1.png</edit_target>"
+            )
+        );
+        assert_eq!(
+            refine_input_text("f", target, &refs[..1]),
+            "<edit_request>\nf\n</edit_request>\n\
+             <edit_target>C:\\codex\\generated_images\\t\\exec-1.png</edit_target>\n\
+             <reference_images>\nC:\\a.png\n</reference_images>"
         );
     }
 

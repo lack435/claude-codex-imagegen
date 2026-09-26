@@ -418,8 +418,9 @@ OPTIONS:
 OTHER:
   --doctor                    Check the Codex CLI, login, plan, image capability and model from
                               a terminal (free: no image is generated), then exit.
-  --cleanup                   Sweep expired sessions across all projects, then exit.
-                              (Not implemented yet.)
+  --cleanup                   Remove expired sessions across all projects (their Codex
+                              threads, Codex's image copies and the published files), print
+                              what was removed and skipped, then exit.
   --older-than-days <n>       With --cleanup: override the TTL (0 = every session not in use).
   --help, -h                  Show this help.
   --version, -V               Show the version.
@@ -717,6 +718,6 @@ mod tests {
         for flag in FLAGS {
             assert!(USAGE.contains(flag), "USAGE does not mention {flag}");
         }
-        assert!(USAGE.contains("Not implemented yet"));
+        assert!(!USAGE.contains("Not implemented yet"));
     }
 }

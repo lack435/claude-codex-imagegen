@@ -4,25 +4,39 @@
 
 .DESCRIPTION
   Drives the staged server over MCP stdio, as Claude Code does: one request at a time, each
-  response matched by its id, lines read with a timeout.
+  response matched by its id, lines read with a timeout. Every server it starts runs with
+  CODEX_IMAGEGEN_HOME pointing at a fresh state folder under the run's working folder, so the
+  sessions it makes and removes are its own, never the user's.
 
   Without -SpendQuota it runs only the free steps: initialize, tools/list and status (status
   starts Codex and makes free calls only), then closes the server's stdin and checks that no Codex
-  process of ours is left. Nothing is generated and no quota is spent.
+  process of ours is left, then runs --cleanup on the empty state folder. Nothing is generated and
+  no quota is spent.
 
-  With -SpendQuota it also generates two images, about 2 images of the ChatGPT plan's image quota
-  (docs/design.md, "smoke.ps1"; this is the milestone M2 version):
-    a) generate with a prompt holding double quotes, a backslash, a newline and non-ASCII text
-       (V2: Codex must use it verbatim);
-    b) generate again with the image from (a) as a reference image (V3);
-  then reads Codex's rollout trace for the tools the agent model was offered (V1) and for the
-  image tool's referenced_image_paths (V3), and the server's stderr for the savedPath Codex
-  reported for each image (V1).
+  With -SpendQuota it also spends about 3 images of the ChatGPT plan's image quota (docs/design.md,
+  "smoke.ps1"; this is the milestone M3 version):
+    a) generate(session=smoke-<stamp>) with a prompt holding double quotes, a backslash, a newline
+       and non-ASCII text (V2: Codex must use it verbatim);
+    b) refine that session with feedback holding the same kinds of character (V2 for refine), and
+       check in Codex's rollout trace that the image call's referenced_image_paths named the
+       first image, the edit target (V3 for refine);
+    c) kill the server, start a fresh one on the same state folder, and refine again (resume after
+       a restart);
+    d) status lists the session with 3 turns;
+  then reads the trace for the tools the agent model was offered (V1) and the servers' stderr for
+  the savedPath Codex reported for each image (V1), and finally, free:
+    e) closes every server and runs codex-imagegen.exe --cleanup --older-than-days 0 on the state
+       folder, which must remove the session's record, its three published files, Codex's image
+       folder for its thread, and the thread's rollout.
+
+  With -Concurrent as well (V9, about 2 more images), two server processes on the same state
+  folder, each with its own stdin, generate at the same moment; both must succeed, and both
+  sessions must be recorded. Step (e) then removes them too.
 
   With -CheckTrace it runs only the V1 and V3 trace checks, against the trace folder of an earlier
   run (its "trace" folder, or one trace-* folder in it). It starts nothing and spends nothing.
 
-  Run it after .\build.ps1, when a change touches the protocol, spawning or turn handling. Tell
+  Run it after .\build.ps1, when a change touches the protocol, spawning or session handling. Tell
   the owner the cost before running it with -SpendQuota.
 
 .EXAMPLE
@@ -32,14 +46,17 @@
 param(
     # Required to generate images. Without it only the free steps run.
     [switch]$SpendQuota,
+    # With -SpendQuota: also V9, two servers generating at the same moment (about 2 more images).
+    [switch]$Concurrent,
     # The server to test. Default: dist\codex-imagegen.exe next to this script.
     [string]$Exe,
     # Passed to the server as --codex-bin when given.
     [string]$CodexBin,
     # Offline: run only the V1 and V3 trace checks against this existing trace folder.
     [string]$CheckTrace,
-    # With -CheckTrace: the reference image V3 looks for in referenced_image_paths.
-    [string]$ReferencePath
+    # With -CheckTrace: the image V3 looks for in referenced_image_paths. Several paths may be
+    # given; any of them counts (a refine's edit target is Codex's copy or ours, byte-identical).
+    [string[]]$ReferencePath
 )
 
 # Not 'Stop': failures are collected as checks and summarised at the end.
@@ -343,9 +360,10 @@ function Get-FullPathOrSelf([string]$Path) {
     catch { return $Path }
 }
 
-# V1 and V3 from the trace under $TraceRoot. V3 looks for $Reference, when given, in the image
-# calls' referenced_image_paths. The lists are also written to $ReportPath, when given.
-function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$ReportPath) {
+# V1 and V3 from the trace under $TraceRoot. V3 looks for any of $References, when given, in the
+# image calls' referenced_image_paths. The lists are also written to $ReportPath, when given.
+function Invoke-TraceChecks([string]$TraceRoot, [string[]]$References, [string]$ReportPath,
+    [string]$V3Name = 'V3: the reference reached the image tool''s referenced_image_paths') {
     Write-Host '-> V1: tools offered to the agent model (rollout trace)'
     $offered = $null
     $calls = @()
@@ -417,8 +435,9 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
     }
 
     Write-Host '-> V3: the reference image in the image call (rollout trace)'
-    $v3Name = 'V3: the reference reached the image tool''s referenced_image_paths'
-    if (-not $Reference) {
+    $v3Name = $V3Name
+    $given = @($References | Where-Object { $_ })
+    if ($given.Count -eq 0) {
         Add-Check $v3Name 'SKIP' 'no reference image to look for'
         return
     }
@@ -429,13 +448,14 @@ function Invoke-TraceChecks([string]$TraceRoot, [string]$Reference, [string]$Rep
     # Only a call made after the reference existed can name it. Text Codex sent to the model
     # never counts: the developer instructions, the tool's declaration and the tagged input name
     # both the parameter and the path whatever the agent does.
-    $wanted = Get-FullPathOrSelf $Reference
-    $hits = @($calls | Where-Object { @($_.Paths | ForEach-Object { Get-FullPathOrSelf $_ }) -contains $wanted })
+    # Any of the paths counts: a refine's edit target is Codex's copy or ours, byte-identical.
+    $wanted = @($given | ForEach-Object { Get-FullPathOrSelf $_ })
+    $hits = @($calls | Where-Object { @($_.Paths | ForEach-Object { Get-FullPathOrSelf $_ } | Where-Object { $wanted -contains $_ }).Count -gt 0 })
     if ($hits.Count -gt 0) {
-        Add-Check $v3Name 'PASS' "$wanted (from the $($hits[0].Source) of the image call in $($hits[0].Folder))"
+        Add-Check $v3Name 'PASS' "$($wanted -join ' or ') (from the $($hits[0].Source) of the image call in $($hits[0].Folder))"
     }
     elseif ($calls.Count -gt 0 -and @($calls | Where-Object { -not $_.Known }).Count -eq 0) {
-        Test-Check $v3Name $false "no image call listed $wanted; see the image calls above"
+        Test-Check $v3Name $false "no image call listed $($wanted -join ' or '); see the image calls above"
     }
     else {
         Add-Check $v3Name 'MANUAL' "$($calls.Count) image call(s) found, not every one readable; inspect $TraceRoot by hand"
@@ -454,7 +474,7 @@ if ($CheckTrace) {
     Write-Host ''
     Write-Host 'codex-imagegen smoke test: offline trace check. Nothing is started and nothing is spent.'
     Write-Host "Trace: $CheckTrace"
-    if ($ReferencePath) { Write-Host "Reference image: $ReferencePath" }
+    if ($ReferencePath) { Write-Host "Reference image: $($ReferencePath -join ' or ')" }
     Write-Host ''
     if (-not (Test-Path -LiteralPath $CheckTrace -PathType Container)) {
         Write-Host "Not a folder: $CheckTrace" -ForegroundColor Red
@@ -468,118 +488,173 @@ if ($CheckTrace) {
     Complete-Smoke 'TRACE CHECK PASS' '' 'TRACE CHECK FAIL'
 }
 
+if ($Concurrent -and -not $SpendQuota) {
+    Write-Host '-Concurrent generates images (V9) and needs -SpendQuota.' -ForegroundColor Red
+    exit 1
+}
+
 # ---------------------------------------------------------------------------------------------
 # The live run
 # ---------------------------------------------------------------------------------------------
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $work = Join-Path ([IO.Path]::GetTempPath()) "codex-imagegen-smoke-$stamp"
-New-Item -ItemType Directory -Path $work -Force | Out-Null
 $outDir = Join-Path $work 'images'
 $traceRoot = Join-Path $work 'trace'
+# The servers' state base (CODEX_IMAGEGEN_HOME): fresh, so every session here is the run's own.
+$stateBase = Join-Path $work 'state'
+# The servers' working directory, which names the per-project state folder under the base.
+$projectDir = Join-Path $work 'project'
+foreach ($d in @($work, $outDir, $stateBase, $projectDir)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
 Write-Host ''
 if ($SpendQuota) {
+    $images = if ($Concurrent) { 'about 5 images' } else { 'about 3 images' }
     Write-Host 'codex-imagegen smoke test: PAID run.' -ForegroundColor Yellow
-    Write-Host 'Expected cost: about 2 images of the ChatGPT plan''s image quota, plus the agent' -ForegroundColor Yellow
-    Write-Host 'model''s tokens for two short turns.' -ForegroundColor Yellow
+    Write-Host "Expected cost: $images of the ChatGPT plan's image quota, plus the agent" -ForegroundColor Yellow
+    Write-Host 'model''s tokens for as many short turns.' -ForegroundColor Yellow
 }
 else {
-    Write-Host 'codex-imagegen smoke test: free steps only (initialize, tools/list, status).'
-    Write-Host 'Pass -SpendQuota to also generate images (about 2 images of the image quota).'
+    Write-Host 'codex-imagegen smoke test: free steps only (initialize, tools/list, status, --cleanup).'
+    Write-Host 'Pass -SpendQuota to also generate and refine images (about 3 images of the image quota).'
 }
 Write-Host "Working folder: $work"
+Write-Host "State base (CODEX_IMAGEGEN_HOME for every server here): $stateBase"
 Write-Host ''
 
 if (-not (Test-Path -LiteralPath $Exe)) {
     Write-Host "Server not found: $Exe. Run .\build.ps1 first." -ForegroundColor Red
     exit 1
 }
+$exePath = (Resolve-Path -LiteralPath $Exe).Path
 
 # ---------------------------------------------------------------------------------------------
-# The server process and a minimal MCP client
+# Server processes and a minimal MCP client
 # ---------------------------------------------------------------------------------------------
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = (Resolve-Path -LiteralPath $Exe).Path
-if ($CodexBin) { $psi.Arguments = '--codex-bin "' + $CodexBin + '"' }
-$psi.UseShellExecute = $false
-$psi.RedirectStandardInput = $true
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.CreateNoWindow = $true
-$psi.StandardOutputEncoding = $utf8
-$psi.StandardErrorEncoding = $utf8
-if ($SpendQuota) {
-    # Inherited by the Codex child: it writes a rollout trace bundle per thread (V1).
-    New-Item -ItemType Directory -Path $traceRoot -Force | Out-Null
-    $psi.EnvironmentVariables['CODEX_ROLLOUT_TRACE_ROOT'] = $traceRoot
+# How every codex-imagegen process here is started: the isolated state base, the run's own
+# working directory, and no CLAUDE_PROJECT_DIR, so nothing lands in a real project.
+function New-StartInfo([string]$Arguments) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exePath
+    $argv = @()
+    if ($CodexBin) { $argv += '--codex-bin "' + $CodexBin + '"' }
+    if ($Arguments) { $argv += $Arguments }
+    $psi.Arguments = $argv -join ' '
+    $psi.WorkingDirectory = $projectDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
+    $psi.EnvironmentVariables['CODEX_IMAGEGEN_HOME'] = $stateBase
+    $psi.EnvironmentVariables.Remove('CLAUDE_PROJECT_DIR')
+    if ($SpendQuota) {
+        # Inherited by the Codex child: it writes a rollout trace bundle per thread (V1, V3).
+        New-Item -ItemType Directory -Path $traceRoot -Force | Out-Null
+        $psi.EnvironmentVariables['CODEX_ROLLOUT_TRACE_ROOT'] = $traceRoot
+    }
+    return $psi
 }
 
-$proc = [System.Diagnostics.Process]::Start($psi)
-# Our own writer over the pipe: UTF-8 without a byte-order mark, which Windows PowerShell's
-# default stdin encoding would not guarantee.
-$script:stdin = New-Object System.IO.StreamWriter($proc.StandardInput.BaseStream, $utf8)
-$script:stdout = $proc.StandardOutput
-# Drained continuously, so the server never blocks on a full stderr pipe; saved at the end.
-$stderrTask = $proc.StandardError.ReadToEndAsync()
-$script:pendingRead = $null
-$script:eof = $false
-$script:nextId = 0
+function Start-Server([string]$Label) {
+    $proc = [System.Diagnostics.Process]::Start((New-StartInfo ''))
+    return [pscustomobject]@{
+        Label       = $Label
+        Proc        = $proc
+        # Our own writer over the pipe: UTF-8 without a byte-order mark, which Windows
+        # PowerShell's default stdin encoding would not guarantee.
+        Stdin       = New-Object System.IO.StreamWriter($proc.StandardInput.BaseStream, $utf8)
+        Stdout      = $proc.StandardOutput
+        # Drained continuously, so the server never blocks on a full stderr pipe.
+        StderrTask  = $proc.StandardError.ReadToEndAsync()
+        Stderr      = $null
+        PendingRead = $null
+        Eof         = $false
+        NextId      = 0
+        Descendants = @()
+    }
+}
 
 # One line from the server, or $null after $TimeoutMs. A read that times out stays pending and is
 # picked up by the next call, so no line is ever lost.
-function Read-ServerLine([int]$TimeoutMs) {
-    if ($null -eq $script:pendingRead) { $script:pendingRead = $script:stdout.ReadLineAsync() }
-    if (-not $script:pendingRead.Wait([Math]::Max(1, $TimeoutMs))) { return $null }
-    $line = $script:pendingRead.Result
-    $script:pendingRead = $null
-    if ($null -eq $line) { $script:eof = $true }
+function Read-ServerLine($Server, [int]$TimeoutMs) {
+    if ($null -eq $Server.PendingRead) { $Server.PendingRead = $Server.Stdout.ReadLineAsync() }
+    if (-not $Server.PendingRead.Wait([Math]::Max(1, $TimeoutMs))) { return $null }
+    $line = $Server.PendingRead.Result
+    $Server.PendingRead = $null
+    if ($null -eq $line) { $Server.Eof = $true }
     return $line
 }
 
-# Send one request and wait for its response. Notifications in between (progress) are shown.
-# Throws on a timeout, a closed stream, or a response to some other id.
-function Invoke-Mcp([string]$Method, $Params, [int]$TimeoutSec, [switch]$WithProgress) {
-    $script:nextId++
-    $id = $script:nextId
+# Send one request; its id.
+function Send-Mcp($Server, [string]$Method, $Params, [switch]$WithProgress) {
+    $Server.NextId++
+    $id = $Server.NextId
     $message = [ordered]@{ jsonrpc = '2.0'; id = $id; method = $Method }
     if ($null -ne $Params) {
         if ($WithProgress) { $Params['_meta'] = @{ progressToken = $id } }
         $message['params'] = $Params
     }
-    $line = ConvertTo-Json -InputObject $message -Depth 20 -Compress
-    $script:stdin.Write($line + "`n")
-    $script:stdin.Flush()
+    $Server.Stdin.Write((ConvertTo-Json -InputObject $message -Depth 20 -Compress) + "`n")
+    $Server.Stdin.Flush()
+    return $id
+}
+
+# Wait for the response to request $Id. Notifications in between (progress) are shown. Throws on a
+# timeout, a closed stream, an error response, or a response to some other id.
+function Receive-Mcp($Server, [int]$Id, [string]$Method, [int]$TimeoutSec) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ($true) {
         $left = [int]($deadline - (Get-Date)).TotalMilliseconds
-        if ($left -le 0) { throw "no response to $Method (id $id) within $TimeoutSec s" }
-        $text = Read-ServerLine $left
+        if ($left -le 0) { throw "$($Server.Label): no response to $Method (id $Id) within $TimeoutSec s" }
+        $text = Read-ServerLine $Server $left
         if ($null -eq $text) {
-            if ($script:eof) { throw "the server closed its output before answering $Method" }
+            if ($Server.Eof) { throw "$($Server.Label): the server closed its output before answering $Method" }
             continue
         }
         if ($text.Trim() -eq '') { continue }
         $obj = ConvertFrom-Json -InputObject $text
         $names = $obj.PSObject.Properties.Name
         if (($names -contains 'id') -and ($null -ne $obj.id)) {
-            if ([string]$obj.id -ne [string]$id) { throw "got a response to id $($obj.id) while waiting for $id" }
-            if ($names -contains 'error') { throw "$Method failed: $($obj.error.message)" }
+            if ([string]$obj.id -ne [string]$Id) { throw "$($Server.Label): got a response to id $($obj.id) while waiting for $Id" }
+            if ($names -contains 'error') { throw "$($Server.Label): $Method failed: $($obj.error.message)" }
             return $obj.result
         }
         if ($obj.method -eq 'notifications/progress') {
-            Write-Host "      progress: $($obj.params.message)" -ForegroundColor DarkGray
+            Write-Host "      [$($Server.Label)] progress: $($obj.params.message)" -ForegroundColor DarkGray
         }
         else {
-            Write-Host "      notification: $($obj.method)" -ForegroundColor DarkGray
+            Write-Host "      [$($Server.Label)] notification: $($obj.method)" -ForegroundColor DarkGray
         }
     }
+}
+
+function Invoke-Mcp($Server, [string]$Method, $Params, [int]$TimeoutSec, [switch]$WithProgress) {
+    $id = Send-Mcp $Server $Method $Params -WithProgress:$WithProgress
+    return Receive-Mcp $Server $id $Method $TimeoutSec
+}
+
+function Initialize-Server($Server) {
+    $init = Invoke-Mcp $Server 'initialize' @{ protocolVersion = '2025-11-25'; capabilities = @{}; clientInfo = @{ name = 'codex-imagegen-smoke'; version = '0' } } 30
+    $Server.Stdin.Write('{"jsonrpc":"2.0","method":"notifications/initialized"}' + "`n")
+    $Server.Stdin.Flush()
+    return $init
 }
 
 function Get-ResultText($Result) {
     $texts = @($Result.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text })
     return ($texts -join "`n")
+}
+
+function Invoke-Tool($Server, [string]$Tool, $Arguments, [int]$TimeoutSec = 420) {
+    $started = Get-Date
+    $result = Invoke-Mcp $Server 'tools/call' @{ name = $Tool; arguments = $Arguments } $TimeoutSec -WithProgress
+    Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
+    Write-Host ((Get-ResultText $result) -replace '(?m)^', '      ') -ForegroundColor DarkGray
+    return $result
 }
 
 # Width and height from a JPEG's SOF marker, or $null.
@@ -619,9 +694,95 @@ function Get-Descendants([int]$RootPid) {
     return $found
 }
 
-# Check one generate result against the design (docs/design.md, "Success result").
-function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]$Prompt) {
-    $head = ((Get-ResultText $Result) -split "`n" | Select-Object -First 3) -join ' | '
+# Remember every process of the server's alive now. Taken while the server still runs, so the
+# parent chain can still be walked; the union keeps a child that died and was replaced.
+function Watch-Descendants($Server) {
+    if (-not $Server.Proc.HasExited) {
+        $Server.Descendants = @(@($Server.Descendants) + @(Get-Descendants $Server.Proc.Id) | Sort-Object ProcessId, CreationDate -Unique)
+    }
+}
+
+# Stop the server: close its stdin, or kill the exe outright (-Kill), which the job object must
+# answer by taking the whole Codex tree with it. Either way no process of ours may be left.
+function Stop-Server($Server, [switch]$Kill) {
+    Watch-Descendants $Server
+    if ($Kill) {
+        Write-Host "-> kill $($Server.Label)"
+        try { $Server.Proc.Kill() } catch { }
+    }
+    else {
+        Write-Host "-> close $($Server.Label)'s stdin"
+        try { $Server.Stdin.Close() } catch { }
+    }
+    $exited = $Server.Proc.WaitForExit(20000)
+    Test-Check "$($Server.Label): the server exits$(if ($Kill) { ' when killed' } else { ' after its stdin closes' })" $exited ''
+    if (-not $exited) { try { $Server.Proc.Kill() } catch { } }
+    if ($Server.StderrTask.Wait(5000)) {
+        $Server.Stderr = $Server.StderrTask.Result
+        $name = ($Server.Label -replace '[^A-Za-z0-9]+', '-').Trim('-')
+        $logPath = Join-Path $work "stderr-$name.log"
+        [IO.File]::WriteAllText($logPath, $Server.Stderr, $utf8)
+        Write-Host "      stderr saved to $logPath" -ForegroundColor DarkGray
+    }
+    Start-Sleep -Milliseconds 500
+    $survivors = @()
+    foreach ($p in $Server.Descendants) {
+        $now = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ProcessId)" -ErrorAction SilentlyContinue
+        if ($now -and $now.CreationDate -eq $p.CreationDate) { $survivors += "$($p.Name) (pid $($p.ProcessId))" }
+    }
+    if ($Server.Descendants.Count -gt 0) {
+        Test-Check "$($Server.Label): no Codex process of ours is left" ($survivors.Count -eq 0) ($survivors -join ', ')
+    }
+    else {
+        Add-Check "$($Server.Label): no Codex process of ours is left" 'SKIP' 'no child process was recorded'
+    }
+}
+
+# codex-imagegen.exe --cleanup --older-than-days 0 on the state base: its exit code and output.
+function Invoke-Cleanup {
+    $proc = [System.Diagnostics.Process]::Start((New-StartInfo '--cleanup --older-than-days 0'))
+    $proc.StandardInput.Close()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit(180000)
+    if (-not $exited) { try { $proc.Kill() } catch { } }
+    [void]$outTask.Wait(5000)
+    [void]$errTask.Wait(5000)
+    $result = [pscustomobject]@{
+        Exited   = $exited
+        ExitCode = $(if ($exited) { $proc.ExitCode } else { $null })
+        Out      = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' })
+        Err      = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' })
+    }
+    Write-Host ($result.Out -replace '(?m)^', '      ') -ForegroundColor DarkGray
+    if ($result.Err.Trim()) { Write-Host ($result.Err -replace '(?m)^', '      ') -ForegroundColor DarkGray }
+    return $result
+}
+
+# The project's session store as the servers here wrote it, parsed, or $null.
+function Read-Store {
+    $files = @(Get-ChildItem -LiteralPath $stateBase -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName 'sessions.json' } | Where-Object { Test-Path -LiteralPath $_ })
+    if ($files.Count -ne 1) { return $null }
+    return ConvertFrom-JsonText ([IO.File]::ReadAllText($files[0], $utf8))
+}
+
+# One session's record from a parsed store, or $null.
+function Get-Record($Store, [string]$Session) {
+    return Get-Field $Store 'sessions', $Session.ToLowerInvariant()
+}
+
+# The rollout files of a thread under a Codex home.
+function Get-Rollouts([string]$CodexHome, [string]$ThreadId) {
+    $sessions = Join-Path $CodexHome 'sessions'
+    if (-not (Test-Path -LiteralPath $sessions)) { return @() }
+    return @(Get-ChildItem -LiteralPath $sessions -Recurse -File -Filter "*$ThreadId*" -ErrorAction SilentlyContinue)
+}
+
+# Check one generate or refine result against the design (docs/design.md, "Success result").
+function Test-ImageResult([string]$Label, $Result, [string]$Session, [int]$Version, [string]$Sent, [string]$SentWhat) {
+    $text = Get-ResultText $Result
+    $head = ($text -split "`n" | Select-Object -First 3) -join ' | '
     Test-Check "$Label is not an error" ($Result.isError -ne $true) $head
     $images = @($Result.content | Where-Object { $_.type -eq 'image' })
     Test-Check "$Label has exactly one image block" ($images.Count -eq 1) "$($images.Count) image block(s)"
@@ -639,13 +800,14 @@ function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]
             Test-Check "$Label preview long edge is at most 1024 px" ($edge -le 1024) "$($size.Width)x$($size.Height)"
         }
     }
-    $text = Get-ResultText $Result
-    $expected = Join-Path $outDir "$Session-v1.png"
+    $first = ($text -split "`n" | Select-Object -First 1)
+    Test-Check "$Label is version $Version of $Session" ($first -ceq "session: $Session   version: $Version") $first
+    $expected = Join-Path $outDir "$Session-v$Version.png"
     $named = $text -match ('(?m)^image: ' + [regex]::Escape($expected) + '  \(')
-    Test-Check "$Label names $Session-v1.png in the output folder" $named
+    Test-Check "$Label names $Session-v$Version.png in the output folder" $named
     Test-Check "$Label file exists" (Test-Path -LiteralPath $expected) $expected
     # V2, compared here rather than taken from the server's own comparison: the prompt Codex says
-    # it used, JSON-quoted on its line, must equal the prompt sent, whitespace at either end aside.
+    # it used, JSON-quoted on its line, must equal the text sent, whitespace at either end aside.
     $promptLines = @($text -split "`n" | Where-Object { $_ -match '^codex prompt: ' })
     if ($promptLines.Count -ne 1 -or $promptLines[0] -eq 'codex prompt: (not reported)') {
         Test-Check "$Label Codex reported the prompt it used (V2)" $false ($promptLines -join ' | ')
@@ -653,7 +815,7 @@ function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]
     else {
         try {
             $reported = [string](ConvertFrom-Json -InputObject $promptLines[0].Substring('codex prompt: '.Length))
-            Test-Check "$Label Codex used the prompt verbatim (V2)" ($reported.Trim() -ceq $Prompt.Trim()) $reported
+            Test-Check "$Label Codex used the $SentWhat verbatim (V2)" ($reported.Trim() -ceq $Sent.Trim()) $reported
         }
         catch {
             Test-Check "$Label Codex's prompt line is readable (V2)" $false $promptLines[0]
@@ -671,149 +833,215 @@ function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]
 # The run
 # ---------------------------------------------------------------------------------------------
 
-$codexPid = $null
-$descendants = @()
+$servers = New-Object System.Collections.Generic.List[object]
+# The sessions made here, each with the number of images it should have.
+$sessionsMade = [ordered]@{}
+$session = "smoke-$stamp"
 $v1 = $null
-# The sessions whose generate succeeded, each of which must have logged Codex's savedPath (V1).
-$sessionsMade = @()
+$codexPid = $null
 try {
+    $s1 = Start-Server 'server 1'
+    $servers.Add($s1)
     Write-Host '-> initialize'
-    $init = Invoke-Mcp 'initialize' @{ protocolVersion = '2025-11-25'; capabilities = @{}; clientInfo = @{ name = 'codex-imagegen-smoke'; version = '0' } } 30
+    $init = Initialize-Server $s1
     Test-Check 'initialize negotiates 2025-11-25' ($init.protocolVersion -eq '2025-11-25') $init.protocolVersion
-    $script:stdin.Write('{"jsonrpc":"2.0","method":"notifications/initialized"}' + "`n")
-    $script:stdin.Flush()
 
     Write-Host '-> tools/list'
-    $tools = Invoke-Mcp 'tools/list' @{} 30
+    $tools = Invoke-Mcp $s1 'tools/list' @{} 30
     $names = @($tools.tools | ForEach-Object { $_.name })
     $wanted = @('codex_imagegen_generate', 'codex_imagegen_refine', 'codex_imagegen_status')
     Test-Check 'tools/list offers the three tools' (-not (Compare-Object $names $wanted)) ($names -join ', ')
 
     Write-Host '-> status (starts Codex; free calls only)'
-    $status = Get-ResultText (Invoke-Mcp 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
+    $status = Get-ResultText (Invoke-Mcp $s1 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
     Write-Host ($status -replace '(?m)^', '      ') -ForegroundColor DarkGray
     Test-Check 'status: image generation is available' ($status -match '(?m)^image generation: available') ''
+    Test-Check 'status: the isolated state base has no sessions' ($status -match '(?m)^sessions in this project: none') ''
+    Test-Check 'status: the state folder is under the run''s own state base' ($status.Contains("(state base $stateBase)")) ''
     if ($status -match 'app-server: running \(pid (\d+)\)') {
         $codexPid = [int]$Matches[1]
-        $descendants = @(Get-Descendants $proc.Id)
-        Test-Check 'the Codex app-server runs under the server' (@($descendants | Where-Object { $_.ProcessId -eq $codexPid }).Count -eq 1) "pid $codexPid"
+        Watch-Descendants $s1
+        Test-Check 'the Codex app-server runs under the server' (@($s1.Descendants | Where-Object { $_.ProcessId -eq $codexPid }).Count -eq 1) "pid $codexPid"
     }
 
     if ($SpendQuota) {
         $e = [char]0x00E9
         $u = [char]0x00FC
         $dash = [char]0x2014
-        $promptA = 'A small "brass" lighthouse on a rocky islet at dusk, loose watercolour.' + "`n" +
+        $prompt = 'A small "brass" lighthouse on a rocky islet at dusk, loose watercolour.' + "`n" +
             'A signboard by its door reads C:\keeper ' + $dash + ' Caf' + $e + ' Br' + $u + 'cke.'
-        $sessionA = "smoke-$stamp"
-        Write-Host "-> generate $sessionA (1 image)"
-        $started = Get-Date
-        $resultA = Invoke-Mcp 'tools/call' @{ name = 'codex_imagegen_generate'; arguments = @{ prompt = $promptA; session = $sessionA; output_dir = $outDir } } 420 -WithProgress
-        Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
-        Write-Host ((Get-ResultText $resultA) -replace '(?m)^', '      ') -ForegroundColor DarkGray
-        $v1 = Test-GenerateResult 'generate' $resultA $sessionA $promptA
-        if ($resultA.isError -ne $true) { $sessionsMade += $sessionA }
+        Write-Host "-> (a) generate $session (1 image)"
+        $result = Invoke-Tool $s1 'codex_imagegen_generate' @{ prompt = $prompt; session = $session; output_dir = $outDir }
+        $v1 = Test-ImageResult 'generate' $result $session 1 $prompt 'prompt'
+        if ($result.isError -ne $true) { $sessionsMade[$session] = 1 }
 
-        $sessionB = "smoke-$stamp-ref"
-        $promptB = 'The same lighthouse and islet as in the reference image, but in deep winter: snow on the rocks, frozen spray, pale morning light.'
-        Write-Host "-> generate $sessionB with the first image as a reference (1 image)"
-        if (Test-Path -LiteralPath $v1) {
-            $started = Get-Date
-            $resultB = Invoke-Mcp 'tools/call' @{ name = 'codex_imagegen_generate'; arguments = @{ prompt = $promptB; session = $sessionB; output_dir = $outDir; reference_images = @($v1) } } 420 -WithProgress
-            Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
-            Write-Host ((Get-ResultText $resultB) -replace '(?m)^', '      ') -ForegroundColor DarkGray
-            $v1ref = Test-GenerateResult 'generate with a reference' $resultB $sessionB $promptB
-            if ($resultB.isError -ne $true) { $sessionsMade += $sessionB }
-            Add-Check 'V3: the second image follows the reference' 'MANUAL' "compare $v1 with $v1ref"
-        }
-        else {
-            Test-Check 'generate with a reference' $false 'skipped: the first image is missing'
-        }
+        $feedback = 'Make the sky a deep "violet" and add one gull.' + "`n" +
+            'Repaint the sign to read D:\harbour ' + $dash + ' ' + $u + 'ber ' + $e + 'toile.'
+        Write-Host "-> (b) refine $session (1 image)"
+        $result = Invoke-Tool $s1 'codex_imagegen_refine' @{ session = $session; feedback = $feedback }
+        [void](Test-ImageResult 'refine' $result $session 2 $feedback 'feedback')
+        if ($result.isError -ne $true) { $sessionsMade[$session] = 2 }
 
-        Write-Host '-> status'
-        $status2 = Get-ResultText (Invoke-Mcp 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
+        Write-Host '-> (c) kill the server, start a fresh one on the same state, refine again (1 image)'
+        Stop-Server $s1 -Kill
+        $s2 = Start-Server 'server 2'
+        $servers.Add($s2)
+        [void](Initialize-Server $s2)
+        $feedback2 = 'Now make it night, with the lighthouse lamp lit.'
+        $result = Invoke-Tool $s2 'codex_imagegen_refine' @{ session = $session; feedback = $feedback2 }
+        [void](Test-ImageResult 'refine after a restart' $result $session 3 $feedback2 'feedback')
+        if ($result.isError -ne $true) { $sessionsMade[$session] = 3 }
+
+        Write-Host '-> (d) status'
+        $status2 = Get-ResultText (Invoke-Mcp $s2 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
+        Write-Host ($status2 -replace '(?m)^', '      ') -ForegroundColor DarkGray
+        Test-Check 'status lists the session with 3 turns' ($status2 -match ('(?m)^  ' + [regex]::Escape($session) + ': 3 turns, latest ' + [regex]::Escape((Join-Path $outDir "$session-v3.png")))) ''
         Test-Check 'status: no turn is left running' ($status2 -match '(?m)^running turns: none') ''
-        if ($codexPid) {
-            $pidNow = if ($status2 -match 'app-server: running \(pid (\d+)\)') { [int]$Matches[1] } else { $null }
-            Test-Check 'the Codex app-server ran the whole time, never respawned' ($pidNow -eq $codexPid) "pid $codexPid at the start, $(if ($pidNow) { "pid $pidNow" } else { 'not running' }) now"
+        Stop-Server $s2
+
+        if ($Concurrent) {
+            Write-Host '-> V9: two servers generate at the same moment (2 images)'
+            $a = Start-Server 'V9 server A'
+            $b = Start-Server 'V9 server B'
+            $servers.Add($a)
+            $servers.Add($b)
+            [void](Initialize-Server $a)
+            [void](Initialize-Server $b)
+            $pair = @(
+                [pscustomobject]@{ Server = $a; Session = "$session-a"; Prompt = 'A red kite over green hills, flat vector style.' },
+                [pscustomobject]@{ Server = $b; Session = "$session-b"; Prompt = 'A blue kite over a grey sea, flat vector style.' }
+            )
+            foreach ($p in $pair) {
+                $p | Add-Member -NotePropertyName Id -NotePropertyValue (Send-Mcp $p.Server 'tools/call' @{ name = 'codex_imagegen_generate'; arguments = @{ prompt = $p.Prompt; session = $p.Session; output_dir = $outDir } } -WithProgress)
+            }
+            foreach ($p in $pair) {
+                try {
+                    $result = Receive-Mcp $p.Server $p.Id 'tools/call' 420
+                    Write-Host ((Get-ResultText $result) -replace '(?m)^', '      ') -ForegroundColor DarkGray
+                    [void](Test-ImageResult $p.Server.Label $result $p.Session 1 $p.Prompt 'prompt')
+                    if ($result.isError -ne $true) { $sessionsMade[$p.Session] = 1 }
+                }
+                catch {
+                    Test-Check "$($p.Server.Label) answers" $false $_.Exception.Message
+                }
+            }
+            Stop-Server $a
+            Stop-Server $b
+            $store = Read-Store
+            foreach ($p in $pair) {
+                Test-Check "V9: $($p.Session) is recorded in the shared store" ($null -ne (Get-Record $store $p.Session)) ''
+            }
         }
+    }
+    else {
+        Stop-Server $s1
     }
 }
 catch {
     Test-Check 'the MCP conversation' $false $_.Exception.Message
 }
 
-# ---------------------------------------------------------------------------------------------
-# Shutdown: closing stdin ends the server, and its job object takes the Codex tree with it
-# ---------------------------------------------------------------------------------------------
-
-# Every process of ours alive now is checked after the exit, not only those seen at the first
-# status: a respawned app-server, or a helper Codex started during a turn, counts too. Taken while
-# the server still runs, so the parent chain can still be walked; the union keeps a child that
-# died and was replaced.
-if (-not $proc.HasExited) {
-    $descendants = @(@($descendants) + @(Get-Descendants $proc.Id) | Sort-Object ProcessId, CreationDate -Unique)
-}
-
-Write-Host '-> close stdin'
-try { $script:stdin.Close() } catch { }
-$exited = $proc.WaitForExit(20000)
-Test-Check 'the server exits after its stdin closes' $exited ''
-if (-not $exited) { try { $proc.Kill() } catch { } }
-$serverStderr = $null
-if ($stderrTask.Wait(5000)) {
-    $serverStderr = $stderrTask.Result
-    $logPath = Join-Path $work 'server-stderr.log'
-    [IO.File]::WriteAllText($logPath, $serverStderr, $utf8)
-    Write-Host "      server stderr saved to $logPath" -ForegroundColor DarkGray
-}
-Start-Sleep -Milliseconds 500
-$survivors = @()
-foreach ($p in $descendants) {
-    $now = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ProcessId)" -ErrorAction SilentlyContinue
-    if ($now -and $now.CreationDate -eq $p.CreationDate) { $survivors += "$($p.Name) (pid $($p.ProcessId))" }
-}
-if ($descendants.Count -gt 0) {
-    Test-Check 'no Codex process of ours is left' ($survivors.Count -eq 0) ($survivors -join ', ')
-}
-else {
-    Add-Check 'no Codex process of ours is left' 'SKIP' 'no child process was recorded'
+# Whatever the run got to, no server of ours is left running.
+foreach ($s in $servers) {
+    if (-not $s.Proc.HasExited) { Stop-Server $s }
 }
 
 # ---------------------------------------------------------------------------------------------
-# V1 and V3, from Codex's rollout trace and the server's stderr
+# V1 and V3, from Codex's rollout trace and the servers' stderr. Before the cleanup, which removes
+# the files they compare.
 # ---------------------------------------------------------------------------------------------
 
+$store = $null
 if ($SpendQuota) {
-    Invoke-TraceChecks $traceRoot $v1 (Join-Path $work 'v1-tools.txt')
+    $store = Read-Store
+    $record = if ($store) { Get-Record $store $session } else { $null }
+    $codexHome = if ($record) { [string](Get-Field $record 'codex_home') } elseif ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $imagesRoot = [IO.Path]::GetFullPath((Join-Path $codexHome 'generated_images')).TrimEnd('\') + '\'
+    $allStderr = (@($servers | ForEach-Object { $_.Stderr } | Where-Object { $_ }) -join "`n")
+
+    # The first image's savedPath is the refine's first choice of edit target; our copy of it is
+    # the fallback. Either in referenced_image_paths passes V3 for refine.
+    $savedLines = @([regex]::Matches($allStderr, '(?m)^codex-imagegen: session ([A-Za-z0-9._-]+): image item has savedPath (.+?)\r?$'))
+    $firstSaved = @($savedLines | Where-Object { $_.Groups[1].Value -eq $session } | Select-Object -First 1 | ForEach-Object { $_.Groups[2].Value })
+    Invoke-TraceChecks $traceRoot (@($firstSaved) + @($v1) | Where-Object { $_ }) (Join-Path $work 'v1-tools.txt') 'V3 (refine): the edit target reached the image tool''s referenced_image_paths'
 
     # V1's last part: Codex reports savedPath. The result reads the same when the server falls
     # back to the image's base64, so the server logs where each image came from (turn.rs,
-    # image_source_line), and the copy it published must match Codex's file byte for byte.
-    if ($null -eq $serverStderr) {
-        Add-Check 'V1: Codex reported savedPath for each image' 'MANUAL' 'the server''s stderr was not captured'
+    # image_source_line), and each copy it published must match Codex's file byte for byte. Each
+    # turn makes one image, so a session's k-th savedPath line is its version k.
+    if (-not $allStderr) {
+        Add-Check 'V1: Codex reported savedPath for each image' 'MANUAL' 'the servers'' stderr was not captured'
     }
     else {
-        $savedLines = @([regex]::Matches($serverStderr, '(?m)^codex-imagegen: session ([A-Za-z0-9._-]+): image item has savedPath (.+?)\r?$'))
-        $fallbacks = @([regex]::Matches($serverStderr, '(?m)^codex-imagegen: session [A-Za-z0-9._-]+: image item has no savedPath.*$'))
+        $fallbacks = @([regex]::Matches($allStderr, '(?m)^codex-imagegen: session [A-Za-z0-9._-]+: image item has no savedPath.*$'))
         Test-Check 'V1: no image lacked savedPath (no base64 fallback)' ($fallbacks.Count -eq 0) (@($fallbacks | ForEach-Object { $_.Value.Trim() }) -join ' | ')
-        $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-        $imagesRoot = [IO.Path]::GetFullPath((Join-Path $codexHome 'generated_images')).TrimEnd('\') + '\'
-        foreach ($session in $sessionsMade) {
-            $mine = @($savedLines | Where-Object { $_.Groups[1].Value -eq $session })
-            if ($mine.Count -ne 1) {
-                Test-Check "V1: Codex reported savedPath for $session" $false "$($mine.Count) savedPath line(s) in the server's stderr"
+        foreach ($name in $sessionsMade.Keys) {
+            $mine = @($savedLines | Where-Object { $_.Groups[1].Value -eq $name })
+            if ($mine.Count -ne $sessionsMade[$name]) {
+                Test-Check "V1: Codex reported savedPath for each image of $name" $false "$($mine.Count) savedPath line(s) for $($sessionsMade[$name]) image(s)"
                 continue
             }
-            $savedPath = $mine[0].Groups[2].Value
-            $copy = Join-Path $outDir "$session-v1.png"
-            $same = $savedPath.StartsWith($imagesRoot, [StringComparison]::OrdinalIgnoreCase) -and
-                (Test-Path -LiteralPath $savedPath) -and (Test-Path -LiteralPath $copy) -and
-                ((Get-FileHash -LiteralPath $savedPath).Hash -eq (Get-FileHash -LiteralPath $copy).Hash)
-            Test-Check "V1: Codex reported savedPath for $session, and $session-v1.png is a byte copy of it" $same $savedPath
+            for ($k = 0; $k -lt $mine.Count; $k++) {
+                $savedPath = $mine[$k].Groups[2].Value
+                $copy = Join-Path $outDir "$name-v$($k + 1).png"
+                $same = $savedPath.StartsWith($imagesRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                    (Test-Path -LiteralPath $savedPath) -and (Test-Path -LiteralPath $copy) -and
+                    ((Get-FileHash -LiteralPath $savedPath).Hash -eq (Get-FileHash -LiteralPath $copy).Hash)
+                Test-Check "V1: Codex reported savedPath for $name v$($k + 1), and $name-v$($k + 1).png is a byte copy of it" $same $savedPath
+            }
         }
     }
     Write-Host "      the trace holds prompts and tool I/O; delete $traceRoot when done" -ForegroundColor DarkGray
+}
+
+# ---------------------------------------------------------------------------------------------
+# (e) The manual sweep, free: thread/delete and file deletions only
+# ---------------------------------------------------------------------------------------------
+
+if ($SpendQuota -and $sessionsMade.Count -gt 0 -and $store) {
+    # What each session left, read before the sweep removes it.
+    $left = @()
+    foreach ($name in $sessionsMade.Keys) {
+        $record = Get-Record $store $name
+        if ($null -eq $record) {
+            Test-Check "$name is recorded in the store" $false ''
+            continue
+        }
+        $threadId = [string](Get-Field $record 'thread_id')
+        $sessionHome = [string](Get-Field $record 'codex_home')
+        # Assigned first, not piped: Get-Field hands an array over as one pipeline object.
+        $published = Get-Field $record 'outputs'
+        $outputs = @()
+        foreach ($o in @($published)) { $outputs += [string](Get-Field $o 'path') }
+        $rollouts = @(Get-Rollouts $sessionHome $threadId)
+        if ($rollouts.Count -eq 0) {
+            Add-Check "(e) $name's thread has a rollout to remove" 'MANUAL' "none found for $threadId under $sessionHome\sessions; the rollout check below proves nothing"
+        }
+        $left += [pscustomobject]@{ Name = $name; ThreadId = $threadId; Home = $sessionHome; Outputs = $outputs; Rollouts = $rollouts.Count }
+    }
+    Write-Host '-> (e) codex-imagegen.exe --cleanup --older-than-days 0 (free)'
+    $sweep = Invoke-Cleanup
+    Test-Check '(e) --cleanup exits 0' ($sweep.Exited -and $sweep.ExitCode -eq 0) "exit code $($sweep.ExitCode)"
+    $after = Read-Store
+    foreach ($s in $left) {
+        Test-Check "(e) --cleanup reports $($s.Name) removed" ($sweep.Out -match ('(?m)^removed [^:]+: ' + [regex]::Escape($s.Name) + ' \(')) ''
+        Test-Check "(e) $($s.Name)'s record is gone" ($null -eq (Get-Record $after $s.Name)) ''
+        $remaining = @($s.Outputs | Where-Object { Test-Path -LiteralPath $_ })
+        Test-Check "(e) $($s.Name)'s $($s.Outputs.Count) published file(s) are gone" ($s.Outputs.Count -gt 0 -and $remaining.Count -eq 0) ($remaining -join ', ')
+        $imageDir = Join-Path (Join-Path $s.Home 'generated_images') $s.ThreadId
+        Test-Check "(e) Codex's image folder for $($s.Name) is gone" (-not (Test-Path -LiteralPath $imageDir)) $imageDir
+        $rollouts = @(Get-Rollouts $s.Home $s.ThreadId)
+        Test-Check "(e) the rollout of $($s.Name)'s thread is gone" ($rollouts.Count -eq 0) (@($rollouts | ForEach-Object { $_.FullName }) -join ', ')
+    }
+}
+elseif ($SpendQuota) {
+    Add-Check '(e) --cleanup removes the run''s sessions' 'SKIP' 'no session was made, or the store could not be read'
+}
+else {
+    Write-Host '-> --cleanup --older-than-days 0 on the empty state base (free)'
+    $sweep = Invoke-Cleanup
+    Test-Check '--cleanup exits 0' ($sweep.Exited -and $sweep.ExitCode -eq 0) "exit code $($sweep.ExitCode)"
+    Test-Check '--cleanup finds nothing to remove in a fresh state base' ($sweep.Out -match '(?m)^nothing to remove') ''
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -821,6 +1049,6 @@ if ($SpendQuota) {
 # ---------------------------------------------------------------------------------------------
 
 if ($SpendQuota) {
-    Complete-Smoke 'SMOKE PASS' "Images: $outDir"
+    Complete-Smoke 'SMOKE PASS' "Working folder: $work"
 }
 Complete-Smoke 'SMOKE PASS (free steps only)'
