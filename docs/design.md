@@ -33,8 +33,9 @@ refine cancelled 5 s into its image call got no response, Codex completed the tu
 and every `savedPath` named the dedicated home, and nothing of the thread was in the ambient home), V1 and V3 on
 0.157.1, and the sweep removing the session from the dedicated home. M5's README is written: install, a
 "check that it works" list for Claude Code, the tools, options, the dedicated home, output files and cleanup,
-troubleshooting, and the IJG notice. The tag-driven release workflow is built (see Build and CI) and has
-not published a release yet.
+troubleshooting, and the IJG notice. The tag-driven release workflow (see Build and CI) published v0.1.0 on
+2026-09-26: the downloaded exe matched its published SHA-256, reported `0.1.0 (<commit>)`, and passed
+`--doctor`.
 
 Claims carry one of three tags:
 
