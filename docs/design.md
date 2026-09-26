@@ -26,7 +26,12 @@ tools still offered to the agent model. The spawn line now switches those off, a
 V1, V2 (generate) and V3 (34 of 34 automated checks). V0 passed for rendering: Claude Code received the preview as an image and described
 it accurately, both through `claude -p` and in the desktop app, where it appears in the expanded tool row. The
 desktop app shows no progress line; the terminal renderer draws one [verified: bundle]. The TaskStop part of V0 was
-not run.
+not run. M4 verified cancellation and the dedicated home live: the paid `smoke.ps1 -SpendQuota -Interrupt
+-CodexHome <dir>` run of 2026-09-26 (codex-cli 0.157.1; 1 image plus 1 cut short) passed 46 of 46 checks: V4 (a
+refine cancelled 5 s into its image call got no response, Codex completed the turn as `interrupted`, and after
+60 s no file had been published or saved by Codex and the record still held one image), V5 (status, the record
+and every `savedPath` named the dedicated home, and nothing of the thread was in the ambient home), V1 and V3 on
+0.157.1, and the sweep removing the session from the dedicated home.
 
 Claims carry one of three tags:
 
@@ -242,6 +247,8 @@ No arguments and no quota. It reports:
 - the server version and build
 - the Codex binary and version, and whether that version is in the tested range
 - whether `app-server` is running
+- the Codex home the child reports, and whether it is the user's own (ambient) or dedicated (`--codex-home`);
+  with `--codex-home` and no child, the configured folder and that Codex did not start
 - the account type and plan
 - image-generation availability
 - whether the pinned model is listed (and whether it is hidden)
@@ -361,9 +368,12 @@ thread id, no session records it, and it stays loaded in the child until the chi
    `generate(reference_images=[<a surviving copy>])`", naming the newest published file that still has its
    recorded size, or saying that none survives. Nothing is spent.
 2. **Check the Codex home.** A record whose `codex_home` is not the child's `codexHome` gets
-   `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare as Windows compares them: case
-   aside, a trailing separator aside, and with or without the `\\?\` prefix Codex puts on a canonicalised
-   `CODEX_HOME` [verified: source, `utils/home-dir`].
+   `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare exactly, as cleanup compares
+   them, apart from a `\\?\` prefix and a trailing separator: both sides come from Codex's handshake, which
+   canonicalises `CODEX_HOME`, so a spelling that differs only by case is another home. Codex 0.157.1 reports
+   the home in its on-disk case and long form, without `\\?\` or a trailing separator, for an input in another
+   case, with `\\?\`, as an 8.3 name or with a trailing backslash [verified: initialize, 0.157.1]; a record
+   written by an older Codex with the prefix still matches.
 3. **Always call `thread/resume`** with `excludeTurns: true` and the thread parameters, before every
    `turn/start`, each try after a fresh `config/read` and MCP-off map. Codex counts our `config` and
    `developerInstructions` as overrides it cannot apply to a loaded thread. So on a thread still loaded in this
@@ -970,8 +980,13 @@ later `thread/resume` then fails with `no rollout found for thread id <id>`. Cod
 - There is no cancel tool [decided]. TaskStop already covers backgrounded calls, and a foreground call blocks
   the model, which could not call a cancel tool anyway.
 
-**What an interrupt loses.** An image call that is cut short produces no file and no `item/completed`
-[assumed: V4].
+**What an interrupt loses.** An image call that is cut short produces no file [verified: V4]. Codex completes
+the turn with status `interrupted`, and no image arrives later either: none had been saved in the thread's
+`generated_images` folder 60 s after the cancel. It sends no `item/completed` for the call [verified: V4
+trace]: the cut-short call has no `tool_call_ended` event, where a completed one does, and the turn ends as
+`cancelled` with `turn_aborted`. The server logs a failed image item (`image item failed`), and the V4 smoke
+check requires that no such line appears. Whether the cut-short call still counts against the image quota is
+not observable here.
 
 **After `turn/interrupt`.**
 
@@ -1073,12 +1088,20 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   - web search
   - sub-agents and `request_user_input`
   - the auto-review subagent
-- **Dedicated home (`--codex-home <dir>`).** One-time setup: `CODEX_HOME=<dir> codex login --device-auth`.
+- **Dedicated home (`--codex-home <dir>`).** One-time setup: create the folder, then sign it in. In
+  PowerShell, `$env:CODEX_HOME = '<dir>'; codex login --device-auth; Remove-Item Env:CODEX_HOME` (PowerShell
+  has no `VAR=value command` form, and the variable is removed so a `claude` started later from that window
+  does not inherit it); in Git Bash, `CODEX_HOME='<dir>' codex login --device-auth`. The sign-in remediations
+  give these commands for the home in use, and the free-plan refusal names the same home.
+  - Codex exits at once when `CODEX_HOME` is missing or not a folder [verified: 0.157.1], so the server checks
+    the folder before spawning and returns `SPAWN_FAILED`, naming it, with the folder and sign-in commands and
+    the registration fix (a backslash just before a closing quote swallows the quote). `status` then shows the
+    configured folder and that Codex did not start.
   - It avoids everything under `~/.codex`: config, `AGENTS.md`, MCP servers, plugins, user skills.
   - Three things still load, because they live outside `CODEX_HOME` [verified]: `%USERPROFILE%\.agents\skills`,
     the machine-wide `C:\ProgramData\OpenAI\Codex` config and admin skills, and managed (MDM/enterprise)
-    requirements. `status` reports a non-empty `skills/list` or a present system layer, so these are visible
-    rather than assumed away.
+    requirements. Skills cannot reach the model: their instructions are not included and no skill tool is
+    offered (V1). `status` does not report a system or managed layer [decided: not built].
   - Copying `auth.json` between homes is unsupported, because refresh tokens appear to be single-use.
 - **Billing.** API-key variables are removed from the child, and every child's preflight requires a `chatgpt`
   account.
@@ -1111,7 +1134,7 @@ Everything is a command-line argument on the MCP entry. There is no config file 
 --effort <level>           Agent reasoning effort. Default low
 --output-dir <dir>         Default output directory; relative paths resolve against CLAUDE_PROJECT_DIR
 --state-dir <abs dir>      Override the per-project state directory
---timeout-seconds <n>      Whole-call limit for generate/refine. Default 300
+--timeout-seconds <n>      Whole-call limit for generate/refine, 60..86400. Default 300
 --max-concurrent <n>       Concurrent turns across sessions. Default 4
 --session-ttl-days <n>     Expire sessions idle this long (see Cleanup). Default 7; 0 disables
 --doctor                   Check CLI, login, plan, capability and model from a terminal (free), then exit:
@@ -1268,6 +1291,24 @@ With `-Concurrent` as well (V9, about 2 more images), two server processes on th
 its own stdin, get their `generate` requests before either is answered; both must succeed, and both sessions
 must be recorded in the shared store. Step (e) then removes them too.
 
+With `-Interrupt` as well (V4), (b) to (d) are replaced by one `refine` that is cancelled with
+`notifications/cancelled` 5 s after its `generating image` progress: about 1 image plus 1 cut short in all. The
+cancelled request must get no response within 30 s, and `status` must then show no running turn. After 60 s from
+the cancel, the time an image takes, there must be no `<session>-v2.png`, the thread's `generated_images` folder
+must hold only the first image, and the record must still have 1 turn and 1 output. From the server's stderr, it
+must have logged `interrupting turn <turn> on thread <thread>` for the session's thread, and `turn <turn> on
+thread <thread> completed: interrupted` for the refine's turn, which is the second of the thread's two
+completions (the first interrupt seen could be the generate's), and no `image item failed on thread <thread>`
+line. The server logs how every turn completed and every failed image item as they arrive, whether or not their
+call is still waiting, and a call that gives up on an interrupt Codex has not confirmed.
+
+With `-CodexHome <dir>` (V5), every server, and the sweep, runs with `--codex-home <dir>`. `status` must report
+that home as dedicated, each session's record must name it, every logged `savedPath` must be under its
+`generated_images`, and, for each session, neither a rollout of its thread nor its image folder may exist in an
+ambient home: an inherited `CODEX_HOME` and `%USERPROFILE%\.codex`, each that is not the dedicated home. When
+neither differs from it, the check is left to inspect by hand rather than skipped. The home must already be
+signed in.
+
 The servers run with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and the script reads the trace.
 Each thread writes a `trace-*` folder holding `trace.jsonl` and the payload files its events name [verified:
 real trace, 0.156.0]:
@@ -1313,8 +1354,8 @@ Each item must pass before the code that depends on it is considered done.
 | V1 | **Passed 2026-09-25** (second paid run, after the sub-agent and user-input switches). The full spawn line in ambient mode, with `CODEX_ROLLOUT_TRACE_ROOT` set on the child. The recorded requests offered only `functions.exec` (nested: `image_gen__imagegen`, plus the documented `apply_patch`, `view_image`, `clock__curr_time`), `functions.wait`, `functions.request_user_input_async` and `clock.sleep`: no shell, `write_stdin`, web search, browser, computer-use, sub-agent, `request_user_input`, skill, tool-suggest or MCP tool, and nothing unclassified. The item was reported with `savedPath` populated, and each published file is a byte copy of it. The first paid run had shown the sub-agent (`collaboration`) and `request_user_input` tools still offered, which the added switches removed. | 1 image (part of smoke) | M2 |
 | V2 | **Passed** (generate 2026-09-25; refine 2026-09-26). Tagged input plus developerInstructions give a verbatim `revisedPrompt` on generate and on refine with an explicit `<edit_target>`, including quotes, a backslash, a newline and non-ASCII text. Both the generate prompt and the refine feedback came back verbatim, and the edit target reached `referenced_image_paths`. | part of smoke | M2/M3 |
 | V3 | **Passed 2026-09-25.** `reference_images` on generate reach `referenced_image_paths` and influence the output. The reference reached `referenced_image_paths` (trace), and the output followed it. | 1 image | M2 |
-| V4 | `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. | 1 partial image (quota effect unknown) | M4 |
-| V5 | With `--codex-home` pointing at a dedicated home, images land under that home. | 1 image, plus a one-time login by the owner | M4 |
+| V4 | **Passed 2026-09-26** (codex-cli 0.157.1). `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. A refine cancelled with `notifications/cancelled` 5 s into its image call got no response; the server logged its `turn/interrupt` and Codex's `turn/completed: interrupted` for that turn; `status` showed no running turn; 60 s after the cancel there was no `-v2` file, the thread's `generated_images` folder still held only the first image, and the record still had 1 turn and 1 output. `smoke.ps1 -SpendQuota -Interrupt`. | 1 partial image (quota effect unknown) | M4 |
+| V5 | **Passed 2026-09-26.** With `--codex-home` pointing at a dedicated home, images land under that home. `status` reported the home as dedicated, the session's record named it, the image's `savedPath` and the rollout were under it, and neither the thread's image folder nor a rollout of it existed in the ambient home. The sweep removed the session from the dedicated home. `smoke.ps1 -CodexHome <dir>`. | 1 image, plus a one-time login by the owner | M4 |
 | V10 | On a FAT32 or exFAT volume (a USB stick), the POSIX delete is refused with one of the errors that fall back to the legacy disposition, and cleanup still deletes the session's files there. The fallback itself is covered by a unit test with the refusal injected. | free (no turn) | when such a volume is at hand |
 | V9 | **Passed 2026-09-26.** Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeeded (26 s and 30 s), and both sessions were recorded in the shared store. `smoke.ps1 -SpendQuota -Concurrent`. | 2 images | M3 |
 

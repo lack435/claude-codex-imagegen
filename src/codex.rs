@@ -246,6 +246,20 @@ pub fn spawn(bin: &Path, cfg: &Config) -> Result<AppServer, Failure> {
         ))
         .with_detail(e.to_string()));
     }
+    if let Some(home) = &cfg.codex_home {
+        match std::fs::metadata(home) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(errors::codex_home_unusable(home, "is not a folder")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(errors::codex_home_unusable(home, "does not exist"))
+            }
+            Err(e) => {
+                return Err(
+                    errors::codex_home_unusable(home, "cannot be read").with_detail(e.to_string())
+                )
+            }
+        }
+    }
     AppServer::spawn(&spawn_spec(bin, cfg))
         .map_err(|e| errors::spawn_failed(&bin.display().to_string(), e.to_string()))
 }
@@ -492,7 +506,10 @@ pub fn preflight(
         ));
     }
     if plan.as_deref() == Some("free") {
-        return Err(errors::imagegen_unavailable_on_plan("free"));
+        return Err(errors::imagegen_unavailable_on_plan(
+            "free",
+            cfg.codex_home.as_deref(),
+        ));
     }
 
     // 2. The provider's image capability. Not a login check: it reads true even signed out.
@@ -1456,6 +1473,36 @@ mod tests {
         let mut facts = Facts::default();
         let result = preflight(&rpc, &handshake, cfg, &mut facts);
         (result, facts)
+    }
+
+    #[test]
+    fn a_codex_home_that_is_missing_or_a_file_is_refused_before_codex_starts() {
+        let dir = crate::testutil::temp_dir("codex-home");
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let mut config = cfg(&[]);
+        config.work_dir = dir.join("work");
+        // Never started: the check comes first.
+        let bin = dir.join("never-run.exe");
+        for (home, why) in [
+            (dir.join("missing"), "does not exist"),
+            (file, "is not a folder"),
+        ] {
+            config.codex_home = Some(home.clone());
+            let failure = spawn(&bin, &config).err().expect("refused");
+            assert_eq!(failure.code, "SPAWN_FAILED");
+            assert!(
+                failure
+                    .summary
+                    .contains(&format!("{} {why}", home.display())),
+                "{}",
+                failure.summary
+            );
+            assert!(failure
+                .remediation
+                .contains("New-Item -ItemType Directory -Force"));
+            assert!(failure.remediation.contains("$env:CODEX_HOME"));
+        }
     }
 
     #[test]

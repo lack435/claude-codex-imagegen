@@ -32,6 +32,18 @@
        before the sweep, and be gone from that exact path after it; a listing error fails). A
        recorded session the run lost track of fails the run, and is still removed.
 
+  With -Interrupt as well (V4), (b) to (d) are replaced by one refine that is cancelled
+  (notifications/cancelled) a few seconds after its image call starts: about 1 image plus 1 cut
+  short in all. The cancelled request must get no response; the server must send turn/interrupt
+  and Codex must complete the turn as interrupted; after the time an image takes, no file may have
+  been published or saved by Codex for it, and the session must still hold its one image.
+
+  With -CodexHome <dir> (V5), every server runs with --codex-home <dir>. status must report that
+  home, each session's record must name it, every image Codex saved must be under it, and nothing
+  of the run's threads may be in an ambient home ($env:CODEX_HOME, and %USERPROFILE%\.codex). The
+  home must be signed in already: $env:CODEX_HOME = '<dir>'; codex login --device-auth; then
+  Remove-Item Env:CODEX_HOME, so the variable does not linger in the window that runs this script.
+
   With -Concurrent as well (V9, about 2 more images), two server processes on the same state
   folder, each with its own stdin, generate at the same moment; both must succeed, and both
   sessions must be recorded. Step (e) then removes them too.
@@ -51,6 +63,10 @@ param(
     [switch]$SpendQuota,
     # With -SpendQuota: also V9, two servers generating at the same moment (about 2 more images).
     [switch]$Concurrent,
+    # With -SpendQuota: V4, a refine cancelled during its image call, instead of (b) to (d).
+    [switch]$Interrupt,
+    # Passed to every server as --codex-home (V5). Must be an existing, signed-in Codex home.
+    [string]$CodexHome,
     # The server to test. Default: dist\codex-imagegen.exe next to this script.
     [string]$Exe,
     # Passed to the server as --codex-bin when given.
@@ -495,6 +511,29 @@ if ($Concurrent -and -not $SpendQuota) {
     Write-Host '-Concurrent generates images (V9) and needs -SpendQuota.' -ForegroundColor Red
     exit 1
 }
+if ($Interrupt -and -not $SpendQuota) {
+    Write-Host '-Interrupt generates images (V4) and needs -SpendQuota.' -ForegroundColor Red
+    exit 1
+}
+if ($CodexHome) {
+    $CodexHome = (Get-FullPathOrSelf $CodexHome).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $CodexHome -PathType Container)) {
+        Write-Host "-CodexHome is not a folder: $CodexHome" -ForegroundColor Red
+        exit 1
+    }
+}
+# The home a server uses without --codex-home.
+$ambientHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+# V5's "nothing in the ambient home" looks in both: an inherited CODEX_HOME (left from the sign-in,
+# say) may be the dedicated home itself, and the user's own home must stay untouched regardless.
+$ambientHomes = @(@($env:CODEX_HOME, (Join-Path $env:USERPROFILE '.codex')) | Where-Object { $_ })
+
+# Whether two spellings name the same folder, for the V5 checks: full paths, without a \\?\ prefix
+# or a trailing backslash, compared case-insensitively.
+function Test-SameFolder([string]$A, [string]$B) {
+    $plain = { param($p) ((Get-FullPathOrSelf ($p -replace '^\\\\\?\\', '')) -replace '/', '\').TrimEnd('\') }
+    return [string]::Equals((& $plain $A), (& $plain $B), [StringComparison]::OrdinalIgnoreCase)
+}
 
 # ---------------------------------------------------------------------------------------------
 # The live run
@@ -512,7 +551,8 @@ foreach ($d in @($work, $outDir, $stateBase, $projectDir)) { New-Item -ItemType 
 
 Write-Host ''
 if ($SpendQuota) {
-    $images = if ($Concurrent) { 'about 5 images' } else { 'about 3 images' }
+    $images = if ($Interrupt) { 'about 1 image plus 1 cut short' } else { 'about 3 images' }
+    if ($Concurrent) { $images += ', plus 2 for V9' }
     Write-Host 'codex-imagegen smoke test: PAID run.' -ForegroundColor Yellow
     Write-Host "Expected cost: $images of the ChatGPT plan's image quota, plus the agent" -ForegroundColor Yellow
     Write-Host 'model''s tokens for as many short turns.' -ForegroundColor Yellow
@@ -523,6 +563,7 @@ else {
 }
 Write-Host "Working folder: $work"
 Write-Host "State base (CODEX_IMAGEGEN_HOME for every server here): $stateBase"
+if ($CodexHome) { Write-Host "Codex home (--codex-home for every server here): $CodexHome" }
 Write-Host ''
 
 if (-not (Test-Path -LiteralPath $Exe)) {
@@ -542,6 +583,7 @@ function New-StartInfo([string]$Arguments) {
     $psi.FileName = $exePath
     $argv = @()
     if ($CodexBin) { $argv += '--codex-bin "' + $CodexBin + '"' }
+    if ($CodexHome) { $argv += '--codex-home "' + $CodexHome + '"' }
     if ($Arguments) { $argv += $Arguments }
     $psi.Arguments = $argv -join ' '
     $psi.WorkingDirectory = $projectDir
@@ -658,6 +700,63 @@ function Invoke-Tool($Server, [string]$Tool, $Arguments, [int]$TimeoutSec = 420)
     Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
     Write-Host ((Get-ResultText $result) -replace '(?m)^', '      ') -ForegroundColor DarkGray
     return $result
+}
+
+function Get-Status($Server) {
+    return Get-ResultText (Invoke-Mcp $Server 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
+}
+
+# V4: read the server's output until call $Id reports its image call started (the "generating
+# image" progress phase). Response is $null then; it holds the call's response when the call
+# answered first. Throws on a timeout or a closed stream.
+function Wait-ImageStarted($Server, [int]$Id, [int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        $left = [int]($deadline - (Get-Date)).TotalMilliseconds
+        if ($left -le 0) { throw "$($Server.Label): the image call did not start within $TimeoutSec s" }
+        $text = Read-ServerLine $Server $left
+        if ($null -eq $text) {
+            if ($Server.Eof) { throw "$($Server.Label): the server closed its output" }
+            continue
+        }
+        if ($text.Trim() -eq '') { continue }
+        $obj = ConvertFrom-Json -InputObject $text
+        $names = $obj.PSObject.Properties.Name
+        if (($names -contains 'id') -and ($null -ne $obj.id)) {
+            if ([string]$obj.id -ne [string]$Id) { throw "$($Server.Label): got a response to id $($obj.id) while waiting for $Id" }
+            return [pscustomobject]@{ Response = $obj }
+        }
+        if ($obj.method -eq 'notifications/progress') {
+            Write-Host "      [$($Server.Label)] progress: $($obj.params.message)" -ForegroundColor DarkGray
+            if ([string]$obj.params.message -like 'generating image*') { return [pscustomobject]@{ Response = $null } }
+        }
+    }
+}
+
+# V4: read the server's output for $Seconds; every response to $Id seen meanwhile (a cancelled
+# request must get none). Any other response throws; notifications are shown.
+function Read-ResponsesTo($Server, [int]$Id, [int]$Seconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $responses = @()
+    while ($true) {
+        $left = [int]($deadline - (Get-Date)).TotalMilliseconds
+        if ($left -le 0) { break }
+        $text = Read-ServerLine $Server $left
+        if ($null -eq $text) {
+            if ($Server.Eof) { break }
+            continue
+        }
+        if ($text.Trim() -eq '') { continue }
+        $obj = ConvertFrom-Json -InputObject $text
+        $names = $obj.PSObject.Properties.Name
+        if (($names -contains 'id') -and ($null -ne $obj.id)) {
+            if ([string]$obj.id -ne [string]$Id) { throw "$($Server.Label): got a response to id $($obj.id) while waiting for $Id" }
+            $responses += $obj
+            continue
+        }
+        Write-Host "      [$($Server.Label)] $(if ($obj.method -eq 'notifications/progress') { "progress: $($obj.params.message)" } else { "notification: $($obj.method)" })" -ForegroundColor DarkGray
+    }
+    return , $responses
 }
 
 # Width and height from a JPEG's SOF marker, or $null.
@@ -901,6 +1000,8 @@ function Test-ImageResult([string]$Label, $Result, [string]$Session, [int]$Versi
 $servers = New-Object System.Collections.Generic.List[object]
 # The sessions made here, each with the number of images it should have.
 $sessionsMade = [ordered]@{}
+# Set once V4's refine has been cancelled; its stderr checks run after the servers stop.
+$script:v4Cancelled = $false
 $session = "smoke-$stamp"
 $v1 = $null
 $codexPid = $null
@@ -923,6 +1024,11 @@ try {
     Test-Check 'status: image generation is available' ($status -match '(?m)^image generation: available') ''
     Test-Check 'status: the isolated state base has no sessions' ($status -match '(?m)^sessions in this project: none') ''
     Test-Check 'status: the state folder is under the run''s own state base' ($status.Contains("(state base $stateBase)")) ''
+    if ($CodexHome) {
+        $reported = if ($status -match '(?m)^Codex home: (.+) \(dedicated, from --codex-home\)\r?$') { $Matches[1] } else { $null }
+        Test-Check 'V5: status reports the dedicated Codex home' ($null -ne $reported -and (Test-SameFolder $reported $CodexHome)) $(
+            if ($status -match '(?m)^Codex home: .*$') { $Matches[0] } else { 'no Codex home line' })
+    }
     if ($status -match 'app-server: running \(pid (\d+)\)') {
         $codexPid = [int]$Matches[1]
         Watch-Descendants $s1
@@ -940,29 +1046,84 @@ try {
         $v1 = Test-ImageResult 'generate' $result $session 1 $prompt 'prompt'
         if ($result.isError -ne $true) { $sessionsMade[$session] = 1 }
 
-        $feedback = 'Make the sky a deep "violet" and add one gull.' + "`n" +
-            'Repaint the sign to read D:\harbour ' + $dash + ' ' + $u + 'ber ' + $e + 'toile.'
-        Write-Host "-> (b) refine $session (1 image)"
-        $result = Invoke-Tool $s1 'codex_imagegen_refine' @{ session = $session; feedback = $feedback }
-        [void](Test-ImageResult 'refine' $result $session 2 $feedback 'feedback')
-        if ($result.isError -ne $true) { $sessionsMade[$session] = 2 }
+        if ($Interrupt) {
+            if (-not $sessionsMade.Contains($session)) { throw '(a) made no image, so there is no session to refine for V4' }
+            Write-Host "-> (i) V4: refine $session, cancelled once its image call is under way (1 image cut short)"
+            $v4Id = Send-Mcp $s1 'tools/call' @{ name = 'codex_imagegen_refine'; arguments = @{ session = $session; feedback = 'Add a small red fishing boat by the rocks.' } } -WithProgress
+            $answer = (Wait-ImageStarted $s1 $v4Id 300).Response
+            if ($null -eq $answer) {
+                # Well into the image call, as a user pressing Esc would be.
+                $early = Read-ResponsesTo $s1 $v4Id 5
+                if ($early.Count) { $answer = $early[0] }
+            }
+            if ($null -ne $answer) {
+                Test-Check 'V4: the refine was still generating when it was cancelled' $false 'it answered before it could be cancelled'
+                if ($answer.result -and $answer.result.isError -ne $true) { $sessionsMade[$session] = 2 }
+            }
+            else {
+                Write-Host "-> notifications/cancelled for request $v4Id"
+                $s1.Stdin.Write((ConvertTo-Json -InputObject ([ordered]@{ jsonrpc = '2.0'; method = 'notifications/cancelled'; params = [ordered]@{ requestId = $v4Id; reason = 'smoke V4' } }) -Compress) + "`n")
+                $s1.Stdin.Flush()
+                $cancelledAt = Get-Date
+                $script:v4Cancelled = $true
+                $late = Read-ResponsesTo $s1 $v4Id 30
+                Test-Check 'V4: the cancelled request gets no response' ($late.Count -eq 0) $(if ($late.Count) { ((Get-ResultText $late[0].result) -split "`n" | Select-Object -First 2) -join ' | ' })
+                if ($late.Count -and $late[0].result -and $late[0].result.isError -ne $true) { $sessionsMade[$session] = 2 }
+                $running = ''
+                for ($i = 0; $i -lt 10; $i++) {
+                    $running = @((Get-Status $s1) -split "`n" | Where-Object { $_ -like 'running turns:*' }) -join ''
+                    if ($running -eq 'running turns: none') { break }
+                    Start-Sleep -Seconds 3
+                }
+                Test-Check 'V4: the interrupted turn is no longer running' ($running -eq 'running turns: none') $running
+                # Codex could still finish an image it had in flight: wait as long as one takes.
+                $pause = 60 - ((Get-Date) - $cancelledAt).TotalSeconds
+                if ($pause -gt 0) {
+                    Write-Host ("      waiting {0:N0} s for an image that might still arrive" -f $pause) -ForegroundColor DarkGray
+                    Start-Sleep -Seconds ([int][Math]::Ceiling($pause))
+                }
+                $published = @(Get-ChildItem -LiteralPath $outDir -File -Filter "$session-v*.png" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+                Test-Check 'V4: no file was published for the cancelled refine' ($published.Count -eq 1 -and $published[0] -eq "$session-v1.png") ($published -join ', ')
+                $v4Record = Get-Record (Read-Store) $session
+                if ($null -eq $v4Record) {
+                    Test-Check "V4: $session is still recorded" $false ''
+                }
+                else {
+                    $v4Outputs = Get-Field $v4Record 'outputs'
+                    $turns = [int](Get-Field $v4Record 'turns')
+                    Test-Check 'V4: the session record still holds its one image' ($turns -eq 1 -and @($v4Outputs | Where-Object { $_ }).Count -eq 1) "turns $turns, $(@($v4Outputs | Where-Object { $_ }).Count) output(s)"
+                    $v4Folder = Join-Path (Join-Path ([string](Get-Field $v4Record 'codex_home')) 'generated_images') ([string](Get-Field $v4Record 'thread_id'))
+                    $codexPngs = @(Get-ChildItem -LiteralPath $v4Folder -File -Filter '*.png' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+                    Test-Check 'V4: Codex saved no image for the cancelled refine' ($codexPngs.Count -eq 1) "$($codexPngs.Count) PNG(s) in $v4Folder"
+                }
+            }
+            Stop-Server $s1
+        }
+        else {
+            $feedback = 'Make the sky a deep "violet" and add one gull.' + "`n" +
+                'Repaint the sign to read D:\harbour ' + $dash + ' ' + $u + 'ber ' + $e + 'toile.'
+            Write-Host "-> (b) refine $session (1 image)"
+            $result = Invoke-Tool $s1 'codex_imagegen_refine' @{ session = $session; feedback = $feedback }
+            [void](Test-ImageResult 'refine' $result $session 2 $feedback 'feedback')
+            if ($result.isError -ne $true) { $sessionsMade[$session] = 2 }
 
-        Write-Host '-> (c) kill the server, start a fresh one on the same state, refine again (1 image)'
-        Stop-Server $s1 -Kill
-        $s2 = Start-Server 'server 2'
-        $servers.Add($s2)
-        [void](Initialize-Server $s2)
-        $feedback2 = 'Now make it night, with the lighthouse lamp lit.'
-        $result = Invoke-Tool $s2 'codex_imagegen_refine' @{ session = $session; feedback = $feedback2 }
-        [void](Test-ImageResult 'refine after a restart' $result $session 3 $feedback2 'feedback')
-        if ($result.isError -ne $true) { $sessionsMade[$session] = 3 }
+            Write-Host '-> (c) kill the server, start a fresh one on the same state, refine again (1 image)'
+            Stop-Server $s1 -Kill
+            $s2 = Start-Server 'server 2'
+            $servers.Add($s2)
+            [void](Initialize-Server $s2)
+            $feedback2 = 'Now make it night, with the lighthouse lamp lit.'
+            $result = Invoke-Tool $s2 'codex_imagegen_refine' @{ session = $session; feedback = $feedback2 }
+            [void](Test-ImageResult 'refine after a restart' $result $session 3 $feedback2 'feedback')
+            if ($result.isError -ne $true) { $sessionsMade[$session] = 3 }
 
-        Write-Host '-> (d) status'
-        $status2 = Get-ResultText (Invoke-Mcp $s2 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
-        Write-Host ($status2 -replace '(?m)^', '      ') -ForegroundColor DarkGray
-        Test-Check 'status lists the session with 3 turns' ($status2 -match ('(?m)^  ' + [regex]::Escape($session) + ': 3 turns, latest ' + [regex]::Escape((Join-Path $outDir "$session-v3.png")))) ''
-        Test-Check 'status: no turn is left running' ($status2 -match '(?m)^running turns: none') ''
-        Stop-Server $s2
+            Write-Host '-> (d) status'
+            $status2 = Get-ResultText (Invoke-Mcp $s2 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
+            Write-Host ($status2 -replace '(?m)^', '      ') -ForegroundColor DarkGray
+            Test-Check 'status lists the session with 3 turns' ($status2 -match ('(?m)^  ' + [regex]::Escape($session) + ': 3 turns, latest ' + [regex]::Escape((Join-Path $outDir "$session-v3.png")))) ''
+            Test-Check 'status: no turn is left running' ($status2 -match '(?m)^running turns: none') ''
+            Stop-Server $s2
+        }
 
         if ($Concurrent) {
             Write-Host '-> V9: two servers generate at the same moment (2 images)'
@@ -1020,8 +1181,9 @@ $store = $null
 if ($SpendQuota) {
     $store = Read-Store
     $record = if ($store) { Get-Record $store $session } else { $null }
-    $codexHome = if ($record) { [string](Get-Field $record 'codex_home') } elseif ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-    $imagesRoot = [IO.Path]::GetFullPath((Join-Path $codexHome 'generated_images')).TrimEnd('\') + '\'
+    # Not $codexHome: PowerShell names ignore case, and that would overwrite -CodexHome.
+    $recordHome = if ($record) { [string](Get-Field $record 'codex_home') } elseif ($CodexHome) { $CodexHome } else { $ambientHome }
+    $imagesRoot = [IO.Path]::GetFullPath((Join-Path $recordHome 'generated_images')).TrimEnd('\') + '\'
     $allStderr = (@($servers | ForEach-Object { $_.Stderr } | Where-Object { $_ }) -join "`n")
 
     # The first image's savedPath is the refine's first choice of edit target; our copy of it is
@@ -1053,6 +1215,55 @@ if ($SpendQuota) {
                     (Test-Path -LiteralPath $savedPath) -and (Test-Path -LiteralPath $copy) -and
                     ((Get-FileHash -LiteralPath $savedPath).Hash -eq (Get-FileHash -LiteralPath $copy).Hash)
                 Test-Check "V1: Codex reported savedPath for $name v$($k + 1), and $name-v$($k + 1).png is a byte copy of it" $same $savedPath
+            }
+        }
+    }
+
+    # V4, from the servers' stderr (turn.rs, send_interrupt and route_notification). The session's
+    # thread ran two turns, the generate's and then the refine's, and it is the refine's turn, the
+    # second to complete, that must have been interrupted: named by its completion, not by the first
+    # interrupt seen, which could be the generate's.
+    if ($script:v4Cancelled) {
+        $threadId = if ($record) { [string](Get-Field $record 'thread_id') } else { '' }
+        $completions = @(if ($threadId) { [regex]::Matches($allStderr, '(?m)^codex-imagegen: turn (\S+) on thread ' + [regex]::Escape($threadId) + ' completed: (\S+)\r?$') })
+        Test-Check 'V4: Codex completed the session''s two turns' ($completions.Count -eq 2) "$($completions.Count) turn/completed line(s) for thread $threadId"
+        if ($completions.Count -eq 2) {
+            $turnId = $completions[1].Groups[1].Value
+            $turnStatus = $completions[1].Groups[2].Value
+            $sent = $allStderr -match ('(?m)^codex-imagegen: interrupting turn ' + [regex]::Escape($turnId) + ' on thread ' + [regex]::Escape($threadId) + '\r?$')
+            Test-Check 'V4: the server sent turn/interrupt for the refine''s turn' $sent "turn $turnId"
+            Test-Check 'V4: Codex completed the refine''s turn as interrupted' ($turnStatus -eq 'interrupted') "turn $turnId completed: $turnStatus"
+        }
+        # The thread's only image item is the first image, completed: a cut-short call must send
+        # no item/completed, failed or not. Logged as it arrives, even after its call gave up.
+        $itemFailures = @(if ($threadId) { [regex]::Matches($allStderr, '(?m)^codex-imagegen: image item failed on thread ' + [regex]::Escape($threadId) + ': .*$') | ForEach-Object { $_.Value.Trim() } })
+        Test-Check 'V4: Codex sent no failed image item for the cut-short call' ($threadId -and $itemFailures.Count -eq 0) ($itemFailures -join ' | ')
+    }
+
+    # V5: every session the run made is recorded against the dedicated home, every image Codex
+    # saved is under it, and nothing of the run's threads is in the ambient home.
+    if ($CodexHome) {
+        $dedicatedImages = (Join-Path $CodexHome 'generated_images').TrimEnd('\') + '\'
+        $outside = @($savedLines | Where-Object { -not $_.Groups[2].Value.StartsWith($dedicatedImages, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Groups[2].Value })
+        Test-Check 'V5: every image Codex saved is under the dedicated home' ($savedLines.Count -gt 0 -and $outside.Count -eq 0) $(
+            if ($savedLines.Count -eq 0) { 'no savedPath was logged' } else { $outside -join ', ' })
+        foreach ($name in $sessionsMade.Keys) {
+            $made = if ($store) { Get-Record $store $name } else { $null }
+            if ($null -eq $made) { continue }
+            $recordedHome = [string](Get-Field $made 'codex_home')
+            Test-Check "V5: $name's record names the dedicated home" (Test-SameFolder $recordedHome $CodexHome) $recordedHome
+            $threadId = [string](Get-Field $made 'thread_id')
+            $others = @($ambientHomes | Where-Object { -not (Test-SameFolder $_ $CodexHome) } | Sort-Object -Unique)
+            if ($others.Count -eq 0) {
+                Add-Check "V5: nothing of $name's thread is in the ambient home" 'MANUAL' 'every ambient home is the dedicated home, so there is nothing to compare with'
+            }
+            foreach ($other in $others) {
+                $ambientRollouts = Get-Rollouts $other $threadId
+                $ambientFolder = Join-Path (Join-Path $other 'generated_images') $threadId
+                $ambientState = Get-PathState $ambientFolder
+                $clean = (-not $ambientRollouts.Error) -and $ambientRollouts.Paths.Count -eq 0 -and $ambientState -eq 'gone'
+                Test-Check "V5: nothing of $name's thread is in the ambient home $other" $clean $(
+                    if ($ambientRollouts.Error) { "listing failed: $($ambientRollouts.Error)" } else { @(@($ambientRollouts.Paths) + @("$ambientFolder is $ambientState")) -join ', ' })
             }
         }
     }

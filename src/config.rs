@@ -16,8 +16,9 @@ pub const DEFAULT_EFFORT: &str = "low";
 /// Whole-call budget for generate/refine. A turn takes 37-41 s [verified: smoke logs], so this
 /// leaves room for a slow backend and a cold Codex start.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
-/// Below this a normal turn would time out, so a smaller value is a mistake, not a preference.
-pub const MIN_TIMEOUT_SECS: u64 = 30;
+/// A normal turn takes about 40 s, plus a cold start, so a limit below this would cut most turns
+/// short: a mistake, not a preference.
+pub const MIN_TIMEOUT_SECS: u64 = 60;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_CONCURRENT: u32 = 4;
 pub const DEFAULT_SESSION_TTL_DAYS: u32 = 7;
@@ -433,8 +434,11 @@ OPTIONS:
                               %LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe
   --codex-home <abs dir>      Run Codex with CODEX_HOME set to this directory, a dedicated
                               home that keeps ~/.codex (config, AGENTS.md, MCP servers,
-                              plugins, skills) away from it. Sign it in once with
-                              CODEX_HOME=<dir> codex login --device-auth
+                              plugins, skills) away from it. Create the folder, then sign it
+                              in once, in PowerShell:
+                                $env:CODEX_HOME = '<dir>'; codex login --device-auth;
+                                Remove-Item Env:CODEX_HOME
+                              (Git Bash: CODEX_HOME='<dir>' codex login --device-auth)
   --model <id>                Agent model, full id. Default: gpt-6-astra
   --effort <level>            Agent reasoning effort. Default: low
   --output-dir <dir>          Default output directory for images. A relative path resolves
@@ -444,7 +448,7 @@ OPTIONS:
   --state-dir <abs dir>       Override the per-project state directory. Default:
                               <state base>\<project>-<hash>, where the state base is
                               %CODEX_IMAGEGEN_HOME%, else %USERPROFILE%\.codex-imagegen
-  --timeout-seconds <n>       Whole-call limit for generate/refine, 30..86400. Default: 300
+  --timeout-seconds <n>       Whole-call limit for generate/refine, 60..86400. Default: 300
   --max-concurrent <n>        Concurrent image turns across sessions, at least 1. Default: 4
   --session-ttl-days <n>      Expire sessions idle this many days, and their files. 0 disables.
                               Default: 7
@@ -597,13 +601,13 @@ mod tests {
 
     #[test]
     fn numbers_are_range_checked() {
-        assert!(err(&["--timeout-seconds", "29"]).contains("between 30 and 86400"));
-        assert!(err(&["--timeout-seconds", "86401"]).contains("between 30 and 86400"));
+        assert!(err(&["--timeout-seconds", "59"]).contains("between 60 and 86400"));
+        assert!(err(&["--timeout-seconds", "86401"]).contains("between 60 and 86400"));
         assert!(err(&["--timeout-seconds", "5m"]).contains("whole number"));
         assert!(err(&["--timeout-seconds", "-1"]).contains("whole number"));
         assert_eq!(
-            parse(&["--timeout-seconds", "30"]).unwrap().timeout,
-            Duration::from_secs(30)
+            parse(&["--timeout-seconds", "60"]).unwrap().timeout,
+            Duration::from_secs(60)
         );
         assert!(err(&["--max-concurrent", "0"]).contains("between 1"));
         assert!(err(&["--session-ttl-days", "3651"]).contains("between 0 and 3650"));
