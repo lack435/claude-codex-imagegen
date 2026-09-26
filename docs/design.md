@@ -829,7 +829,10 @@ session can no longer be refined. Expiry is therefore per session [decided].
   4. `thread/delete {threadId}`. "no rollout found" (and "thread not found") counts as already gone: for a
      thread id Codex does not know, `thread/delete` answers `no rollout found for thread id <id>`, in the ambient
      home and in a fresh dedicated one [verified: live, `--cleanup` on fabricated records, 2026-09-25]. "active
-     writer" or any other error skips the session until next time.
+     writer" or any other error skips the session until next time, and so does a timeout: once, while another
+     Codex process was busy on the same home, a `thread/delete` answered only after 30 s although the rollout was
+     already gone, and the next run found the thread gone and finished the session [verified: live, 2026-09-26].
+     The `--cleanup` sweep therefore waits up to 120 s for each delete; automatic expiry keeps its ~60 s bound.
   5. Delete Codex's per-thread image folder, `<codex_home>\generated_images\<threadId>\`: only `*.png` entries
      that are plain files, then the folder once it is empty. First, neither `<codex_home>\generated_images` nor
      the thread's folder may be a link (a reparse point), and the folder's canonical path must equal the

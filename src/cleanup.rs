@@ -62,6 +62,13 @@ pub type BusyHere<'a> = &'a dyn Fn(&str) -> bool;
 /// How long the sweep's children get to exit once their input ends.
 const CHILD_GRACE: Duration = Duration::from_secs(5);
 
+/// How long the `--cleanup` sweep waits for each `thread/delete`. It runs from a terminal, so it can
+/// afford to wait: one delete answered only after 30 s while another Codex process was busy on the
+/// same home, although the rollout was already gone [verified: live, 2026-09-26]. A timeout is not
+/// harmful either way -- the session is skipped and the next run finds the thread gone -- but a
+/// longer wait finishes the job in one run.
+const SWEEP_DELETE_DEADLINE: Duration = Duration::from_secs(120);
+
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 const SECS_PER_DAY: i64 = 86_400;
@@ -996,7 +1003,7 @@ fn sweep_groups(
                 .request(
                     "thread/delete",
                     json!({"threadId": thread_id}),
-                    Instant::now() + codex::CALL_DEADLINE,
+                    Instant::now() + SWEEP_DELETE_DEADLINE,
                     None,
                 )
                 .map(|_| ())
