@@ -22,6 +22,8 @@
 //!   by wildcard there.
 //! - Every file is deleted through the handle its checks were made on ([`crate::delete`]), which
 //!   admits no other writer or deleter and never follows a link at the file's name.
+//! - A read-only file or folder is kept, as the user's protection: logged, not retried, and not a
+//!   reason to keep the session.
 //! - The session's lease is held throughout, taken without waiting: a session in use is skipped,
 //!   and the record is read again under the lease, so one a call has just refreshed is left be.
 //!
@@ -460,8 +462,8 @@ fn remove_codex_images(
 
 /// Delete one of Codex's PNGs through a handle that never follows a link at its name, once that
 /// handle shows a plain file directly in `folder`, the canonical path of the thread's image
-/// folder. Checking the location through the handle means a link swapped into the path after the
-/// folder was checked cannot redirect the deletion.
+/// folder, that is not read-only. Checking the location through the handle means a link swapped
+/// into the path after the folder was checked cannot redirect the deletion.
 fn delete_codex_png(path: &Path, folder: &Path) -> io::Result<Verdict> {
     let Some(file) = delete::open(path)? else {
         return Ok(Verdict::Gone);
@@ -477,13 +479,16 @@ fn delete_codex_png(path: &Path, folder: &Path) -> io::Result<Verdict> {
             folder.display()
         )));
     }
+    if file.is_read_only() {
+        return Ok(read_only());
+    }
     let size = file.size();
     file.delete()?;
     Ok(Verdict::Deleted(size))
 }
 
 /// Remove the thread's image folder, empty by now, through a handle, once that handle shows the
-/// plain folder at `folder`.
+/// plain folder at `folder`, not read-only.
 fn remove_codex_folder(dir: &Path, folder: &Path) -> io::Result<Verdict> {
     let Some(opened) = delete::open(dir)? else {
         return Ok(Verdict::Gone);
@@ -494,6 +499,9 @@ fn remove_codex_folder(dir: &Path, folder: &Path) -> io::Result<Verdict> {
     let at = opened.final_path()?;
     if !same_path(&at, folder) {
         return Ok(Verdict::Refused(format!("it resolves to {}", at.display())));
+    }
+    if opened.is_read_only() {
+        return Ok(read_only());
     }
     opened.delete()?;
     Ok(Verdict::Deleted(0))
@@ -549,9 +557,9 @@ fn remove_outputs(record: &Record, freed: &mut u64, problems: &mut Vec<String>) 
 }
 
 /// Delete a published output through one handle, only while that handle shows a plain file with
-/// the recorded size and content fingerprint. Size and fingerprint are read through the handle,
-/// which admits no other writer or deleter, and the deletion is marked on it, so the file checked
-/// is the file deleted.
+/// the recorded size and content fingerprint, that is not read-only. Size, fingerprint and
+/// attributes are read through the handle, which admits no other writer or deleter, and the
+/// deletion is marked on it, so the file checked is the file deleted.
 fn delete_output(path: &Path, bytes: u64, fingerprint: u64) -> io::Result<Verdict> {
     let Some(file) = delete::open(path)? else {
         return Ok(Verdict::Gone);
@@ -567,8 +575,19 @@ fn delete_output(path: &Path, bytes: u64, fingerprint: u64) -> io::Result<Verdic
             "its content changed after it was published".to_string(),
         ));
     }
+    if file.is_read_only() {
+        return Ok(read_only());
+    }
     file.delete()?;
     Ok(Verdict::Deleted(bytes))
+}
+
+/// A read-only file or folder is kept: the attribute is the user's protection, and cleanup honours
+/// it rather than overriding it. Kept, not a failure, so the deletion is not retried and the rest of
+/// the session still goes; were it attempted, it would fail with ERROR_ACCESS_DENIED, which
+/// [`output::retry_transient`] takes for a busy file.
+fn read_only() -> Verdict {
+    Verdict::Kept("it is read-only".to_string())
 }
 
 /// Remove `names` from `store` one by one while time remains, then record the outcome as the
@@ -1043,8 +1062,9 @@ mod tests {
     use crate::codex::testing::{FakeCodex, CODEX_HOME};
     use crate::config::Fnv1a64;
     use crate::session::{Output, StoreFile};
-    use crate::testutil::{make_junction, temp_dir, TempDir};
+    use crate::testutil::{make_junction, set_read_only, temp_dir, TempDir};
     use crate::tools::testing::cfg;
+    use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1427,6 +1447,131 @@ mod tests {
             "the replacement was deleted"
         );
         assert!(world.file().get("fox").is_none());
+    }
+
+    /// Well under the ~0.8 s `output::retry_transient` spends on an error it takes for a busy file.
+    const PROMPTLY: Duration = Duration::from_millis(600);
+
+    #[test]
+    fn a_read_only_output_is_kept_at_once_and_the_session_still_goes() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1, 2]);
+        let protected = &record.outputs[0];
+        set_read_only(&protected.path);
+        let started = Instant::now();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        let took = started.elapsed();
+        assert!(
+            took < PROMPTLY,
+            "the read-only file was retried as if it were busy ({took:?})"
+        );
+        assert_eq!(fs::read(&protected.path).unwrap(), vec![1u8; 101]);
+        assert!(!record.outputs[1].path.exists(), "the unprotected v2");
+        assert!(!world.images_dir(THREAD).exists(), "Codex's image folder");
+        let file = world.file();
+        assert!(
+            file.get("fox").is_none(),
+            "a read-only file kept the session"
+        );
+        let outcome = file.last_cleanup.unwrap();
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        // Codex's two copies and our v2.
+        assert_eq!(outcome.freed_bytes, 101 + 102 + 102);
+        // Kept on purpose, which cleanup logs, without the deletion being attempted.
+        let fingerprint = protected.fingerprint().unwrap();
+        assert_eq!(
+            delete_output(&protected.path, protected.bytes, fingerprint).unwrap(),
+            Verdict::Kept("it is read-only".to_string())
+        );
+        assert!(protected.path.is_file());
+    }
+
+    #[test]
+    fn a_read_only_codex_png_is_kept_with_its_folder_and_the_session_still_goes() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1, 2]);
+        let protected = world.images_dir(THREAD).join("exec-1.png");
+        set_read_only(&protected);
+        let started = Instant::now();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        let took = started.elapsed();
+        assert!(
+            took < PROMPTLY,
+            "the read-only file was retried as if it were busy ({took:?})"
+        );
+        assert_eq!(fs::read(&protected).unwrap(), vec![1u8; 101]);
+        assert!(!world.images_dir(THREAD).join("exec-2.png").exists());
+        for output in &record.outputs {
+            assert!(!output.path.exists(), "{}", output.path.display());
+        }
+        let file = world.file();
+        assert!(
+            file.get("fox").is_none(),
+            "a read-only file kept the session"
+        );
+        let outcome = file.last_cleanup.unwrap();
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        // Codex's v2 and our two copies.
+        assert_eq!(outcome.freed_bytes, 102 + 101 + 102);
+        // Kept on purpose, which cleanup logs, and its folder with it.
+        let folder = fs::canonicalize(world.images_dir(THREAD)).unwrap();
+        assert_eq!(
+            delete_codex_png(&protected, &folder).unwrap(),
+            Verdict::Kept("it is read-only".to_string())
+        );
+        assert!(protected.is_file());
+    }
+
+    #[test]
+    fn a_read_only_codex_folder_is_emptied_but_kept_at_once_and_the_session_still_goes() {
+        let world = World::new();
+        world.session("fox", THREAD, OLD, &[1]);
+        let dir = world.images_dir(THREAD);
+        set_read_only(&dir);
+        let started = Instant::now();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        let took = started.elapsed();
+        assert!(
+            took < PROMPTLY,
+            "the read-only folder was retried as if it were busy ({took:?})"
+        );
+        // Its PNG is deleted: the attribute on a folder does not protect what is in it.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(world.file().get("fox").is_none());
+        let folder = fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            remove_codex_folder(&dir, &folder).unwrap(),
+            Verdict::Kept("it is read-only".to_string())
+        );
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_codex_png_open_in_a_viewer_that_shares_delete_is_unlinked_and_its_folder_removed() {
+        let world = World::new();
+        let record = world.session("fox", THREAD, OLD, &[1]);
+        let png = world.images_dir(THREAD).join("exec-1.png");
+        // An image viewer: reading, and sharing reading, writing and deleting.
+        let mut viewer = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2 | 0x4)
+            .open(&png)
+            .unwrap();
+        expire_with(&world, 7, &Deletes::ok(), &|_| false);
+        assert!(
+            !world.images_dir(THREAD).exists(),
+            "Codex's image folder stayed behind a PNG open in a viewer"
+        );
+        assert!(!record.outputs[0].path.exists());
+        let file = world.file();
+        assert!(file.get("fox").is_none());
+        let outcome = file.last_cleanup.unwrap();
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert_eq!(outcome.freed_bytes, 101 + 101);
+        // The viewer still reads what it opened.
+        let mut content = Vec::new();
+        viewer.read_to_end(&mut content).unwrap();
+        assert_eq!(content, vec![1u8; 101]);
     }
 
     #[test]

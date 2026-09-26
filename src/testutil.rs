@@ -102,6 +102,17 @@ pub fn make_junction(link: &Path, target: &Path) {
     );
 }
 
+/// Set the read-only attribute on the file or folder at `path`, as a user protecting it would.
+/// Removing the test's directory still removes it: the standard library's `remove_dir_all` deletes
+/// read-only entries.
+pub fn set_read_only(path: &Path) {
+    let mut permissions = std::fs::metadata(path)
+        .expect("read metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions).expect("set read-only");
+}
+
 /// Collects what a code path writes, standing in for our stdout.
 #[derive(Clone, Default)]
 pub struct Recorder(Arc<Mutex<Vec<u8>>>);

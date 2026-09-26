@@ -11,10 +11,16 @@
 //! - It is opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so a link (a symbolic link or a junction)
 //!   at the final name is opened as itself and never followed. Folders on the way there are still
 //!   resolved, so [`Opened::final_path`] reports where the handle really is.
-//! - Its type, size, content and location are read through the handle.
-//! - The deletion is marked on the same handle (`SetFileInformationByHandle` with
-//!   `FileDispositionInfo`) and takes effect as the handle closes, so the file verified is the file
-//!   deleted.
+//! - Its type, attributes, size, content and location are read through the handle.
+//! - The deletion is marked on the same handle, so the file verified is the file deleted:
+//!   `SetFileInformationByHandle` with `FileDispositionInfoEx` and POSIX semantics, which removes
+//!   the name as this handle closes, even while another process that shares delete (an image
+//!   viewer) still has the file open. Where the file system has no POSIX deletes (expected of FAT,
+//!   exFAT and some network file systems: docs/design.md, V10), the legacy `FileDispositionInfo` is
+//!   marked on the same handle instead, and there the name stays, delete-pending, until the last
+//!   handle to the file is closed.
+//! - Neither overrides the read-only attribute, which cleanup takes as the user's protection: it
+//!   keeps a read-only file or folder ([`Opened::is_read_only`]) without attempting the deletion.
 
 use std::ffi::OsString;
 use std::fs::{File, Metadata, OpenOptions};
@@ -33,10 +39,20 @@ const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 const FILE_SHARE_READ: u32 = 0x1;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-/// `FILE_INFO_BY_HANDLE_CLASS::FileDispositionInfo`.
+/// `FILE_INFO_BY_HANDLE_CLASS::FileDispositionInfo`: the legacy disposition, one BOOLEAN.
 const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+/// `FILE_INFO_BY_HANDLE_CLASS::FileDispositionInfoEx`: `FILE_DISPOSITION_INFO_EX`, one ULONG of
+/// flags.
+const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
+const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+/// What a file system without POSIX deletes answers `FileDispositionInfoEx` with.
+const ERROR_INVALID_FUNCTION: i32 = 1;
+const ERROR_NOT_SUPPORTED: i32 = 50;
+const ERROR_INVALID_PARAMETER: i32 = 87;
 
 extern "system" {
     fn SetFileInformationByHandle(
@@ -95,6 +111,12 @@ impl Opened {
         !self.is_link() && self.is_folder()
     }
 
+    /// Read-only when it was opened. Neither deletion in [`Opened::delete`] overrides that: it
+    /// fails with ERROR_ACCESS_DENIED.
+    pub fn is_read_only(&self) -> bool {
+        self.meta.file_attributes() & FILE_ATTRIBUTE_READONLY != 0
+    }
+
     /// The size when it was opened, which no one else can change while it is open.
     pub fn size(&self) -> u64 {
         self.meta.len()
@@ -141,33 +163,84 @@ impl Opened {
         }
     }
 
-    /// Delete it: mark the deletion on this handle, which takes effect as the handle closes here.
-    /// A folder that is not empty fails with ERROR_DIR_NOT_EMPTY and is left as it was.
+    /// Delete it, marking the deletion on this handle.
+    ///
+    /// First as a POSIX delete (`FileDispositionInfoEx` with
+    /// `FILE_DISPOSITION_FLAG_POSIX_SEMANTICS`): the name is removed as this handle closes, at the
+    /// end of this call, even while another process that shares delete (an image viewer) has the
+    /// file open; that process can go on reading it until it closes it, and a folder the file was
+    /// in can be removed at once. A file system without POSIX deletes refuses that with
+    /// ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED or ERROR_INVALID_FUNCTION (expected of FAT,
+    /// exFAT and some network file systems, not yet seen: docs/design.md, V10), and then the legacy
+    /// `FileDispositionInfo` is marked on the same handle: the name then stays, delete-pending,
+    /// until the last handle to the file is closed.
+    ///
+    /// Neither sets `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE`, so a read-only file or
+    /// folder fails with ERROR_ACCESS_DENIED; cleanup keeps one before getting here. A folder that
+    /// is not empty fails with ERROR_DIR_NOT_EMPTY. Either is left as it was.
     pub fn delete(self) -> io::Result<()> {
-        // FILE_DISPOSITION_INFO is one BOOLEAN, DeleteFile.
-        let delete_file: u8 = 1;
-        // SAFETY: the handle is valid while `self.file` lives, and was opened with DELETE access;
-        // the buffer is the one-byte FILE_DISPOSITION_INFO the class expects and outlives the
-        // call.
-        let marked = unsafe {
-            SetFileInformationByHandle(
-                self.file.as_raw_handle() as *mut c_void,
-                FILE_DISPOSITION_INFO_CLASS,
-                (&delete_file as *const u8).cast(),
-                1,
-            )
-        };
-        if marked == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        self.delete_with(mark_posix_delete)
     }
+
+    /// [`Opened::delete`], with the POSIX delete `posix` stands for, so a test can make it
+    /// unsupported.
+    fn delete_with(self, posix: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+        match posix(&self.file) {
+            Err(e) if no_posix_deletes(&e) => mark_legacy_delete(&self.file),
+            marked => marked,
+        }
+    }
+}
+
+/// Whether `e` is a file system saying it has no POSIX deletes.
+fn no_posix_deletes(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)
+    )
+}
+
+/// Mark a POSIX delete on `file`'s handle.
+fn mark_posix_delete(file: &File) -> io::Result<()> {
+    let flags: u32 = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+    // SAFETY: FILE_DISPOSITION_INFO_EX is one ULONG of flags.
+    unsafe { set_disposition(file, FILE_DISPOSITION_INFO_EX_CLASS, &flags) }
+}
+
+/// Mark the legacy delete on `file`'s handle.
+fn mark_legacy_delete(file: &File) -> io::Result<()> {
+    let delete_file: u8 = 1;
+    // SAFETY: FILE_DISPOSITION_INFO is one BOOLEAN, DeleteFile.
+    unsafe { set_disposition(file, FILE_DISPOSITION_INFO_CLASS, &delete_file) }
+}
+
+/// `SetFileInformationByHandle(file, class, info)`.
+///
+/// # Safety
+///
+/// `T` must be the structure `class` expects.
+unsafe fn set_disposition<T>(file: &File, class: i32, info: &T) -> io::Result<()> {
+    // SAFETY: the handle is valid while `file` lives, and was opened with DELETE access; `info` is
+    // the structure `class` expects (the caller's promise), of the size passed, and outlives the
+    // call.
+    let marked = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as *mut c_void,
+            class,
+            (info as *const T).cast(),
+            std::mem::size_of::<T>() as u32,
+        )
+    };
+    if marked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{make_junction, temp_dir};
+    use crate::testutil::{make_junction, set_read_only, temp_dir};
     use std::fs;
 
     #[test]
@@ -207,6 +280,105 @@ mod tests {
         drop(held);
         open(&path).unwrap().unwrap().delete().unwrap();
         assert!(!path.exists());
+    }
+
+    /// An image viewer's handle: reading, and sharing reading, writing and deleting.
+    fn open_in_viewer(path: &Path) -> File {
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_file_open_in_a_viewer_that_shares_delete_is_unlinked_at_once() {
+        let dir = temp_dir("delete");
+        let folder = dir.join("thread");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("exec-1.png");
+        fs::write(&path, b"foobar").unwrap();
+        let mut viewer = open_in_viewer(&path);
+        open(&path).unwrap().unwrap().delete().unwrap();
+        // The name is gone as the deleting handle closes, not when the viewer's does: the folder is
+        // empty, and can be removed.
+        let left: Vec<_> = fs::read_dir(&folder).unwrap().collect();
+        assert!(left.is_empty(), "still named, delete-pending: {left:?}");
+        open(&folder).unwrap().unwrap().delete().unwrap();
+        assert!(!folder.exists());
+        // The viewer still reads what it opened.
+        let mut content = Vec::new();
+        viewer.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"foobar");
+    }
+
+    #[test]
+    fn a_read_only_file_is_shown_and_neither_deletion_overrides_it() {
+        let dir = temp_dir("delete");
+        let path = dir.join("kept.png");
+        fs::write(&path, b"keep").unwrap();
+        assert!(!open(&path).unwrap().unwrap().is_read_only());
+        set_read_only(&path);
+        let opened = open(&path).unwrap().expect("a read-only file opens");
+        assert!(opened.is_read_only() && opened.is_plain_file());
+        let err = opened.delete().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5), "ERROR_ACCESS_DENIED: {err}");
+        let err = open(&path)
+            .unwrap()
+            .unwrap()
+            .delete_with(|_| Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED)))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5), "the legacy disposition: {err}");
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn where_posix_deletes_are_unsupported_the_legacy_disposition_is_marked_instead() {
+        let dir = temp_dir("delete");
+        let unsupported = |code: i32| move |_: &File| Err(io::Error::from_raw_os_error(code));
+        for code in [
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+            ERROR_INVALID_FUNCTION,
+        ] {
+            let path = dir.join(format!("exec-{code}.png"));
+            fs::write(&path, b"x").unwrap();
+            let opened = open(&path).unwrap().unwrap();
+            opened.delete_with(unsupported(code)).unwrap();
+            assert!(open(&path).unwrap().is_none(), "os error {code}");
+        }
+        // Any other failure is returned, and nothing else is tried.
+        let path = dir.join("refused.png");
+        fs::write(&path, b"x").unwrap();
+        let err = open(&path)
+            .unwrap()
+            .unwrap()
+            .delete_with(unsupported(32))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"x");
+
+        // It is the legacy disposition: while a viewer that shares delete has the file open, the
+        // name stays, delete-pending, and the folder cannot be removed until the viewer closes it.
+        let folder = dir.join("thread");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("exec-1.png");
+        fs::write(&path, b"foobar").unwrap();
+        let viewer = open_in_viewer(&path);
+        open(&path)
+            .unwrap()
+            .unwrap()
+            .delete_with(unsupported(ERROR_NOT_SUPPORTED))
+            .unwrap();
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        let err = open(&folder).unwrap().unwrap().delete().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(145), "ERROR_DIR_NOT_EMPTY: {err}");
+        drop(viewer);
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 0);
+        open(&folder).unwrap().unwrap().delete().unwrap();
+        assert!(!folder.exists());
     }
 
     #[test]
