@@ -126,6 +126,10 @@ struct Shared {
     /// The child process, for its exit status. `None` for a test transport.
     child: Mutex<Option<Child>>,
     next_id: AtomicU64,
+    /// A test transport's stand-in for its process having exited, set by the fake while its
+    /// output is still open: a real child's exit can be seen before its last lines are read.
+    #[cfg(test)]
+    process_exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -206,9 +210,15 @@ impl AppServer {
         *lock(&self.shared.handler) = Some(handler);
     }
 
-    /// True until the child's output closes or the process exits.
+    /// True until the child's output closes or the process exits. The process can be seen to exit
+    /// before the reader has read its last lines; [`exit_detail`](Self::exit_detail) is set only
+    /// once every line has been routed.
     pub fn is_alive(&self) -> bool {
         if lock(&self.shared.table).exited.is_some() {
+            return false;
+        }
+        #[cfg(test)]
+        if self.shared.process_exited.load(Ordering::SeqCst) {
             return false;
         }
         match lock(&self.shared.child).as_mut() {
@@ -217,8 +227,8 @@ impl AppServer {
         }
     }
 
-    /// Why the child is gone, once its output has closed: the exit status and the tail of its
-    /// stderr. `None` while it is running.
+    /// Why the child is gone, once its output has closed and every line it wrote has been routed:
+    /// the exit status and the tail of its stderr. `None` until then.
     pub fn exit_detail(&self) -> Option<String> {
         lock(&self.shared.table).exited.clone()
     }
@@ -421,6 +431,8 @@ impl Shared {
             stderr,
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
+            #[cfg(test)]
+            process_exited: Arc::default(),
         })
     }
 
@@ -804,7 +816,10 @@ pub mod fake {
     /// What the fake server sends back. Cloneable, so a script can hand it to another thread and
     /// reply later. Every clone shares one output, so any of them can close it.
     #[derive(Clone)]
-    pub struct Outbox(Arc<Mutex<Option<Sender<Vec<u8>>>>>);
+    pub struct Outbox {
+        output: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
+        process_exited: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl Outbox {
         pub fn send(&self, message: Value) {
@@ -813,7 +828,7 @@ pub mod fake {
 
         /// Send one line exactly as given, for whitespace and malformed-input cases.
         pub fn send_raw(&self, line: &str) {
-            if let Some(output) = lock(&self.0).as_ref() {
+            if let Some(output) = lock(&self.output).as_ref() {
                 let _ = output.send(format!("{line}\n").into_bytes());
             }
         }
@@ -821,7 +836,15 @@ pub mod fake {
         /// Close the server's output, as a child that exits does, from whichever thread holds
         /// this.
         pub fn close(&self) {
-            lock(&self.0).take();
+            lock(&self.output).take();
+        }
+
+        /// Make the process count as exited while its output stays open, until [`close`]: the
+        /// order in which a real child's exit can be seen, with its last lines still unread.
+        ///
+        /// [`close`]: Self::close
+        pub fn exit_process(&self) {
+            self.process_exited.store(true, Ordering::SeqCst);
         }
     }
 
@@ -844,8 +867,17 @@ pub mod fake {
     ) -> AppServer {
         let (to_server, server_in) = mpsc::channel::<Vec<u8>>();
         let (server_out, from_server) = mpsc::channel::<Vec<u8>>();
+        let server = AppServer::from_transport(
+            BufReader::new(ChannelReader::new(from_server)),
+            ChannelWriter(to_server),
+            max_line_bytes,
+        );
+        let process_exited = Arc::clone(&server.shared.process_exited);
         std::thread::spawn(move || {
-            let outbox = Outbox(Arc::new(Mutex::new(Some(server_out))));
+            let outbox = Outbox {
+                output: Arc::new(Mutex::new(Some(server_out))),
+                process_exited,
+            };
             let mut input = BufReader::new(ChannelReader::new(server_in));
             let mut line = String::new();
             loop {
@@ -865,11 +897,7 @@ pub mod fake {
             // from another thread.
             outbox.close();
         });
-        AppServer::from_transport(
-            BufReader::new(ChannelReader::new(from_server)),
-            ChannelWriter(to_server),
-            max_line_bytes,
-        )
+        server
     }
 
     /// Bytes written here come out of the paired [`ChannelReader`].

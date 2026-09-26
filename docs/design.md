@@ -507,7 +507,8 @@ Measured: about 1 ms and under 1 KB allocated per 3.8 MB line, against about 1.3
 - Check `status` before reading anything else.
 - Only a `completed` item with a `savedPath` is copied.
 - A `completed` item with no `savedPath` is re-parsed with `result: Cow<str>`, and the base64 is decoded
-  instead.
+  instead. The result reads the same either way, so each completed item logs one stderr line naming its
+  `savedPath`, or saying it had none; `smoke.ps1` reads it for V1.
 - A `completed` item with neither a `savedPath` nor decodable image data leaves no image anywhere, so it counts
   as a failed item [decided].
 - A `failed` item is handled under [Errors](#errors).
@@ -532,7 +533,10 @@ sees the server's tools. A report that comes later interrupts the turn.
 ### Lifecycle
 
 - **Child death.** In-flight turns fail with `APP_SERVER_FAILED`, unless an image already completed (see the
-  success rule). The next call respawns the child and re-runs preflight.
+  success rule). The next call respawns the child and re-runs preflight. The exit can be seen before the
+  reader has read the child's last lines, an image's `item/completed` among them, so a call that finds the
+  child dead first waits, bounded to about 2.5 s, for the reader to reach the end of the output (it marks
+  that only after routing every line), then handles every event already routed to it [decided].
 - **Our stdin closing.** When our stdin closes and we are given time to exit:
   1. interrupt running turns;
   2. let copies already in progress finish;
@@ -950,6 +954,8 @@ tested against a scripted fake child that replays message sequences for these ca
 - an MCP canary breach
 - an oversized line
 - a missing `savedPath`
+- a child seen to exit before its last image line is read, and one that exits while the call is busy with an
+  earlier image
 - a deleted edit target, where no turn is sent
 - cleanup:
   - an expired session is removed completely;
@@ -962,10 +968,21 @@ tested against a scripted fake child that replays message sequences for these ca
 the free steps (`initialize`, `tools/list`, `status`, then the no-stray-process check). The M2 version spends
 about 2 images: `generate` with the quotes, backslash, newline and non-ASCII prompt (V2), then `generate` with
 that image as a reference (V3), each checked for an `image/jpeg` preview of 512,000 bytes or less with a long
-edge of 1024 px or less, the `<session>-v1.png` file, and no `revisedPrompt` warning. It runs the server with
-`CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and reads the offered tools from the trace (V1): each
-recorded Responses request's `tools`, plus the nested tools listed as headings in `exec`'s description. The full
-version below arrives with sessions in M3.
+edge of 1024 px or less, and the `<session>-v1.png` file. V2 is compared by the script itself: the `codex prompt`
+line, JSON-decoded, must equal the prompt sent (whitespace at either end aside), and the server must raise no
+prompt warning. It runs the server with `CODEX_ROLLOUT_TRACE_ROOT` set, which the child inherits, and reads the
+trace:
+
+- V1: the offered tools, from each recorded Responses request's `tools`, plus the nested tools listed as
+  headings in `exec`'s description;
+- V3: the image tool's recorded invocation (a `tool_call_started` event's payload) must list the first image in
+  `referenced_image_paths`. Text Codex sent to the model never counts: the developer instructions, the tool's
+  declaration and the tagged input name both the parameter and the path whatever the agent does.
+
+V1's `savedPath` comes from the server's stderr: each image must have logged its `savedPath`, under
+`<CODEX_HOME>\generated_images`, byte-identical to the published copy, and none may have fallen back to the
+base64. The no-stray-process check covers every process of ours alive just before shutdown, and an app-server
+respawned during the run fails. The full version below arrives with sessions in M3.
 
 The full version spends about 3 images. It is run when protocol, spawning or session code changes, and the user
 is told the cost first. It drives `dist\codex-imagegen.exe` over MCP:

@@ -51,6 +51,13 @@ pub const INTERRUPT_WAIT: Duration = Duration::from_secs(15);
 /// cancel hook; this only bounds how late the call itself notices.
 const EVENT_POLL: Duration = Duration::from_millis(100);
 
+/// How long a call that finds the child dead waits for the reader to reach the end of the child's
+/// output. The process can be seen to exit before its last lines are read, an image's
+/// `item/completed` among them, and the reader marks the end only once it has routed every line.
+/// Above the up to 2 s the reader then takes to collect the exit code and the stderr tail; bounded,
+/// because a grandchild holding the pipe open could delay the end indefinitely.
+const EXIT_SETTLE: Duration = Duration::from_millis(2500);
+
 /// The longest revised prompt the result text repeats. Prompts come from Claude and are normally
 /// far shorter; the bound keeps a runaway one from filling the result.
 const MAX_PROMPT_CHARS: usize = 4000;
@@ -765,17 +772,15 @@ fn wait_for_turn(
             return (Ended::GaveUp, stop);
         }
         if !call.server.is_alive() {
-            let detail = call
-                .server
-                .exit_detail()
-                .unwrap_or_else(|| "the process exited".to_string());
-            return (Ended::ChildDied(detail), stop);
+            return (child_gone(call, turn, events, request, &phase), stop);
         }
         let slice = until.saturating_duration_since(now).min(EVENT_POLL);
         let event = match events.recv_timeout(slice) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
-            // The registry drops the sender only with the slot, which this call still holds.
+            // The registry drops the sender only with the slot, which this call still holds. A
+            // channel reports this only once every event sent before has been received, so there
+            // is nothing left to drain.
             Err(RecvTimeoutError::Disconnected) => {
                 return (
                     Ended::ChildDied("the turn's event channel closed".to_string()),
@@ -787,6 +792,34 @@ fn wait_for_turn(
             return (ended, stop);
         }
     }
+}
+
+/// The child is gone. Its exit can be seen before the reader has read its last lines, and the
+/// reader may have routed more while this thread was busy with an earlier image: an image that
+/// completed in the child's last moments must still count (the success rule). So wait, bounded,
+/// for the reader to reach the end of the output, which it marks only after routing every line,
+/// then handle everything it routed. One of those events can still end the turn.
+fn child_gone(
+    call: &Call<'_>,
+    turn: &mut Turn,
+    events: &Receiver<Event>,
+    request: &Request<'_>,
+    phase: &dyn Fn(&str),
+) -> Ended {
+    let settle_until = Instant::now() + EXIT_SETTLE;
+    while call.server.exit_detail().is_none() && Instant::now() < settle_until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    events
+        .try_iter()
+        .find_map(|event| apply_event(turn, event, request, phase))
+        .unwrap_or_else(|| {
+            Ended::ChildDied(
+                call.server
+                    .exit_detail()
+                    .unwrap_or_else(|| "the process exited".to_string()),
+            )
+        })
 }
 
 /// What one event changes. `Some` when it ends the wait for the turn.
@@ -846,6 +879,10 @@ fn apply_event(
 /// best-effort: the image completed, so whatever fails here becomes a warning, never a failure
 /// (docs/design.md, "Copy").
 fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
+    eprintln!(
+        "{}",
+        image_source_line(request.session, image.saved_path.as_deref())
+    );
     let bytes: Result<Vec<u8>, String> = match (&image.saved_path, &image.base64) {
         // One read, shared by the copy and the preview.
         (Some(path), _) => std::fs::read(path)
@@ -943,6 +980,22 @@ fn deliver(turn: &mut Turn, image: CompletedImage, request: &Request<'_>) {
         preview,
         revised_prompt: image.revised_prompt,
     });
+}
+
+/// The stderr line saying where a completed image's bytes come from. The base64 fallback is
+/// otherwise invisible in the result, so `smoke.ps1` reads this line to check that Codex reports
+/// `savedPath` (V1); keep the two in step. Only the path is logged, never the data.
+fn image_source_line(session: &str, saved_path: Option<&Path>) -> String {
+    match saved_path {
+        Some(path) => format!(
+            "codex-imagegen: session {session}: image item has savedPath {}",
+            path.display()
+        ),
+        None => format!(
+            "codex-imagegen: session {session}: image item has no savedPath; falling back to its \
+             base64 data"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1470,20 @@ mod tests {
         assert!(matches!(event, Event::Unreadable { what } if what.contains("item/completed")));
         // Without even a thread id there is nobody to tell.
         assert!(parse_notification("turn/completed", &raw(json!({"x": 1}))).is_none());
+    }
+
+    #[test]
+    fn the_image_source_line_keeps_the_wording_smoke_ps1_reads() {
+        // smoke.ps1 matches these lines to check that Codex reported savedPath (V1).
+        assert_eq!(
+            image_source_line(
+                "smoke-1",
+                Some(Path::new(r"C:\codex\generated_images\t\exec-1.png"))
+            ),
+            r"codex-imagegen: session smoke-1: image item has savedPath C:\codex\generated_images\t\exec-1.png"
+        );
+        assert!(image_source_line("smoke-1", None)
+            .starts_with("codex-imagegen: session smoke-1: image item has no savedPath;"));
     }
 
     #[test]
@@ -2273,6 +2340,51 @@ mod generate_tests {
             text_of(&result)
         );
         assert!(f.dir.join("generated-images").join("s-v1.png").is_file());
+    }
+
+    #[test]
+    fn an_image_still_unread_when_the_child_is_seen_to_exit_is_kept() {
+        // The process is seen to exit while its last line, the image, is still in the pipe: the
+        // call must wait for the reader to reach the end of the output, not give up at once.
+        let saved = saved_png();
+        let f = fixture(codex(vec![
+            Step::Send(turn_started()),
+            Step::Send(image_started("exec-1")),
+            Step::ProcessExits,
+            Step::Sleep(EVENT_POLL * 3),
+            Step::Send(image_completed("exec-1", "p", "", Some(&saved.path))),
+            Step::Exit,
+        ]));
+        let result = generate(&f, json!({"prompt": "p", "session": "s"}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(
+            text_of(&result).contains("warning: the Codex app-server exited after the image"),
+            "{}",
+            text_of(&result)
+        );
+        assert!(f.dir.join("generated-images").join("s-v1.png").is_file());
+    }
+
+    #[test]
+    fn images_routed_while_the_call_was_busy_are_kept_when_the_child_then_exits() {
+        // A large first image keeps the call's thread busy with its copy and preview while the
+        // reader routes the second one and reaches the end of the output.
+        let big = saved_file(photo_like_png(2400, 2400));
+        let small = saved_png();
+        let f = fixture(codex(vec![
+            Step::Send(turn_started()),
+            Step::Send(image_completed("exec-1", "p", "", Some(&big.path))),
+            Step::Send(image_completed("exec-2", "p", "", Some(&small.path))),
+            Step::Exit,
+        ]));
+        let result = generate(&f, json!({"prompt": "p", "session": "s"}));
+        assert_eq!(result["isError"], false, "{result}");
+        let text = text_of(&result);
+        assert_eq!(result["content"].as_array().unwrap().len(), 3, "{text}");
+        assert!(text.starts_with("session: s   versions: 1, 2\n"), "{text}");
+        let dir = f.dir.join("generated-images");
+        assert_eq!(std::fs::read(dir.join("s-v1.png")).unwrap(), big.bytes);
+        assert_eq!(std::fs::read(dir.join("s-v2.png")).unwrap(), small.bytes);
     }
 
     #[test]

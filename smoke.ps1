@@ -15,7 +15,9 @@
     a) generate with a prompt holding double quotes, a backslash, a newline and non-ASCII text
        (V2: Codex must use it verbatim);
     b) generate again with the image from (a) as a reference image (V3);
-  and inspects Codex's rollout trace for the tools the agent model was offered (V1).
+  then reads Codex's rollout trace for the tools the agent model was offered (V1) and for the
+  image tool's referenced_image_paths (V3), and the server's stderr for the savedPath Codex
+  reported for each image (V1).
 
   Run it after .\build.ps1, when a change touches the protocol, spawning or turn handling. Tell
   the owner the cost before running it with -SpendQuota.
@@ -223,8 +225,23 @@ function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]
     $named = $text -match ('(?m)^image: ' + [regex]::Escape($expected) + '  \(')
     Test-Check "$Label names $Session-v1.png in the output folder" $named
     Test-Check "$Label file exists" (Test-Path -LiteralPath $expected) $expected
-    $promptWarning = @($text -split "`n" | Where-Object { $_ -match '^warning: codex prompt differs' })
-    Test-Check "$Label Codex used the prompt verbatim (V2)" ($promptWarning.Count -eq 0) ($promptWarning -join ' ')
+    # V2, compared here rather than taken from the server's own comparison: the prompt Codex says
+    # it used, JSON-quoted on its line, must equal the prompt sent, whitespace at either end aside.
+    $promptLines = @($text -split "`n" | Where-Object { $_ -match '^codex prompt: ' })
+    if ($promptLines.Count -ne 1 -or $promptLines[0] -eq 'codex prompt: (not reported)') {
+        Test-Check "$Label Codex reported the prompt it used (V2)" $false ($promptLines -join ' | ')
+    }
+    else {
+        try {
+            $reported = [string](ConvertFrom-Json -InputObject $promptLines[0].Substring('codex prompt: '.Length))
+            Test-Check "$Label Codex used the prompt verbatim (V2)" ($reported.Trim() -ceq $Prompt.Trim()) $reported
+        }
+        catch {
+            Test-Check "$Label Codex's prompt line is readable (V2)" $false $promptLines[0]
+        }
+    }
+    $promptWarnings = @($text -split "`n" | Where-Object { $_ -match '^warning: (codex prompt differs|Codex did not report the prompt)' })
+    Test-Check "$Label the server raised no prompt warning (V2)" ($promptWarnings.Count -eq 0) ($promptWarnings -join ' ')
     foreach ($warning in @($text -split "`n" | Where-Object { $_ -like 'warning:*' })) {
         Write-Host "      $warning" -ForegroundColor Yellow
     }
@@ -238,6 +255,8 @@ function Test-GenerateResult([string]$Label, $Result, [string]$Session, [string]
 $codexPid = $null
 $descendants = @()
 $v1 = $null
+# The sessions whose generate succeeded, each of which must have logged Codex's savedPath (V1).
+$sessionsMade = @()
 try {
     Write-Host '-> initialize'
     $init = Invoke-Mcp 'initialize' @{ protocolVersion = '2025-11-25'; capabilities = @{}; clientInfo = @{ name = 'codex-imagegen-smoke'; version = '0' } } 30
@@ -274,6 +293,7 @@ try {
         Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
         Write-Host ((Get-ResultText $resultA) -replace '(?m)^', '      ') -ForegroundColor DarkGray
         $v1 = Test-GenerateResult 'generate' $resultA $sessionA $promptA
+        if ($resultA.isError -ne $true) { $sessionsMade += $sessionA }
 
         $sessionB = "smoke-$stamp-ref"
         $promptB = 'The same lighthouse and islet as in the reference image, but in deep winter: snow on the rocks, frozen spray, pale morning light.'
@@ -284,6 +304,7 @@ try {
             Write-Host ("      took {0:N1} s" -f ((Get-Date) - $started).TotalSeconds)
             Write-Host ((Get-ResultText $resultB) -replace '(?m)^', '      ') -ForegroundColor DarkGray
             $v1ref = Test-GenerateResult 'generate with a reference' $resultB $sessionB $promptB
+            if ($resultB.isError -ne $true) { $sessionsMade += $sessionB }
             Add-Check 'V3: the second image follows the reference' 'MANUAL' "compare $v1 with $v1ref"
         }
         else {
@@ -293,6 +314,10 @@ try {
         Write-Host '-> status'
         $status2 = Get-ResultText (Invoke-Mcp 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
         Test-Check 'status: no turn is left running' ($status2 -match '(?m)^running turns: none') ''
+        if ($codexPid) {
+            $pidNow = if ($status2 -match 'app-server: running \(pid (\d+)\)') { [int]$Matches[1] } else { $null }
+            Test-Check 'the Codex app-server ran the whole time, never respawned' ($pidNow -eq $codexPid) "pid $codexPid at the start, $(if ($pidNow) { "pid $pidNow" } else { 'not running' }) now"
+        }
     }
 }
 catch {
@@ -303,14 +328,24 @@ catch {
 # Shutdown: closing stdin ends the server, and its job object takes the Codex tree with it
 # ---------------------------------------------------------------------------------------------
 
+# Every process of ours alive now is checked after the exit, not only those seen at the first
+# status: a respawned app-server, or a helper Codex started during a turn, counts too. Taken while
+# the server still runs, so the parent chain can still be walked; the union keeps a child that
+# died and was replaced.
+if (-not $proc.HasExited) {
+    $descendants = @(@($descendants) + @(Get-Descendants $proc.Id) | Sort-Object ProcessId, CreationDate -Unique)
+}
+
 Write-Host '-> close stdin'
 try { $script:stdin.Close() } catch { }
 $exited = $proc.WaitForExit(20000)
 Test-Check 'the server exits after its stdin closes' $exited ''
 if (-not $exited) { try { $proc.Kill() } catch { } }
+$serverStderr = $null
 if ($stderrTask.Wait(5000)) {
+    $serverStderr = $stderrTask.Result
     $logPath = Join-Path $work 'server-stderr.log'
-    [IO.File]::WriteAllText($logPath, $stderrTask.Result, $utf8)
+    [IO.File]::WriteAllText($logPath, $serverStderr, $utf8)
     Write-Host "      server stderr saved to $logPath" -ForegroundColor DarkGray
 }
 Start-Sleep -Milliseconds 500
@@ -327,45 +362,83 @@ else {
 }
 
 # ---------------------------------------------------------------------------------------------
-# V1: the tools the agent model was offered, from Codex's rollout trace
+# V1 and V3, from Codex's rollout trace and the server's stderr
 # ---------------------------------------------------------------------------------------------
+
+# Whether $Object has a property called $Name (Set-StrictMode makes reading a missing one an error).
+function Test-Property($Object, [string]$Name) {
+    return ($null -ne $Object) -and ($Object.PSObject.Properties.Name -contains $Name)
+}
 
 if ($SpendQuota) {
     Write-Host '-> V1: tools offered to the agent model (rollout trace)'
-    # Each thread writes <root>\trace-<uuid>-<thread>\trace.jsonl. An inference_started event names
-    # the payload file holding the Responses request, whose `tools` list is what the model saw.
-    # Nested tools reachable from code-mode `exec` are listed in its description as "### `name`"
-    # headings (codex-rs code-mode-protocol description.rs at rust-v0.156.0).
+    # Each thread writes <root>\trace-<uuid>-<thread>\trace.jsonl, one event per line, each naming
+    # its payload files by a path relative to that folder (codex-rs rollout-trace at rust-v0.156.0,
+    # raw_event.rs and payload.rs):
+    # - inference_started names the Responses request, whose `tools` list is what the model saw.
+    #   Nested tools reachable from code-mode `exec` are listed in its description as "### `name`"
+    #   headings (code-mode-protocol description.rs).
+    # - tool_call_started names the invocation of each tool Codex ran, nested calls from `exec`
+    #   included: {tool_name, tool_namespace, payload: {type: "function", arguments: "<JSON>"}}
+    #   (tool_dispatch.rs). The image tool's is how V3 is checked.
     $topLevel = New-Object System.Collections.Generic.HashSet[string]
     $nested = New-Object System.Collections.Generic.HashSet[string]
     $requests = 0
-    foreach ($log in @(Get-ChildItem -LiteralPath $traceRoot -Recurse -Filter 'trace.jsonl' -ErrorAction SilentlyContinue)) {
-        foreach ($line in [IO.File]::ReadAllLines($log.FullName, $utf8)) {
-            if ($line -notmatch '"inference_started"') { continue }
-            $traceEvent = ConvertFrom-Json -InputObject $line
-            if ($traceEvent.payload.type -ne 'inference_started') { continue }
-            $payloadPath = Join-Path $log.DirectoryName $traceEvent.payload.request_payload.path
-            if (-not (Test-Path -LiteralPath $payloadPath)) { continue }
-            $request = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($payloadPath, $utf8))
-            $requests++
-            foreach ($tool in @($request.tools)) {
-                $toolName = if ($tool.PSObject.Properties.Name -contains 'name') { $tool.name } else { $tool.type }
-                [void]$topLevel.Add($toolName)
-                if ($tool.PSObject.Properties.Name -contains 'tools') {
-                    foreach ($inner in @($tool.tools)) { [void]$nested.Add("$toolName.$($inner.name)") }
-                }
-                if ($toolName -eq 'exec' -and ($tool.PSObject.Properties.Name -contains 'description')) {
-                    foreach ($m in [regex]::Matches($tool.description, '(?m)^### `([^`]+)`')) {
-                        [void]$nested.Add($m.Groups[1].Value)
+    $imageCalls = @()
+    $traceError = $null
+    try {
+        foreach ($log in @(Get-ChildItem -LiteralPath $traceRoot -Recurse -Filter 'trace.jsonl' -ErrorAction SilentlyContinue)) {
+            foreach ($line in [IO.File]::ReadAllLines($log.FullName, $utf8)) {
+                if ($line -notmatch '"(inference_started|tool_call_started)"') { continue }
+                $traceEvent = ConvertFrom-Json -InputObject $line
+                if ($traceEvent.payload.type -eq 'inference_started') {
+                    $payloadPath = Join-Path $log.DirectoryName $traceEvent.payload.request_payload.path
+                    if (-not (Test-Path -LiteralPath $payloadPath)) { continue }
+                    $request = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($payloadPath, $utf8))
+                    $requests++
+                    foreach ($tool in @($request.tools)) {
+                        $toolName = if (Test-Property $tool 'name') { $tool.name } else { $tool.type }
+                        [void]$topLevel.Add($toolName)
+                        if (Test-Property $tool 'tools') {
+                            foreach ($inner in @($tool.tools)) { [void]$nested.Add("$toolName.$($inner.name)") }
+                        }
+                        if ($toolName -eq 'exec' -and (Test-Property $tool 'description')) {
+                            foreach ($m in [regex]::Matches($tool.description, '(?m)^### `([^`]+)`')) {
+                                [void]$nested.Add($m.Groups[1].Value)
+                            }
+                        }
                     }
+                }
+                elseif ($traceEvent.payload.type -eq 'tool_call_started') {
+                    $ref = if (Test-Property $traceEvent.payload 'invocation_payload') { $traceEvent.payload.invocation_payload } else { $null }
+                    if ($null -eq $ref) { continue }
+                    $invocationPath = Join-Path $log.DirectoryName $ref.path
+                    if (-not (Test-Path -LiteralPath $invocationPath)) { continue }
+                    $invocation = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($invocationPath, $utf8))
+                    # Matched on the tool's name alone, so a change of namespace does not hide it.
+                    if ($invocation.tool_name -ne 'imagegen' -or -not (Test-Property $invocation.payload 'arguments')) { continue }
+                    $arguments = ConvertFrom-Json -InputObject $invocation.payload.arguments
+                    $paths = @()
+                    if (Test-Property $arguments 'referenced_image_paths') {
+                        $paths = @($arguments.referenced_image_paths | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
+                    }
+                    $imageCalls += [pscustomobject]@{ At = [long]$traceEvent.wall_time_unix_ms; Paths = $paths }
                 }
             }
         }
     }
+    catch {
+        $traceError = $_.Exception.Message
+    }
     $toolReport = Join-Path $work 'v1-tools.txt'
-    $reportLines = @("requests inspected: $requests", "top-level tools: $(@($topLevel) -join ', ')", "nested tools: $(@($nested) -join ', ')")
+    $reportLines = @("requests inspected: $requests", "top-level tools: $(@($topLevel) -join ', ')", "nested tools: $(@($nested) -join ', ')",
+        "image tool calls: $($imageCalls.Count)")
+    foreach ($call in $imageCalls) { $reportLines += "  referenced_image_paths: [$(@($call.Paths) -join ', ')]" }
     [IO.File]::WriteAllLines($toolReport, $reportLines, $utf8)
     foreach ($l in $reportLines) { Write-Host "      $l" -ForegroundColor DarkGray }
+    if ($traceError) {
+        Add-Check 'V1: the rollout trace is readable' 'MANUAL' "$traceError; inspect $traceRoot by hand"
+    }
     if ($requests -eq 0) {
         Add-Check 'V1: tool list' 'MANUAL' "no inference request found in the trace under $traceRoot; inspect it by hand"
     }
@@ -377,16 +450,50 @@ if ($SpendQuota) {
         Test-Check 'V1: no shell, stdin, web search, browser, computer-use, multi-agent, skill or tool-suggest tool' ($offending.Count -eq 0) ($offending -join ', ')
         Write-Host "      full list saved to $toolReport" -ForegroundColor DarkGray
     }
-    # V3's first half: the reference path reached the image tool's referenced_image_paths.
-    if ($v1 -and $requests -gt 0) {
-        $needle = $v1.Replace('\', '\\')
-        $hit = @(Get-ChildItem -LiteralPath $traceRoot -Recurse -Filter '*.json' -ErrorAction SilentlyContinue |
-            Where-Object { $t = [IO.File]::ReadAllText($_.FullName, $utf8); $t.Contains('referenced_image_paths') -and $t.Contains($needle) })
-        if ($hit.Count -gt 0) {
-            Add-Check 'V3: the reference reached referenced_image_paths' 'PASS' $hit[0].Name
+
+    # V1's last part: Codex reports savedPath. The result reads the same when the server falls
+    # back to the image's base64, so the server logs where each image came from (turn.rs,
+    # image_source_line), and the copy it published must match Codex's file byte for byte.
+    if ($null -eq $serverStderr) {
+        Add-Check 'V1: Codex reported savedPath for each image' 'MANUAL' 'the server''s stderr was not captured'
+    }
+    else {
+        $savedLines = @([regex]::Matches($serverStderr, '(?m)^codex-imagegen: session ([A-Za-z0-9._-]+): image item has savedPath (.+?)\r?$'))
+        $fallbacks = @([regex]::Matches($serverStderr, '(?m)^codex-imagegen: session [A-Za-z0-9._-]+: image item has no savedPath.*$'))
+        Test-Check 'V1: no image lacked savedPath (no base64 fallback)' ($fallbacks.Count -eq 0) (@($fallbacks | ForEach-Object { $_.Value.Trim() }) -join ' | ')
+        $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+        $imagesRoot = [IO.Path]::GetFullPath((Join-Path $codexHome 'generated_images')).TrimEnd('\') + '\'
+        foreach ($session in $sessionsMade) {
+            $mine = @($savedLines | Where-Object { $_.Groups[1].Value -eq $session })
+            if ($mine.Count -ne 1) {
+                Test-Check "V1: Codex reported savedPath for $session" $false "$($mine.Count) savedPath line(s) in the server's stderr"
+                continue
+            }
+            $savedPath = $mine[0].Groups[2].Value
+            $copy = Join-Path $outDir "$session-v1.png"
+            $same = $savedPath.StartsWith($imagesRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-Path -LiteralPath $savedPath) -and (Test-Path -LiteralPath $copy) -and
+                ((Get-FileHash -LiteralPath $savedPath).Hash -eq (Get-FileHash -LiteralPath $copy).Hash)
+            Test-Check "V1: Codex reported savedPath for $session, and $session-v1.png is a byte copy of it" $same $savedPath
+        }
+    }
+
+    # V3's first half: the reference reached the image tool's referenced_image_paths, as Codex
+    # recorded the call. Never judged from text Codex sent to the model: the developer instructions,
+    # the tool's declaration and the tagged input already name both the parameter and the path.
+    if ($v1) {
+        $v3Name = 'V3: the reference reached the image tool''s referenced_image_paths'
+        $v1Full = [IO.Path]::GetFullPath($v1)
+        # Only the second thread's call can name the first image's copy: it did not exist before.
+        if (@($imageCalls | Where-Object { $_.Paths -contains $v1Full }).Count -gt 0) {
+            Add-Check $v3Name 'PASS' $v1Full
+        }
+        elseif ($imageCalls.Count -ge 2) {
+            $last = @($imageCalls | Sort-Object At)[-1]
+            Test-Check $v3Name $false "the last image call had referenced_image_paths: [$(@($last.Paths) -join ', ')]"
         }
         else {
-            Add-Check 'V3: the reference reached referenced_image_paths' 'MANUAL' 'not found in the trace payloads; inspect by hand'
+            Add-Check $v3Name 'MANUAL' "$($imageCalls.Count) image tool call(s) found in the trace; inspect $traceRoot by hand"
         }
     }
     Write-Host "      the trace holds prompts and tool I/O; delete $traceRoot when done" -ForegroundColor DarkGray

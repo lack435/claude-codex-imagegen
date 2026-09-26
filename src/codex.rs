@@ -940,6 +940,9 @@ pub(crate) mod testing {
         Run(Arc<dyn Fn() + Send + Sync>),
         /// Close the output, as a child that dies does.
         Exit,
+        /// The process exits as the client's liveness check sees it, while its output stays open
+        /// until an `Exit` step: a real child's exit can be seen before its last lines are read.
+        ProcessExits,
     }
 
     /// What the fake does with a turn.
@@ -1207,6 +1210,7 @@ pub(crate) mod testing {
                                         out.close();
                                         return;
                                     }
+                                    Step::ProcessExits => out.exit_process(),
                                 }
                             }
                         });
