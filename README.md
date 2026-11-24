@@ -8,9 +8,11 @@ An MCP server that lets Claude Code generate images through your local Codex CLI
 
 Windows only. It ships as a single self-contained executable.
 
-**Status: 0.1.0**, the first release. Generating, refining, resuming a session after a restart,
-cancelling, a dedicated Codex home and cleanup have all been checked against the real Codex CLI (0.156 and
-0.157). [`docs/design.md`](docs/design.md) describes how it works and why.
+**Status: 0.2.0.** Generating, refining, resuming a session after a restart, cancelling, a dedicated
+Codex home and cleanup have all been checked against the real Codex CLI (0.156 and 0.157). 0.2.0 adds
+retrying a refinement from an earlier version (`from_version`) and the opt-in
+[precise mode](#precise-mode-openai-api-billed-per-image), both checked live on Codex 0.171.0 and the OpenAI
+API. [`docs/design.md`](docs/design.md) describes how it works and why.
 
 ## Requirements
 
