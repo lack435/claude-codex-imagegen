@@ -489,9 +489,10 @@ codex app-server --listen stdio://
   disabled servers too, but every operation then needs its connection from the session's connection set, and
   that set is built from enabled servers only (`codex-mcp/src/connection_manager.rs`, the
   `server.enabled()` filter). A disabled server gets "unknown MCP server" before anything is sent, and a
-  list with no server named walks only that set (`connection_manager/resources.rs`). On our threads every
-  configured server is disabled, by the MCP-off map, and the canary fails any turn in which one starts, so the
-  tools find nothing [verified: source, `rust-v0.171.0`] [decided: accepted].
+  list with no server named walks only that set (`connection_manager/resources.rs`) [verified: source,
+  `rust-v0.171.0`]. On our threads no server is enabled. Configured servers are disabled by the MCP-off map;
+  apps and plugins, the other sources of servers, are switched off at spawn and checked in preflight; and the
+  canary fails any turn in which a server starts anyway. So the tools find nothing [decided: accepted].
 - **`apply_patch` stays.** It is nested in `exec` for every model while the thread has an environment, and the
   environment cannot go without breaking `referenced_image_paths`. Under the read-only sandbox with
   `approvalPolicy: never`, Codex rejects every patch [verified: source, `core/src/safety.rs`] [decided: accepted].

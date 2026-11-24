@@ -82,6 +82,8 @@ def read_shard(path):
                 raise TraceError(f"{path.name}: the record at byte {pos} runs past the shard's end")
             break  # the cut-off tail of an incomplete stream
         record_id = data[header_end : header_end + id_len].decode("utf-8")
+        if record_id in records:
+            raise TraceError(f"{path.name}: record {record_id} appears twice")
         records[record_id] = data[header_end + id_len : end]
         pos = end
     return records, complete
@@ -156,7 +158,11 @@ def decode_folder(folder, out_root):
         for number, line in enumerate(lines, 1):
             if not any(f'"{kind}"' in line for kind in WANTED):
                 continue
-            event = json.loads(line)
+            try:
+                event = json.loads(line)
+            except ValueError as e:
+                problems.append(f"{folder.name}, line {number}: not a JSON event ({e})")
+                continue
             payload = event.get("payload") or {}
             field = WANTED.get(payload.get("type"))
             if field is None or field not in payload:

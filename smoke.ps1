@@ -368,8 +368,9 @@ function Get-ToolVerdict($Tool) {
             'view_image' { return @('Allowed', 'reads an image into the model''s context; writes nothing') }
             'clock__curr_time' { return @('Allowed', 'clock') }
             # codex-cli 0.171.0 adds these for every code-mode-only model. They reach only
-            # servers in the session's connection set, which holds enabled servers only, and
-            # every server is disabled on our threads (docs/design.md, Spawn).
+            # servers in the session's connection set, which holds enabled servers only, and none
+            # is enabled on our threads: the MCP-off map, apps and plugins off at spawn, and the
+            # canary (docs/design.md, Spawn).
             { $_ -in 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource' } {
                 return @('Allowed', 'MCP resource tool; reaches enabled MCP servers only, and none is enabled on our threads')
             }
