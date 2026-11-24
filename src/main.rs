@@ -14,11 +14,14 @@ mod cancel;
 mod cleanup;
 mod codex;
 mod config;
+mod credential;
 mod delete;
 mod errors;
+mod https;
 mod jsonrpc;
 mod mcp;
 mod output;
+mod precise;
 mod preview;
 mod registry;
 mod session;
@@ -95,7 +98,90 @@ fn main() {
             );
             std::process::exit(code);
         }
+        Mode::SetApiKey => std::process::exit(set_api_key()),
+        Mode::RemoveApiKey => std::process::exit(remove_api_key()),
         Mode::Serve => mcp::serve(Arc::new(tools::App::serving(cfg))),
+    }
+}
+
+/// `--set-api-key`: read the key from the keyboard with typing hidden, check it with a free call,
+/// and store it in Credential Manager (docs/design.md, "Precise mode"). Prints only its last four
+/// characters. Exits 0 when stored.
+fn set_api_key() -> i32 {
+    let fail = |why: &str| {
+        eprintln!("codex-imagegen: {why}");
+        1
+    };
+    let line = match credential::read_hidden_line("OpenAI API key (typing is hidden): ") {
+        Ok(line) => line,
+        Err(why) => return fail(&why),
+    };
+    let key = match credential::Secret::new(&line) {
+        Ok(key) => key,
+        Err(why) => return fail(&format!("not stored: {why}")),
+    };
+    drop(line);
+    eprintln!("checking the key with OpenAI (a free call that lists models)...");
+    let check = https::Transport::send(
+        &https::WinHttp,
+        &key,
+        &https::Request {
+            method: "GET",
+            path: "/v1/models",
+            body: None,
+            timeout: std::time::Duration::from_secs(30),
+        },
+    );
+    match check {
+        Ok(response) if response.status == 200 => {}
+        Ok(response) if response.status == 401 => {
+            return fail("not stored: OpenAI refused the key (HTTP 401). Check it and try again.")
+        }
+        Ok(response) => {
+            return fail(&format!(
+                "not stored: OpenAI answered HTTP {} to the check. Try again later.",
+                response.status
+            ))
+        }
+        Err(e) => {
+            return fail(&format!(
+                "not stored: could not reach {} to check the key ({e:?}).",
+                https::API_HOST
+            ))
+        }
+    }
+    match credential::write(credential::TARGET, &key) {
+        Ok(()) => {
+            println!(
+                "Stored the key ({}) in Windows Credential Manager as {}. Register the server \
+                 with --precise to use it.",
+                key.last4(),
+                credential::TARGET
+            );
+            0
+        }
+        Err(why) => fail(&why),
+    }
+}
+
+/// `--remove-api-key`: delete the stored key. Exits 0 whether or not one was stored.
+fn remove_api_key() -> i32 {
+    match credential::delete(credential::TARGET) {
+        Ok(true) => {
+            println!(
+                "Removed the key {} from Credential Manager.",
+                credential::TARGET
+            );
+            0
+        }
+        Ok(false) => {
+            println!("No key was stored as {}.", credential::TARGET);
+            0
+        }
+        Err(why) => {
+            eprintln!("codex-imagegen: {why}");
+            1
+        }
     }
 }
 

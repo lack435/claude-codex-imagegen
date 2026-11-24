@@ -1594,7 +1594,7 @@ fn image_line(image: &Delivered) -> String {
     }
 }
 
-fn format_size(bytes: usize) -> String {
+pub(crate) fn format_size(bytes: usize) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     if bytes as f64 >= MB {
         format!("{:.1} MB", bytes as f64 / MB)
@@ -1605,7 +1605,7 @@ fn format_size(bytes: usize) -> String {
 
 /// The prompt Codex used, as one JSON-quoted line: escapes keep a newline in it from reading as the
 /// next line of the result, and characters that hide text are removed.
-fn quote_prompt(prompt: &str) -> String {
+pub(crate) fn quote_prompt(prompt: &str) -> String {
     let mut shown: String = prompt
         .chars()
         .filter(|c| !crate::jsonrpc::hides_text(*c))
@@ -1627,11 +1627,12 @@ fn same_prompt(revised: &str, sent: &str) -> bool {
 /// Every success tells the agent to show the image. Many clients fold tool results away (the Claude
 /// desktop app shows the preview only inside the collapsed tool row [verified: owner, 2026-09-25]),
 /// so the preview is often seen by the agent alone [decided].
-const SHOW_USER_LINE: &str = "the user may not see this tool result: show them the image, by \
+pub(crate) const SHOW_USER_LINE: &str =
+    "the user may not see this tool result: show them the image, by \
      displaying or sending the file if you have a tool for that, otherwise by giving them its path";
 
 /// The scratch-space line every success carries (docs/design.md, "Output files").
-fn scratch_line(ttl_days: u32) -> String {
+pub(crate) fn scratch_line(ttl_days: u32) -> String {
     match ttl_days {
         0 => "output files are scratch space; move keepers into the project".to_string(),
         1 => "output files are scratch and expire after 1 day idle; move keepers into the project"
@@ -2259,6 +2260,7 @@ mod generate_tests {
                 codex_home: PathBuf::from(r"C:\Users\someone\.codex"),
                 model: "gpt-6-astra".to_string(),
                 output_dir: f.dir.join("generated-images"),
+                engine: crate::session::Engine::Codex,
             }),
         );
         writer
@@ -3175,6 +3177,7 @@ mod refine_tests {
                 codex_home: PathBuf::from(CODEX_HOME),
                 model: "gpt-6-astra".to_string(),
                 output_dir: out.to_path_buf(),
+                engine: crate::session::Engine::Codex,
             }),
         )
         .image_completed(

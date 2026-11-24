@@ -23,9 +23,9 @@ Be careful where being wrong is expensive, and proportionate everywhere else.
 **Rigor belongs where the blast radius is real.** Enumerate edge cases and fail closed for:
 
 - billing and credentials: no API-key mode for the Codex tools, API-key variables stripped from the child, a
-  `chatgpt` account required. The one exception is the opt-in precise tool, approved in
-  [`docs/precise-mode.md`](docs/precise-mode.md) but not built yet. Its key lives only in Credential Manager,
-  reaches only `api.openai.com`, and never reaches the Codex child;
+  `chatgpt` account required. The one exception is the opt-in precise tool
+  ([design: Precise mode](docs/design.md#precise-mode)). Its key lives only in Credential Manager, reaches only
+  `api.openai.com`, never reaches the Codex child, and never appears in a result, an error or a log;
 - the Codex child's posture: read-only sandbox, `approvalPolicy: never`, shell tool and user MCP
   servers off;
 - process reaping: the job object;
