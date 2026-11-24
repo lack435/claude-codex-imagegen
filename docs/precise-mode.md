@@ -1,9 +1,9 @@
 # Precise mode: design draft
 
-Status: draft for the owner's review, 2026-11-23. Nothing here is built. It reopens a boundary that
-`docs/design.md` and `AGENTS.md` close ("no API-key mode"), for one new, opt-in tool only. The existing tools,
-`generate` and `refine`, and the Codex child are unchanged. Once approved, this folds into `docs/design.md` and
-`AGENTS.md` is amended in the same change.
+Status: approved by the owner, 2026-11-23, with every recommendation under [Decisions](#decisions). Nothing
+here is built. It reopens a boundary that `docs/design.md` and `AGENTS.md` close ("no API-key mode"), for one
+new, opt-in tool only. The existing tools, `generate` and `refine`, and the Codex child are unchanged. Both
+documents now point here. This document folds into `docs/design.md` in the change that builds it.
 
 Claims use the tags of `docs/design.md`. Facts read in OpenAI's or Microsoft's documentation on 2026-11-23 are
 **[assumed]** until a live check passes. Each such fact has an entry under [Verification](#verification).
@@ -41,15 +41,16 @@ user's OpenAI API key", so the agent and the user can always tell it from the pl
 | `quality` | string, optional | `auto` (default), `low`, `medium`, `high`, plus `xhigh` and `max` where the model takes them [assumed: P2]. |
 | `background` | string, optional | `auto` (default), `opaque`, `transparent`. |
 | `n` | integer, optional | 1 to 4 (default 1). Each image is its own version, as when Codex makes several in one turn. |
-| `moderation` | string, optional | `auto` (default) or `low`. |
 | `output_dir` | string, optional | As today. |
 
 The output is always PNG. The preview pipeline decodes PNG only (the `png` crate), and a lossy file would defeat
 "precise" [decided]. Not offered in this version: `output_format`, `output_compression`, streaming and partial
 images, masks and `markup`, `complexity`, GIF and SVG output.
 
-The model is pinned by full id with `--precise-model` [decided]. The default is an open question (see
-[Open questions](#open-questions)). A value outside the documented set is refused at startup, not per call.
+The model is pinned by full id with `--precise-model`, default `gpt-image-2.5-sunburst-2026-09-08` [decided].
+A value outside the documented set is refused at startup, not per call. `--precise-moderation low` sends
+`moderation: low` on every precise call; without it the field is omitted and the API's `auto` applies
+[decided].
 
 ### Generate or edit
 
@@ -137,7 +138,7 @@ WinHTTP over raw FFI, like the job object: no new crate [decided].
 ## Spending guardrails
 
 - **Off by default.** The tool is listed only under `--precise`, and the key is never read without it.
-- **A daily cap.** `--precise-max-images-per-day N`, counted in the state folder under the store lock, across
+- **A daily cap.** `--precise-max-images-per-day N` (default 20; 0 means no cap), counted in the state folder under the store lock, across
   processes. Each image counts when it is requested, so a failed call still counts [decided]. A call that would
   pass the cap is refused before anything is sent: `PRECISE_CAP_REACHED`.
 - **On OpenAI's side**, in the README:
@@ -207,23 +208,23 @@ without the field is `"codex"`. An api record has no `thread_id` or `codex_home`
 | P4 | Error mapping: a bad key gives 401 (free). Moderation and 403 shapes come from the documentation until one is seen. | free |
 | P5 | The owner confirms in the dashboard: the restricted-key option for images, and the hard spend limit. | free |
 
-## Open questions for the owner
+## Decisions
 
-1. **Default model.** Options:
-   - `gpt-image-2-2026-04-21`, the dated `gpt-image-2`. Its transparency is "in preview", and it has no
-     `xhigh` or `max`.
-   - `gpt-image-2.5-sunburst-2026-09-08`: transparency, `xhigh` and `max`. What separates "sunburst" from
-     "flare" is not stated on the pages read.
-   - `gpt-image-2.6-*`, which has no dated snapshot listed, so it would be pinned to a moving alias.
+Taken by the owner on 2026-11-23 [decided]:
 
-   Recommendation: `gpt-image-2.5-sunburst-2026-09-08`.
-2. **Same repository?** Precise mode does not use Codex. Keeping it here reuses the store, publishing, previews
-   and MCP layer. A separate server would keep "codex-imagegen never holds an API key" literally true.
-   Recommendation: here, behind `--precise`.
-3. **Daily cap default.** Recommendation: 20 images, with 0 meaning no cap.
-4. **`moderation: low`.** Expose it to the agent, or leave it at `auto` and make it a server flag?
-   Recommendation: a server flag, `--precise-moderation low`, so it is the user's choice, not the agent's.
-5. **Tool name.** `codex_imagegen_precise` keeps the prefix. `codex_imagegen_api` says more plainly what it costs.
+1. **Default model: `gpt-image-2.5-sunburst-2026-09-08`.** It supports transparency, `xhigh` and `max`, and it
+   is a dated snapshot. The alternatives were:
+   - `gpt-image-2-2026-04-21`, whose transparency is "in preview" and which has no `xhigh` or `max`;
+   - `gpt-image-2.6-*`, which has no dated snapshot listed and would pin a moving alias.
+
+   What separates "sunburst" from "flare" is not stated on the pages read.
+2. **This repository, behind `--precise`.** That reuses the store, publishing, previews and MCP layer. The
+   alternative, a separate server, would have kept "codex-imagegen never holds an API key" literally true.
+3. **Daily cap: 20 images by default.** 0 means no cap.
+4. **`moderation` is a server flag, not a tool argument.** `--precise-moderation low` is the user's choice, not
+   the agent's. The tool has no `moderation` argument; without the flag the API's `auto` applies.
+5. **Tool name: `codex_imagegen_precise`.** It keeps the prefix. Its description starts with the billing
+   statement.
 
 ## Sources
 

@@ -60,8 +60,9 @@ server drives Codex, collects the images, and hands them to Claude.
 
 Out of scope for v1:
 
-- an OpenAI API-key mode
-- choosing the image model, size or quality
+- an OpenAI API-key mode for these tools. A separate, opt-in tool that calls the OpenAI Images API with its own
+  key is approved, but not built: see [`precise-mode.md`](precise-mode.md)
+- choosing the image model, size or quality through Codex (precise mode offers these)
 - several variants per call
 - branching into parallel histories. `refine`'s `from_version` edits an earlier version, but the new image
   joins the one linear version list (see [Refine](#refine))
