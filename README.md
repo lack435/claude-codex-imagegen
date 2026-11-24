@@ -212,7 +212,7 @@ The paid modes are billed to your ChatGPT plan:
 
 | Command | Cost | Checks |
 | --- | --- | --- |
-| `.\smoke.ps1 -SpendQuota` | about 3 images | generate, refine, refine after a restart, status, cleanup, Codex's tool surface |
+| `.\smoke.ps1 -SpendQuota` | about 4 images | generate, refine, refine after a restart, refine from an earlier version, status, cleanup, Codex's tool surface |
 | `... -Concurrent` | 2 more | two servers generating at once |
 | `... -Interrupt` | 1 image plus 1 cut short, instead of the refines | a refine cancelled during its image call |
 | `... -CodexHome <dir>` | none extra | every server runs with `--codex-home <dir>` |

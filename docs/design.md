@@ -36,7 +36,9 @@ and every `savedPath` named the dedicated home, and nothing of the thread was in
 troubleshooting, and the IJG notice. The tag-driven release workflow (see Build and CI) published v0.1.0 on
 2026-09-26: the downloaded exe matched its published SHA-256, reported `0.1.0 (<commit>)`, and passed
 `--doctor`. After it, `refine` gained `from_version`, to edit an earlier version (see [Refine](#refine)).
-Unit tests cover it; no paid run has exercised it yet.
+The paid `smoke.ps1 -SpendQuota` run of 2026-11-23 (codex-cli 0.171.0, outside the tested range; 4 images)
+passed V11 and 68 of 69 checks. The one failure was V1's trace reading: 0.171.0's `inference_started` events
+name no request payload, so the tool-surface checks did not run on that version.
 
 Claims carry one of three tags:
 
@@ -383,7 +385,7 @@ thread id, no session records it, and it stays loaded in the child until the chi
    turns after version N stay in its history [decided]. The agent model sees that history, but only relays
    the feedback verbatim. The image tool's call takes only `prompt`, `referenced_image_paths` and
    `num_last_images_to_include` [verified], and the developer instructions forbid the last, so the call
-   should get the feedback and the edit target alone [assumed: no paid run has used `from_version`]. The new
+   gets the feedback and the edit target alone [verified: V11, 0.171.0]. The new
    image is numbered and recorded like any other, so it becomes the latest, and earlier files are untouched.
 2. **Check the Codex home.** A record whose `codex_home` is not the child's `codexHome` gets
    `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare exactly, as cleanup compares
@@ -1289,15 +1291,16 @@ Without `-SpendQuota` it runs the free steps: `initialize`, `tools/list`, `statu
 under that state folder), the no-stray-process check after closing the server's stdin, then `--cleanup
 --older-than-days 0` on the state folder, which must exit 0 with nothing to remove.
 
-The M3 version spends about 3 images, and is run when protocol, spawning or session code changes, after the
-user is told the cost:
+It spends about 4 images, and is run when protocol, spawning or session code changes, after the user is told
+the cost:
 
 1. `initialize`, `tools/list`, `status`
 2. (a) `generate(session=smoke-<ts>)`, with a prompt holding quotes, a backslash, a newline and non-ASCII text
 3. (b) `refine`, with feedback holding the same kinds of character
 4. (c) kill the exe (the job object must take the Codex tree with it), start a fresh one on the same state
-   folder, and `refine` again: resume after a restart
-5. (d) `status`, which must list the session with three turns and its latest file; then close the server
+   folder, and `refine` again: resume after a restart. Then `refine` with `from_version: 1` (V11): the result
+   must be version 4, and the run's last image call with references must list v1's published file first
+5. (d) `status`, which must list the session with four turns and its latest file; then close the server
 6. (e) free, and run whatever the steps before got to: `--cleanup --older-than-days 0` on the state folder
 
 Each result must carry an `image/jpeg` preview of 512,000 bytes or less with a long edge of 1024 px or less, be
@@ -1384,7 +1387,7 @@ Each item must pass before the code that depends on it is considered done.
 | V4 | **Passed 2026-09-26** (codex-cli 0.157.1). `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. A refine cancelled with `notifications/cancelled` 5 s into its image call got no response; the server logged its `turn/interrupt` and Codex's `turn/completed: interrupted` for that turn; `status` showed no running turn; 60 s after the cancel there was no `-v2` file, the thread's `generated_images` folder still held only the first image, and the record still had 1 turn and 1 output. `smoke.ps1 -SpendQuota -Interrupt`. | 1 partial image (quota effect unknown) | M4 |
 | V5 | **Passed 2026-09-26.** With `--codex-home` pointing at a dedicated home, images land under that home. `status` reported the home as dedicated, the session's record named it, the image's `savedPath` and the rollout were under it, and neither the thread's image folder nor a rollout of it existed in the ambient home. The sweep removed the session from the dedicated home. `smoke.ps1 -CodexHome <dir>`. | 1 image, plus a one-time login by the owner | M4 |
 | V10 | On a FAT32 or exFAT volume (a USB stick), the POSIX delete is refused with one of the errors that fall back to the legacy disposition, and cleanup still deletes the session's files there. The fallback itself is covered by a unit test with the refusal injected. | free (no turn) | when such a volume is at hand |
-| V11 | `refine` with `from_version` names that version's published file as the edit target: it reaches `referenced_image_paths` (trace), the new image edits it rather than the latest one, and `revisedPrompt` is the feedback verbatim. Not yet in `smoke.ps1`. | 1 image | when next running the paid smoke |
+| V11 | **Passed 2026-11-23** (codex-cli 0.171.0). `refine` with `from_version` names that version's published file as the edit target. A refine with `from_version: 1` after v3 returned v4, and its image call's `referenced_image_paths` was exactly `[<session>-v1.png]`, the published copy (trace). `revisedPrompt` was the feedback verbatim. Step (c) of `smoke.ps1 -SpendQuota`. Whether the image follows v1 rather than v3 was not judged by eye. | 1 image (part of smoke) | with `from_version` |
 | V9 | **Passed 2026-09-26.** Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeeded (26 s and 30 s), and both sessions were recorded in the shared store. `smoke.ps1 -SpendQuota -Concurrent`. | 2 images | M3 |
 
 ## Milestones
