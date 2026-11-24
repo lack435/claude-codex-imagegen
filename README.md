@@ -218,6 +218,8 @@ The paid modes are billed to your ChatGPT plan:
 | `... -CodexHome <dir>` | none extra | every server runs with `--codex-home <dir>` |
 
 `.\smoke.ps1 -CheckTrace <folder>` re-reads the Codex trace a paid run left behind, and spends nothing.
+From codex-cli 0.171.0 the trace is zstd-compressed, and reading it needs Python 3.14 or later (`py -3`),
+which `smoke-trace.py` uses for its standard-library `compression.zstd`.
 [`AGENTS.md`](AGENTS.md) has the rules for working on the code.
 
 **Releasing.** Set the new version in `Cargo.toml` (run `cargo build` to update `Cargo.lock`) and merge
