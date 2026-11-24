@@ -1,6 +1,6 @@
 [package]
 name = "codex-imagegen"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # jpeg-encoder, which the preview pipeline uses, needs 1.87 (see docs/design.md).
 rust-version = "1.87"
