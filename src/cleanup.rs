@@ -959,7 +959,7 @@ pub fn sweep(
         if total.removed.is_empty() {
             ""
         } else {
-            " (not counting the Codex rollouts thread/delete removed)"
+            " (not counting any Codex rollouts thread/delete removed)"
         },
         total.skipped.len(),
         match unsearched.len() {

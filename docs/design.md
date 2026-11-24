@@ -40,7 +40,7 @@ The paid `smoke.ps1 -SpendQuota` run of 2026-11-23 (codex-cli 0.171.0, outside t
 passed V11 and 68 of 69 checks. The one failure was V1's trace reading: 0.171.0's `inference_started` events
 name no request payload, so the tool-surface checks did not run on that version. `smoke.ps1` has since learned
 that trace format, and V1 passes on it (see the V1 row). Precise mode, an opt-in tool on the OpenAI Images API
-with its key in Credential Manager, is built, unit-tested and checked live for free; no paid run yet (see
+with its key in Credential Manager, is built, unit-tested and checked live, including 2 paid images (see
 [Precise mode](#precise-mode)).
 
 Claims carry one of three tags:
@@ -1104,8 +1104,8 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
 
 ## Precise mode
 
-Approved by the owner on 2026-11-23. Built, unit-tested and checked live for free (P1, P4); no paid run yet
-(P2, P3).
+Approved by the owner on 2026-11-23. Built, unit-tested, and checked live: P1 and P4 free, P2 and P3 paid
+(2 images on the owner's API key, 2026-11-23, 14 of 14 checks).
 
 **Why.** Codex's image tool always asks for `size` and `quality` `auto`, whether Codex is signed in with
 ChatGPT or an API key (see [What Codex actually provides](#what-codex-actually-provides)). The OpenAI Images
@@ -1135,7 +1135,7 @@ tell it from the plan-billed tools.
 | `session` | string, optional | A new name starts a precise session; an existing precise session is edited. A Codex session's name is refused, and `refine` refuses a precise session; each names the other tool. |
 | `from_version` | integer ≥ 1, optional | With an existing session: edit that version's published file (as `refine`'s). |
 | `reference_images` | string[], optional | Up to 4, validated as today; sent as edit inputs after the session's image. |
-| `size` | string, optional | `auto`, `1024x1024`, `1536x1024`, `1024x1536`, or `WIDTHxHEIGHT`: multiples of 16, at most 3840x2160 either way round, aspect within 3:1, 655,360 to 8,294,400 pixels [assumed: P2]. |
+| `size` | string, optional | `auto`, `1024x1024`, `1536x1024`, `1024x1536`, or `WIDTHxHEIGHT`: multiples of 16, at most 3840x2160 either way round, aspect within 3:1, 655,360 to 8,294,400 pixels [assumed: the API reference]. A custom 1536x864 came back at exactly that size [verified: P2]. |
 | `quality` | string, optional | `auto`, `low`, `medium`, `high`, `xhigh`, `max`. |
 | `background` | string, optional | `auto`, `opaque`, `transparent`. |
 | `n` | integer, optional | 1 to 4, default 1. Each image is its own version. |
@@ -1147,14 +1147,14 @@ because the preview decodes PNG only. Not offered: `output_format`, compression,
 images, masks and `markup`, `complexity`, GIF and SVG. `moderation` is the user's, through
 `--precise-moderation`, not the agent's [decided].
 
-**Requests** [assumed: P2, P3; the API reference, read 2026-11-23]:
+**Requests** (the API reference, read 2026-11-23; both shapes accepted live [verified: P2, P3]):
 
 - Without input images: `POST /v1/images/generations`, JSON `{model, prompt, n, output_format: "png"}`, plus
   `size`, `quality`, `background` and `moderation` when given.
 - With input images (the edit target first, then the references): `POST /v1/images/edits`, the same fields
   plus `images: [{image_url: "data:<type>;base64,..."}]`. A data URL over 20,971,520 characters is refused
-  before sending. The reference's examples use multipart `image[]`; if JSON edits are refused live, multipart
-  is the fallback.
+  before sending. The reference's examples use multipart `image[]`, but the JSON body with a data URL was
+  accepted [verified: P3], so no multipart is needed.
 - The answer's `data[].b64_json` images are published, previewed and recorded as Codex's are (versioned
   names, no-replace publish, fingerprint, `resolved_path`). The result adds what the API reports it made
   (`size`, `quality`, `background`), its `usage` tokens, and "billed to the user's OpenAI API key, not the
@@ -1268,8 +1268,8 @@ an empty `thread_id` and `codex_home`, and its `model` is the image model.
 | # | Check | Cost | State |
 | --- | --- | --- | --- |
 | P1 | Credential Manager round trip; WinHTTP over TLS through the automatic proxy | free | **Passed 2026-11-23**: the round trip in a unit test, and the live 401 request. `--set-api-key` with a real key not yet run (needs the owner's key). |
-| P2 | Generate with a custom size, `quality: high` and the pinned model: accepted, and the PNG has the size asked | 1 image | not run |
-| P3 | Edit with a JSON body and a data URL; if refused, switch to multipart | 1 image | not run |
+| P2 | Generate with a custom size, `quality: high` and the pinned model: accepted, and the PNG has the size asked | 1 image | **Passed 2026-11-23**: `gpt-image-2.5-sunburst-2026-09-08`, `1536x864`, `high`; a 1536x864 PNG, 2.5 MB, in 72 s; the API reported `size 1536x864, quality high, background opaque` and 22 input, 1,078 output tokens. |
+| P3 | Edit with a JSON body and a data URL; if refused, switch to multipart | 1 image | **Passed 2026-11-23**: v1 as the edit input, `background: transparent`, `1024x1024`; published as v2, an RGBA PNG with transparent pixels, in 26 s. The preview was flattened onto white, as designed. `status` then showed the session `(precise)` with 2 turns and "2 of 20 images today"; no key-like text was in any result or in stderr; `--cleanup --older-than-days 0` removed the session and its files without starting Codex. |
 | P4 | Error mapping | free | 401 **passed 2026-11-23**. 403 and moderation shapes are from the documentation until one is seen. |
 | P5 | The dashboard offers an images-only restricted key and a hard spend limit | free | for the owner |
 
