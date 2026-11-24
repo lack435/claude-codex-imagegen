@@ -143,6 +143,26 @@ pub struct Record {
     /// Every file this server published for the session. Cleanup deletes only these, and only
     /// while the path, resolved path, size and content fingerprint still match.
     pub outputs: Vec<Output>,
+    /// What made the session: Codex (the default, and every record written before this field), or
+    /// the OpenAI API in precise mode, whose records have no thread and no Codex home.
+    #[serde(default, skip_serializing_if = "Engine::is_codex")]
+    pub engine: Engine,
+}
+
+/// What made a session's images (docs/design.md, "Precise mode").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    #[default]
+    Codex,
+    /// `codex_imagegen_precise`: the OpenAI Images API.
+    Api,
+}
+
+impl Engine {
+    pub fn is_codex(&self) -> bool {
+        *self == Engine::Codex
+    }
 }
 
 /// A published file.
@@ -392,6 +412,63 @@ impl Drop for FileLock {
     }
 }
 
+/// The lock on `path`, `name`d in the error, waiting up to `wait` for another holder.
+fn lock_waiting(path: &Path, name: &str, wait: Duration) -> Result<FileLock, StoreError> {
+    let give_up = Instant::now() + wait;
+    loop {
+        match FileLock::try_acquire(path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) if Instant::now() < give_up => std::thread::sleep(LOCK_POLL),
+            Ok(None) => {
+                return Err(StoreError::Io {
+                    path: path.to_path_buf(),
+                    what: "locking",
+                    error: io::Error::other(format!(
+                        "another process has held the {name} for over {} s",
+                        wait.as_secs()
+                    )),
+                })
+            }
+            Err(e) => return Err(StoreError::io(path, "locking")(e)),
+        }
+    }
+}
+
+/// A lock held across processes, released when dropped. For state outside the session store, such
+/// as precise mode's daily image count.
+pub struct Guard {
+    _lock: FileLock,
+}
+
+/// Lock `path` (created if missing), waiting as the store lock does.
+pub fn lock_file(path: &Path) -> Result<Guard, StoreError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(StoreError::io(dir, "creating the state folder"))?;
+    }
+    Ok(Guard {
+        _lock: lock_waiting(path, "lock", STORE_LOCK_WAIT)?,
+    })
+}
+
+/// Replace `path` with `bytes` atomically, as the store is written: a flushed temp file beside it,
+/// renamed over it.
+pub fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let temp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        path.file_name()
+            .map_or_else(|| "state".to_string(), |n| n.to_string_lossy().to_string()),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    output::write_new(&temp, bytes)?;
+    if let Err(e) = output::retry_transient(|| fs::rename(&temp, path)) {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// A session's lease, held for a whole generate or refine call. Dropping it releases it.
 pub struct Lease {
     _lock: FileLock,
@@ -498,6 +575,7 @@ impl Store {
             file.last_cleanup = value
                 .get("last_cleanup")
                 .and_then(|c| LastCleanup::deserialize(c).ok());
+            recognise_precise(&mut file);
         }
         Tolerant {
             file,
@@ -534,8 +612,9 @@ impl Store {
             path: self.path(),
             detail,
         };
-        let file: StoreFile =
+        let mut file: StoreFile =
             serde_json::from_slice(without_bom(bytes)).map_err(|e| corrupt(e.to_string()))?;
+        recognise_precise(&mut file);
         if file.version != STORE_VERSION {
             return Err(corrupt(format!(
                 "it is store version {}, and this build reads version {STORE_VERSION}; a newer \
@@ -548,27 +627,9 @@ impl Store {
 
     /// The store lock, waiting up to `lock_wait` for another holder.
     fn lock_store(&self) -> Result<FileLock, StoreError> {
-        let path = self.dir.join(LOCK_FILE);
         fs::create_dir_all(&self.dir)
             .map_err(StoreError::io(&self.dir, "creating the state folder"))?;
-        let give_up = Instant::now() + self.lock_wait;
-        loop {
-            match FileLock::try_acquire(&path) {
-                Ok(Some(lock)) => return Ok(lock),
-                Ok(None) if Instant::now() < give_up => std::thread::sleep(LOCK_POLL),
-                Ok(None) => {
-                    return Err(StoreError::Io {
-                        path,
-                        what: "locking",
-                        error: io::Error::other(format!(
-                            "another process has held the store lock for over {} s",
-                            self.lock_wait.as_secs()
-                        )),
-                    })
-                }
-                Err(e) => return Err(StoreError::io(&path, "locking")(e)),
-            }
-        }
+        lock_waiting(&self.dir.join(LOCK_FILE), "store lock", self.lock_wait)
     }
 
     /// Replace the store atomically: a flushed temp file in the same folder, renamed over it.
@@ -602,6 +663,18 @@ impl Tolerant {
     }
 }
 
+/// A build older than precise mode does not know `engine`, and drops it from every record when it
+/// rewrites the store. A precise record is still recognisable: only it has neither a thread nor a
+/// Codex home (a Codex record always has both). Restored here, on every read, so such a session is
+/// still edited by precise mode and expired by cleanup.
+fn recognise_precise(file: &mut StoreFile) {
+    for record in file.sessions.values_mut() {
+        if record.thread_id.is_empty() && record.codex_home.as_os_str().is_empty() {
+            record.engine = Engine::Api;
+        }
+    }
+}
+
 /// A UTF-8 byte-order mark, which an editor may add to a file saved by hand, is not JSON.
 fn without_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)
@@ -613,10 +686,11 @@ fn without_bom(bytes: &[u8]) -> &[u8] {
 
 /// What a new session's record starts with, besides its name and thread.
 pub struct NewSession {
-    /// The child's `codexHome`, from its handshake.
+    /// The child's `codexHome`, from its handshake; empty for a precise session.
     pub codex_home: PathBuf,
     pub model: String,
     pub output_dir: PathBuf,
+    pub engine: Engine,
 }
 
 /// One completed image, as the record needs it.
@@ -700,6 +774,7 @@ impl SessionWriter {
                         output_dir: new.output_dir.clone(),
                         next_version: 1,
                         outputs: Vec::new(),
+                        engine: new.engine,
                     }),
                     None => {
                         return Err(StoreError::Conflict(format!(
@@ -729,6 +804,7 @@ mod tests {
             codex_home: PathBuf::from(r"C:\Users\someone\.codex"),
             model: "gpt-6-astra".to_string(),
             output_dir: dir.join("out"),
+            engine: Engine::Codex,
         }
     }
 
@@ -758,6 +834,7 @@ mod tests {
             output_dir: PathBuf::from(r"C:\out"),
             next_version: 2,
             outputs: Vec::new(),
+            engine: Engine::Codex,
         }
     }
 
@@ -906,6 +983,31 @@ mod tests {
         let file = Store::new(&dir).read().unwrap();
         assert_eq!(file.sessions.len(), 30);
         assert_eq!(listing(&dir), vec!["sessions.json", "sessions.lock"]);
+    }
+
+    #[test]
+    fn a_precise_record_an_older_build_rewrote_without_its_engine_is_still_precise() {
+        let dir = temp_dir("session-engine");
+        let store = Store::new(&dir);
+        // As an older build writes it: no `engine` field at all.
+        let json = r#"{"version": 1, "sessions": {
+            "pic": {"name": "pic", "thread_id": "", "codex_home": "", "model": "gpt-image-2",
+                    "created": 1, "updated": 1, "turns": 1, "last_saved_path": null,
+                    "last_output_path": null, "last_output_bytes": null, "output_dir": "C:\\o",
+                    "next_version": 2, "outputs": []},
+            "fox": {"name": "fox", "thread_id": "019a0000-0000-7000-8000-00000000cafe",
+                    "codex_home": "C:\\h", "model": "gpt-6-astra", "created": 1, "updated": 1,
+                    "turns": 1, "last_saved_path": null, "last_output_path": null,
+                    "last_output_bytes": null, "output_dir": "C:\\o", "next_version": 2,
+                    "outputs": []}}}"#;
+        fs::write(store.path(), json).unwrap();
+        let file = store.read().unwrap();
+        assert_eq!(file.get("pic").unwrap().engine, Engine::Api);
+        assert_eq!(file.get("fox").unwrap().engine, Engine::Codex);
+        assert_eq!(
+            store.read_tolerant().file.get("pic").unwrap().engine,
+            Engine::Api
+        );
     }
 
     #[test]

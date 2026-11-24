@@ -31,9 +31,12 @@ use crate::cancel::RequestCancel;
 use crate::cleanup;
 use crate::codex::{self, Budget, Facts, Handshake, Rpc, Usage};
 use crate::config::Config;
+use crate::credential::{CredentialManager, KeySource};
 use crate::errors::{self, Failure};
+use crate::https::{Transport, WinHttp};
 use crate::mcp::{self, CallContext, Progress, ToolHost};
 use crate::output;
+use crate::precise;
 use crate::registry::{ChildRef, Liveness, Registry, TurnSlot};
 use crate::session::{self, Lease, NewSession, Record, SessionWriter, Store};
 use crate::turn::{self, Event};
@@ -41,6 +44,8 @@ use crate::turn::{self, Event};
 pub const GENERATE: &str = "codex_imagegen_generate";
 pub const REFINE: &str = "codex_imagegen_refine";
 pub const STATUS: &str = "codex_imagegen_status";
+/// Listed only under `--precise` (docs/design.md, "Precise mode").
+pub const PRECISE: &str = "codex_imagegen_precise";
 
 /// How long shutdown gives the child after closing its stdin (docs/design.md, "Lifecycle").
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -131,6 +136,9 @@ pub struct App {
     interrupt_wait: Duration,
     /// How long refine retries `thread/resume` while another process holds the thread.
     writer_wait: Duration,
+    /// Precise mode's way to the API, and its key. Used only under `--precise`.
+    transport: Box<dyn Transport>,
+    keys: Box<dyn KeySource>,
 }
 
 /// A generate call's claim on its new session: the registry slot, which names it, and the lease.
@@ -230,6 +238,8 @@ impl App {
             store,
             interrupt_wait: turn::INTERRUPT_WAIT,
             writer_wait: turn::WRITER_WAIT,
+            transport: Box::new(WinHttp),
+            keys: Box::new(CredentialManager),
         }
     }
 
@@ -533,6 +543,7 @@ impl App {
                 codex_home: ready.handshake.codex_home.clone(),
                 model: self.cfg.model.clone(),
                 output_dir: dir.path.clone(),
+                engine: session::Engine::Codex,
             }),
         );
         let finished = self.run_turn(
@@ -697,6 +708,14 @@ impl App {
             Ok(existing) => existing,
             Err(failure) => return self.claim_failure(failure),
         };
+        if record.engine == session::Engine::Api {
+            return mcp::failure_result(&errors::bad_request(format!(
+                "Session '{}' was made with {PRECISE} (the OpenAI API), so it has no Codex thread \
+                 to continue. Continue it with {PRECISE}, or pass its image to {GENERATE} as a \
+                 reference.",
+                record.name
+            )));
+        }
         // The call's own folder, else the one the session was created with. A folder given here
         // applies to this call only [decided].
         let dir = match request.output_dir.as_deref() {
@@ -779,6 +798,192 @@ impl App {
             },
         );
         self.finish(child, finished, lease)
+    }
+
+    /// codex_imagegen_precise (docs/design.md, "Precise mode"): validate, read the key, claim the
+    /// session (new, or an existing precise one to edit), pre-check the folder and pick the edit
+    /// target -- nothing is spent on any failure so far -- then count the images against the daily
+    /// cap and send the request.
+    fn precise(&self, args: &Value, ctx: &CallContext) -> Value {
+        let started = Instant::now();
+        let Some(settings) = self.cfg.precise.clone() else {
+            return mcp::failure_result(&errors::bad_request(format!(
+                "{PRECISE} is off: the server was not started with --precise."
+            )));
+        };
+        let request = match validate(&PRECISE_SPEC, args, &self.path_base) {
+            Ok(request) => request,
+            Err(failure) => return mcp::failure_result(&failure),
+        };
+        let options = match args.as_object().map(precise::options) {
+            Some(Ok(options)) => options,
+            Some(Err(failure)) => return mcp::failure_result(&failure),
+            None => unreachable!("validate checked the arguments are an object"),
+        };
+        let key = match self.keys.read() {
+            Ok(Some(key)) => key,
+            Ok(None) => return mcp::failure_result(&errors::api_key_missing()),
+            Err(why) => return mcp::failure_result(&errors::api_key_unreadable(why)),
+        };
+        let budget = Budget::starting_now(self.cfg.timeout);
+
+        // An existing precise session is edited; a new name, or none, starts one.
+        let existing = match request.session.as_deref() {
+            Some(name) => match self.claim_any(name) {
+                Ok(claimed) => Some(claimed),
+                Err(failure) => return self.claim_failure(failure),
+            },
+            None => None,
+        };
+        let (slot, lease, record) = match existing {
+            Some((slot, lease, record)) => (slot, lease, record),
+            None => {
+                let mut auto_name = output::auto_session_name;
+                match self.claim_new_session(None, &mut auto_name) {
+                    Ok(Claim { slot, lease }) => (slot, lease, None),
+                    Err(failure) => return self.claim_failure(failure),
+                }
+            }
+        };
+        if let Some(record) = &record {
+            if record.engine != session::Engine::Api {
+                return mcp::failure_result(&errors::bad_request(format!(
+                    "Session '{}' was made with Codex ({GENERATE}), and {PRECISE} edits only its \
+                     own sessions. Pass that session's image as a reference_images entry with a \
+                     new session name instead.",
+                    record.name
+                )));
+            }
+        } else if request.from_version.is_some() {
+            return mcp::failure_result(&errors::bad_request(
+                "'from_version' needs an existing precise session to edit; this call starts a new \
+                 one.",
+            ));
+        }
+        let name = record
+            .as_ref()
+            .map_or_else(|| slot.session().to_string(), |r| r.name.clone());
+
+        let dir = match (request.output_dir.as_deref(), &record) {
+            (None, Some(record)) => output::OutputDir {
+                path: record.output_dir.clone(),
+                source: output::DirSource::Recorded,
+            },
+            (argument, _) => output::resolve_dir(
+                argument,
+                self.cfg.output_dir.as_deref(),
+                self.project_dir.as_deref(),
+                &self.cfg.cwd,
+                &self.cfg.state_dir,
+            ),
+        };
+        if let Err(failure) = output::precheck(&dir) {
+            return mcp::failure_result(&failure);
+        }
+        let mut inputs = Vec::new();
+        if let Some(record) = &record {
+            let target = match request.from_version {
+                Some(version) => match version_target(record, version) {
+                    Ok(target) => target,
+                    Err(failure) => return mcp::failure_result(&failure),
+                },
+                None => match edit_target(record) {
+                    Some(target) => target,
+                    None => {
+                        return mcp::failure_result(&errors::bad_request(format!(
+                            "The latest image of session '{}' no longer exists as it was \
+                             published, so there is nothing to edit. Pass from_version for an \
+                             earlier one, or start a new session.",
+                            record.name
+                        )))
+                    }
+                },
+            };
+            inputs.push(target);
+        }
+        inputs.extend(request.reference_images.iter().cloned());
+
+        let writer = SessionWriter::new(
+            self.store.clone(),
+            &name,
+            record.is_none().then(|| NewSession {
+                codex_home: PathBuf::new(),
+                model: settings.model.clone(),
+                output_dir: dir.path.clone(),
+                engine: session::Engine::Api,
+            }),
+        );
+        let progress = ctx.progress();
+        progress.set_phase("waiting for the OpenAI API");
+        slot.set_phase("waiting for the OpenAI API");
+        let cancel = ctx.cancel().clone();
+        let result = precise::run(&precise::Call {
+            transport: self.transport.as_ref(),
+            key: &key,
+            model: &settings.model,
+            moderation_low: settings.moderation_low,
+            max_per_day: settings.max_images_per_day,
+            state_base: &self.cfg.state_base,
+            session: &name,
+            prompt: &request.text,
+            options: &options,
+            inputs: &inputs,
+            output_dir: &dir.path,
+            first_version: record.as_ref().map_or(1, |r| r.next_version),
+            record: &writer,
+            deadline: budget.deadline,
+            started,
+            ttl_days: self.cfg.session_ttl_days,
+            cancelled: &|| cancel.is_cancelled(),
+        });
+        drop(key);
+        drop(lease);
+        drop(slot);
+        match result {
+            Ok(value) => value,
+            Err(failure) => mcp::failure_result(&self.during_shutdown(failure)),
+        }
+    }
+
+    /// The precise-mode line of `status`. The key is shown by its last four characters at most.
+    fn precise_text(&self) -> String {
+        let Some(settings) = &self.cfg.precise else {
+            return "precise mode: off (the server was not started with --precise)".to_string();
+        };
+        let key = match self.keys.read() {
+            Ok(Some(key)) => format!("API key stored ({})", key.last4()),
+            Ok(None) => {
+                "no API key stored (run codex-imagegen.exe --set-api-key in a terminal)".to_string()
+            }
+            Err(why) => format!("the API key could not be read ({why})"),
+        };
+        let used = precise::used_on(&self.cfg.state_base, precise::today());
+        let cap = match settings.max_images_per_day {
+            0 => format!("{used} images today (UTC), no cap"),
+            cap => format!("{used} of {cap} images today (UTC)"),
+        };
+        format!(
+            "precise mode: on, billed to the OpenAI API key; model {}; {key}; {cap}{}",
+            settings.model,
+            if settings.moderation_low {
+                "; moderation low"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// Claim `name` for precise mode: the registry, the lease, then its record if it has one.
+    fn claim_any(&self, name: &str) -> Result<(TurnSlot<Event>, Lease, Option<Record>), Failure> {
+        let slot = self.registry.try_start(name)?;
+        let lease = match self.store.try_lease(name) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => return Err(errors::session_busy_elsewhere(name)),
+            Err(e) => return Err(e.failure()),
+        };
+        let store = self.store.read().map_err(|e| e.failure())?;
+        let record = store.get(name).cloned();
+        Ok((slot, lease, record))
     }
 
     /// Claim an existing session for refine, in generate's order: the registry (busy here, the
@@ -938,6 +1143,7 @@ impl App {
             self.cfg.max_concurrent,
             self.cfg.session_ttl_days
         ));
+        line(self.precise_text());
         line(format!(
             "output directory: {}",
             match &self.cfg.output_dir {
@@ -1032,12 +1238,22 @@ impl App {
 
 impl ToolHost for App {
     fn instructions(&self) -> String {
+        let precise = if self.cfg.precise.is_some() {
+            format!(
+                "- {PRECISE}: the same through the OpenAI API, billed per image to the user's API \
+                 key, with size, quality, background and variants. Use it only when the user \
+                 asks for that control.\n"
+            )
+        } else {
+            String::new()
+        };
         format!(
             "codex-imagegen makes images with the user's local Codex CLI, billed to their \
              ChatGPT plan.\n\n\
              - {GENERATE}: start a new session and make one image from a prompt.\n\
              - {REFINE}: edit the latest image of a session, or an earlier version with \
              from_version; each call returns a new version.\n\
+             {precise}\
              - {STATUS}: check the setup (Codex, login, plan, model, usage) without generating \
              anything or using quota.\n\n\
              Each image comes back as a 1024px preview plus the absolute path of the \
@@ -1068,7 +1284,7 @@ impl ToolHost for App {
                 ),
             })
         };
-        vec![
+        let mut tools = vec![
             json!({
                 "name": GENERATE,
                 "description": format!(
@@ -1154,6 +1370,72 @@ impl ToolHost for App {
                 },
             }),
             json!({
+                "name": PRECISE,
+                "description": format!(
+                    "Billed per image to the user's OpenAI API key, not the ChatGPT plan: use it \
+                     only when the user wants control {GENERATE} lacks (an exact size, a quality \
+                     level, a transparent background, several variants). Calls the OpenAI \
+                     Images API directly. Without a session, or with a new name, it generates; \
+                     with an existing precise session it edits the latest image, or \
+                     from_version. Returns 1024px previews plus the absolute paths of the \
+                     full-resolution PNGs. {scratch} {failure_rule}"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "What to draw, or the change to make. Sent verbatim.",
+                        },
+                        "session": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9._-]{1,64}$",
+                            "description": "A new name starts a precise session; an existing \
+                                            precise session is edited. Omit to have a new one \
+                                            named.",
+                        },
+                        "from_version": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "With an existing session: edit this version instead \
+                                            of the latest.",
+                        },
+                        "reference_images": reference_images(
+                            4,
+                            " Sent as edit inputs, after the session's image when editing."
+                        ),
+                        "size": {
+                            "type": "string",
+                            "description": "auto (default), 1024x1024, 1536x1024, 1024x1536, or \
+                                            WIDTHxHEIGHT: multiples of 16, at most 3840x2160, \
+                                            aspect within 3:1.",
+                        },
+                        "quality": {
+                            "type": "string",
+                            "enum": ["auto", "low", "medium", "high", "xhigh", "max"],
+                            "description": "auto (default). Higher costs more.",
+                        },
+                        "background": {
+                            "type": "string",
+                            "enum": ["auto", "opaque", "transparent"],
+                        },
+                        "n": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": precise::MAX_IMAGES,
+                            "description": "Images to make, each billed. Default 1.",
+                        },
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Folder for the PNGs. Default: the session's folder, \
+                                            else the project's generated-images folder.",
+                        },
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false,
+                },
+            }),
+            json!({
                 "name": STATUS,
                 "description": "Check codex-imagegen's setup without generating anything or \
                                 using quota: the Codex CLI and its version, sign-in and plan, \
@@ -1166,7 +1448,12 @@ impl ToolHost for App {
                     "additionalProperties": false,
                 },
             }),
-        ]
+        ];
+        // Without --precise the tool does not exist (docs/design.md, "Precise mode").
+        if self.cfg.precise.is_none() {
+            tools.retain(|tool| tool["name"] != PRECISE);
+        }
+        tools
     }
 
     fn call_tool(&self, name: &str, args: &Value, ctx: &CallContext) -> Value {
@@ -1174,6 +1461,7 @@ impl ToolHost for App {
             GENERATE => self.generate(args, ctx),
             REFINE => self.refine(args, ctx),
             STATUS => self.status(args, ctx),
+            PRECISE if self.cfg.precise.is_some() => self.precise(args, ctx),
             other => mcp::failure_result(&errors::bad_request(format!(
                 "Unknown tool '{}'. codex-imagegen offers {GENERATE}, {REFINE} and {STATUS}.",
                 crate::jsonrpc::clamp(other, 100)
@@ -1305,8 +1593,13 @@ fn sessions_text(store: &session::Tolerant, now: i64) -> Vec<String> {
             |p| format!("latest {}", p.display()),
         );
         lines.push(format!(
-            "  {}: {turns}, {latest}, updated {} ({} ago)",
+            "  {}{}: {turns}, {latest}, updated {} ({} ago)",
             record.name,
+            if record.engine == session::Engine::Api {
+                " (precise)"
+            } else {
+                ""
+            },
             codex::local_time(record.updated).unwrap_or_else(|| "at an unknown time".to_string()),
             age_text(now - record.updated)
         ));
@@ -1555,6 +1848,24 @@ const REFINE_SPEC: ToolSpec = ToolSpec {
         "from_version",
         "reference_images",
         "output_dir",
+    ],
+};
+
+const PRECISE_SPEC: ToolSpec = ToolSpec {
+    name: PRECISE,
+    text_key: "prompt",
+    session_required: false,
+    max_references: 4,
+    keys: &[
+        "prompt",
+        "session",
+        "from_version",
+        "reference_images",
+        "output_dir",
+        "size",
+        "quality",
+        "background",
+        "n",
     ],
 };
 
@@ -1818,6 +2129,16 @@ pub(crate) mod testing {
     }
 
     impl Fixture {
+        /// Give precise mode a scripted transport and key source instead of the real ones.
+        pub fn set_precise(
+            &mut self,
+            transport: Box<dyn crate::https::Transport>,
+            keys: Box<dyn crate::credential::KeySource>,
+        ) {
+            self.app.transport = transport;
+            self.app.keys = keys;
+        }
+
         pub fn running(&self) -> Vec<RunningTurn> {
             self.app.registry.running()
         }

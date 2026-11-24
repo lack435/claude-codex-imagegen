@@ -84,7 +84,8 @@ result also asks Claude to show you the image itself.
 
 ## Using it
 
-Ask in plain language; Claude picks the tool. Three tools are offered:
+Ask in plain language; Claude picks the tool. Three tools are offered, and a fourth with precise mode
+(see [Precise mode](#precise-mode-openai-api-billed-per-image)):
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
@@ -130,6 +131,40 @@ Options are arguments on the MCP registration, after the exe. There is no config
 ```powershell
 claude mcp add --scope user codex-imagegen -- C:\tools\codex-imagegen.exe --timeout-seconds 600
 ```
+
+### Precise mode (OpenAI API, billed per image)
+
+Codex always lets the image backend pick the size and quality. Precise mode adds a fourth tool,
+`codex_imagegen_precise`, that calls the OpenAI Images API directly, with an exact size (up to
+3840x2160), a quality level, a transparent background and up to 4 variants per call. **It is billed per
+image to an OpenAI API key, not to your ChatGPT plan**, and it is off unless you turn it on.
+
+1. In the OpenAI platform, make a project just for this, give it a monthly spend limit with "enforce a
+   hard limit" on, and create a key in it (a restricted key limited to image generation, if offered).
+   Your organization may need API Organization Verification for GPT image models.
+2. Store the key once, in a terminal. It prompts with typing hidden, checks the key with a free call, and
+   keeps it in Windows Credential Manager. Never paste the key into Claude.
+
+   ```powershell
+   C:\tools\codex-imagegen.exe --set-api-key
+   ```
+
+3. Register the server with `--precise`:
+
+   ```powershell
+   claude mcp add --scope user codex-imagegen -- C:\tools\codex-imagegen.exe --precise
+   ```
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--precise` | off | Offer `codex_imagegen_precise` |
+| `--precise-model <id>` | `gpt-image-2.5-sunburst-2026-09-08` | The image model, full id |
+| `--precise-max-images-per-day <n>` | 20 | Images a day (UTC), across all projects; 0 = no cap |
+| `--precise-moderation <low\|auto>` | `auto` | The API's moderation level |
+
+`codex_imagegen_status` shows whether a key is stored (its last four characters only) and today's count.
+`--remove-api-key` deletes the key. Claude uses this tool only when you ask for that control; plain
+requests still go through Codex and your plan.
 
 ### A dedicated Codex home
 

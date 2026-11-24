@@ -38,7 +38,10 @@ troubleshooting, and the IJG notice. The tag-driven release workflow (see Build 
 `--doctor`. After it, `refine` gained `from_version`, to edit an earlier version (see [Refine](#refine)).
 The paid `smoke.ps1 -SpendQuota` run of 2026-11-23 (codex-cli 0.171.0, outside the tested range; 4 images)
 passed V11 and 68 of 69 checks. The one failure was V1's trace reading: 0.171.0's `inference_started` events
-name no request payload, so the tool-surface checks did not run on that version.
+name no request payload, so the tool-surface checks did not run on that version. `smoke.ps1` has since learned
+that trace format, and V1 passes on it (see the V1 row). Precise mode, an opt-in tool on the OpenAI Images API
+with its key in Credential Manager, is built, unit-tested and checked live, including 2 paid images (see
+[Precise mode](#precise-mode)).
 
 Claims carry one of three tags:
 
@@ -60,8 +63,9 @@ server drives Codex, collects the images, and hands them to Claude.
 
 Out of scope for v1:
 
-- an OpenAI API-key mode
-- choosing the image model, size or quality
+- an OpenAI API-key mode for the Codex tools. A separate, opt-in tool calls the OpenAI Images API with its own
+  key: see [Precise mode](#precise-mode)
+- choosing the image model, size or quality through Codex (precise mode offers these)
 - several variants per call
 - branching into parallel histories. `refine`'s `from_version` edits an earlier version, but the new image
   joins the one linear version list (see [Refine](#refine))
@@ -220,7 +224,8 @@ most 1,369 tokens and is not resized on any model tier.
 
 ## Tools
 
-Three tools, prefixed `codex_imagegen_` [decided].
+Three tools, prefixed `codex_imagegen_` [decided], and a fourth, `codex_imagegen_precise`, listed only under
+`--precise` (see [Precise mode](#precise-mode)).
 
 **Session names.**
 
@@ -1053,7 +1058,7 @@ case is always a success with warnings.
 
 | Kind | Codes |
 | --- | --- |
-| Stop and escalate | `CLI_NOT_FOUND`, `SPAWN_FAILED`, `APP_SERVER_FAILED`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED`, `IMAGEGEN_UNAVAILABLE`, `MODEL_UNAVAILABLE`, `RATE_LIMITED`, `UPSTREAM_ERROR`, `CONTENT_REFUSED`, `IMAGE_FAILED`, `NO_IMAGE`, `TIMEOUT`, `STORE_CORRUPT`, `INTERNAL_ERROR` |
+| Stop and escalate | `CLI_NOT_FOUND`, `SPAWN_FAILED`, `APP_SERVER_FAILED`, `NOT_AUTHENTICATED`, `AUTH_EXPIRED`, `IMAGEGEN_UNAVAILABLE`, `MODEL_UNAVAILABLE`, `RATE_LIMITED`, `UPSTREAM_ERROR`, `CONTENT_REFUSED`, `IMAGE_FAILED`, `NO_IMAGE`, `TIMEOUT`, `STORE_CORRUPT`, `INTERNAL_ERROR`, `API_KEY_MISSING`, `API_KEY_REJECTED`, `API_QUOTA`, `API_ACCESS`, `PRECISE_CAP_REACHED` |
 | Agent-correctable (short form) | `BAD_REQUEST`, `SESSION_EXISTS`, `SESSION_NOT_FOUND`, `SESSION_NOT_RESUMABLE`, `SESSION_BUSY`, `SESSION_OPEN_ELSEWHERE`, `TOO_MANY_RUNNING`, `CANCELLED`, `SERVER_SHUTTING_DOWN` |
 
 `STORE_CORRUPT` covers a session store that exists but cannot be parsed (the remediation: move it aside, and a
@@ -1097,6 +1102,177 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
   "image quota".
 - The cache is keyed by `limitId`. A sparse update merges only its non-null fields.
 
+## Precise mode
+
+Approved by the owner on 2026-11-23. Built, unit-tested, and checked live: P1 and P4 free, P2 and P3 paid
+(2 images on the owner's API key, 2026-11-23, 14 of 14 checks).
+
+**Why.** Codex's image tool always asks for `size` and `quality` `auto`, whether Codex is signed in with
+ChatGPT or an API key (see [What Codex actually provides](#what-codex-actually-provides)). The OpenAI Images
+API takes those options and more. Precise mode calls that API directly from this server, billed per image to
+an OpenAI API key.
+
+**The boundary.** It reopens "no API-key mode" for one opt-in tool, and nothing else:
+
+| | Codex tools | `codex_imagegen_precise` |
+| --- | --- | --- |
+| Listed | always | only under `--precise` |
+| Billed to | the ChatGPT plan | the OpenAI API key |
+| Key | API-key variables stripped from the child | read from Credential Manager per call, sent only to `api.openai.com` |
+| Codex | the child, with its posture | not involved: no child, thread or Codex home |
+
+`generate` and `refine` never read the key, whatever flags are set [decided]. Without `--precise` the tool is
+not listed, a call to it is an unknown tool, and the key is never read.
+
+### Tool
+
+The description starts "Billed per image to the user's OpenAI API key", so the agent and the user can always
+tell it from the plan-billed tools.
+
+| arg | type | notes |
+| --- | --- | --- |
+| `prompt` | string, required | Sent verbatim, up to 32,000 characters [assumed: P2]. |
+| `session` | string, optional | A new name starts a precise session; an existing precise session is edited. A Codex session's name is refused, and `refine` refuses a precise session; each names the other tool. |
+| `from_version` | integer ≥ 1, optional | With an existing session: edit that version's published file (as `refine`'s). |
+| `reference_images` | string[], optional | Up to 4, validated as today; sent as edit inputs after the session's image. |
+| `size` | string, optional | `auto`, `1024x1024`, `1536x1024`, `1024x1536`, or `WIDTHxHEIGHT`: multiples of 16, at most 3840x2160 either way round, aspect within 3:1, 655,360 to 8,294,400 pixels [assumed: the API reference]. A custom 1536x864 came back at exactly that size [verified: P2]. |
+| `quality` | string, optional | `auto`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| `background` | string, optional | `auto`, `opaque`, `transparent`. |
+| `n` | integer, optional | 1 to 4, default 1. Each image is its own version. |
+| `output_dir` | string, optional | As today; an existing session's folder by default. |
+
+Only shapes are checked here. Which model takes which value is the API's to say, and its refusal costs
+nothing: a 400 comes back as `BAD_REQUEST` with the API's reason quoted [decided]. The output is always PNG,
+because the preview decodes PNG only. Not offered: `output_format`, compression, streaming and partial
+images, masks and `markup`, `complexity`, GIF and SVG. `moderation` is the user's, through
+`--precise-moderation`, not the agent's [decided].
+
+**Requests** (the API reference, read 2026-11-23; both shapes accepted live [verified: P2, P3]):
+
+- Without input images: `POST /v1/images/generations`, JSON `{model, prompt, n, output_format: "png"}`, plus
+  `size`, `quality`, `background` and `moderation` when given.
+- With input images (the edit target first, then the references): `POST /v1/images/edits`, the same fields
+  plus `images: [{image_url: "data:<type>;base64,..."}]`. A data URL over 20,971,520 characters is refused
+  before sending. The reference's examples use multipart `image[]`, but the JSON body with a data URL was
+  accepted [verified: P3], so no multipart is needed.
+- The answer's `data[].b64_json` images are published, previewed and recorded as Codex's are (versioned
+  names, no-replace publish, fingerprint, `resolved_path`). The result adds what the API reports it made
+  (`size`, `quality`, `background`), its `usage` tokens, and "billed to the user's OpenAI API key, not the
+  ChatGPT plan".
+
+**Order.** Validate; read the key (none: `API_KEY_MISSING`); claim the session (registry, lease, record);
+pre-check the folder; pick the edit target; read the inputs; build the body. Nothing is spent so far. Then a
+cancel is checked one last time, the images are counted against the daily cap, and the request is sent.
+
+**Cancel and timeout.** A cancel stops the call up to the moment the request is sent. Once it is sent, the call
+waits for the answer, bounded by `--timeout-seconds`, and keeps any image that comes back, since it is billed
+either way [decided: proportionate; aborting a synchronous WinHTTP call from another thread was not worth its
+machinery]. Each WinHTTP step gets the remaining budget, and the response is read only until the deadline. The
+response is capped at 64 MiB. A failure after the send (a timeout, a 5xx, a broken connection) may follow an
+image the API made and billed, so its remediation tells the agent not to retry on its own but to let the user
+check the usage first [decided].
+
+### The API key
+
+**Where it lives.** A generic credential in Windows Credential Manager, target `codex-imagegen/openai-api-key`,
+`CRED_PERSIST_LOCAL_MACHINE`, so it stays on this computer and never roams [assumed: P1, Microsoft Learn]
+[decided]. The round trip (write, read, replace, delete) runs in the unit tests against a throwaway target
+[verified: unit test].
+
+Protection, said plainly: Windows stores it "securely", without naming the scheme [assumed]. It is out of other
+Windows users' reach, and out of the project, the MCP registration and every environment. It is **not**
+protected from other programs running as the same user, which can read it as they can read Codex's own
+`auth.json`. Such a program is out of scope, as it is for cleanup [decided].
+
+Rejected: a tool argument (the key would be in Claude's context), a server flag (plain text in
+`~/.claude.json`, and visible in the process list), `OPENAI_API_KEY` (it collides with the rule that strips it
+from the child, and reaches every program), a file in the project.
+
+**Commands**, from a terminal, never through Claude:
+
+- `--set-api-key` reads the key from the console with echo off, and refuses when stdin is not a console, so it
+  never arrives through a pipe that may be logged. It checks the key with a free `GET /v1/models` (200 stores
+  it; 401 or anything else does not), stores it, and prints only its last four characters.
+- `--remove-api-key` deletes it.
+
+**Use.** Read per call and dropped at its end; `Secret` zeroes its bytes on drop and prints as `Secret(…abcd)`.
+It goes in exactly one place, the `Authorization` header, which is built straight into WinHTTP's UTF-16
+buffer and overwritten after the send. It never appears in stderr, a result or an error; `status` shows the last
+four characters at most. No error asks the agent for the key. The API's 401 message is not quoted, because it
+echoes part of the key ("Incorrect API key provided: sk-codex*****0000") [verified: live, 2026-11-23].
+
+### Network
+
+WinHTTP over raw FFI, as the job object is: no new crate [decided].
+
+- `WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY` (Windows 8.1 and later), synchronous.
+- `WINHTTP_OPTION_SECURE_PROTOCOLS` set to TLS 1.2 and 1.3, falling back to 1.2 alone where 1.3 is unknown;
+  `WINHTTP_FLAG_SECURE` on the request.
+- Certificate validation is left on: no option that ignores a certificate problem is ever set, and a unit test
+  checks `https.rs` for their names.
+- The host is the constant `api.openai.com`, port 443. There is no `--api-base` [decided].
+- Redirects are refused (`WINHTTP_OPTION_REDIRECT_POLICY` never), so the header cannot follow one elsewhere.
+- No `Accept-Encoding` is sent, so the answer is never compressed.
+
+A request with a made-up key to `GET /v1/models` came back 401 through this path, mapped to
+`API_KEY_REJECTED` [verified: live, 2026-11-23, ignored unit test `a_made_up_key_is_refused_by_the_real_api_with_401`].
+
+### Spending guardrails
+
+- **Off by default**: the tool exists only under `--precise`.
+- **A daily cap**, `--precise-max-images-per-day` (default 20; 0 = no cap). It counts images, per UTC day,
+  across every project under the state base, in `<state base>\precise-usage.json`, under
+  `precise-usage.lock`. A request's `n` counts when it is sent, whether or not it then succeeds [decided]. A
+  call that would pass the cap is refused before anything is sent: `PRECISE_CAP_REACHED`. A count file that is
+  missing is zero; one that cannot be read or parsed, or saved, fails closed (`INTERNAL_ERROR`, nothing sent)
+  and is left as it is. A stored day later than today (the clock went back) keeps counting into that day.
+- **On OpenAI's side** (README): a project just for this key with a monthly spend limit and "enforce a hard
+  limit" on, and a restricted key if image generation can be its only permission [assumed: P5].
+- **Every result** says it was billed to the API key, with its tokens.
+
+### Errors
+
+The failure contract is unchanged. New codes, all stop-and-escalate:
+
+| Code | When |
+| --- | --- |
+| `API_KEY_MISSING` | no key stored, or it cannot be read |
+| `API_KEY_REJECTED` | 401 |
+| `API_QUOTA` | 429 with `insufficient_quota` |
+| `API_ACCESS` | 403, such as organization verification required [assumed: P4] |
+| `PRECISE_CAP_REACHED` | the daily cap |
+
+Existing codes cover the rest: `RATE_LIMITED` (other 429s), `CONTENT_REFUSED` (`moderation_blocked`, with its
+stage) [assumed: P4], `BAD_REQUEST` (other 4xx: the API refused the arguments), `UPSTREAM_ERROR` (5xx, or no
+response), `TIMEOUT`, and `IMAGE_FAILED` (a 200 without a decodable image). The API's message is quoted,
+bounded and marked untrusted, except on a 401, and except a message holding `sk-` or `****`, which is withheld
+as possibly quoting part of a key. No precise failure points the agent at another tool.
+
+### Sessions and cleanup
+
+Precise sessions share the store. A record gains `engine` (`"api"`; absent means `"codex"`). An api record has
+an empty `thread_id` and `codex_home`, and its `model` is the image model.
+
+- Cleanup removes an api session's published files under the existing safety rules, then its record. It sends
+  no `thread/delete` and touches no Codex folder; the `--cleanup` sweep handles api sessions without starting
+  any Codex [verified: unit test].
+- `status` marks them `(precise)`, and adds a line: on or off, the model, the key (last four characters, or "no
+  API key stored"), and today's count against the cap.
+- An older build reading an api record ignores `engine`. Its cleanup skips the record whole, because the empty
+  `thread_id` is not a UUID, which is safe; its `refine` fails at `thread/resume`, spending nothing. When it
+  rewrites the store it drops `engine` from every record, so every read restores it: a record with neither a
+  thread nor a Codex home is an api record, since a Codex record always has both [verified: unit test].
+
+### Verification
+
+| # | Check | Cost | State |
+| --- | --- | --- | --- |
+| P1 | Credential Manager round trip; WinHTTP over TLS through the automatic proxy | free | **Passed 2026-11-23**: the round trip in a unit test, and the live 401 request. `--set-api-key` with a real key not yet run (needs the owner's key). |
+| P2 | Generate with a custom size, `quality: high` and the pinned model: accepted, and the PNG has the size asked | 1 image | **Passed 2026-11-23**: `gpt-image-2.5-sunburst-2026-09-08`, `1536x864`, `high`; a 1536x864 PNG, 2.5 MB, in 72 s; the API reported `size 1536x864, quality high, background opaque` and 22 input, 1,078 output tokens. |
+| P3 | Edit with a JSON body and a data URL; if refused, switch to multipart | 1 image | **Passed 2026-11-23**: v1 as the edit input, `background: transparent`, `1024x1024`; published as v2, an RGBA PNG with transparent pixels, in 26 s. The preview was flattened onto white, as designed. `status` then showed the session `(precise)` with 2 turns and "2 of 20 images today"; no key-like text was in any result or in stderr; `--cleanup --older-than-days 0` removed the session and its files without starting Codex. |
+| P4 | Error mapping | free | 401 **passed 2026-11-23**. 403 and moderation shapes are from the documentation until one is seen. |
+| P5 | The dashboard offers an images-only restricted key and a hard spend limit | free | for the owner |
+
 ## Security posture
 
 - **Commands.** Codex runs with a read-only sandbox, `approvalPolicy: never` and the shell tool disabled. Its
@@ -1137,7 +1313,8 @@ that never started an image call, `IMAGE_FAILED` for one that started it but nev
     offered (V1). `status` does not report a system or managed layer [decided: not built].
   - Copying `auth.json` between homes is unsupported, because refresh tokens appear to be single-use.
 - **Billing.** API-key variables are removed from the child, and every child's preflight requires a `chatgpt`
-  account.
+  account. The one API-billed path is precise mode, opt-in, with its own key in Credential Manager (see
+  [Precise mode](#precise-mode)).
 - **Recursion.** codex-imagegen never registers itself in Codex, and MCP servers are disabled in the child.
 
 ## MCP server details
@@ -1174,8 +1351,19 @@ Everything is a command-line argument on the MCP entry. There is no config file 
                            0 when ready, 1 otherwise
 --cleanup                  Sweep expired sessions across all projects, then exit
 --older-than-days <n>      With --cleanup: override the TTL (0 = every session not in use)
+--precise                  Offer codex_imagegen_precise (see Precise mode). Off by default
+--precise-model <id>       Its image model, full id. Default gpt-image-2.5-sunburst-2026-09-08
+--precise-max-images-per-day <n>
+                           Its daily cap (UTC day, all projects). Default 20; 0 = no cap
+--precise-moderation <low|auto>
+                           Sent as `moderation: low` when low. Default auto (the field is left out)
+--set-api-key              Prompt for the API key with typing hidden, check it, store it, then exit
+--remove-api-key           Delete the stored key, then exit
 --help, --version
 ```
+
+The `--precise-*` flags are refused without `--precise`. A `--precise-model` outside the GPT image ids the API
+reference lists is refused at startup [decided].
 
 `CODEX_IMAGEGEN_HOME` overrides the state base. `CODEX_IMAGEGEN_BUILD`, set at compile time, stamps the commit
 into `--version`.
@@ -1221,7 +1409,10 @@ Planned modules:
 | `errors.rs` | Failure contract, item-level and `codexErrorInfo` mapping. |
 | `config.rs` | Flags, state directory derivation, `fnv1a64` (also the output fingerprint). |
 | `winjob.rs` | Job object and suspended spawn. |
-| `tools.rs` | `App`, the three tools, validation and start ordering, refine's edit target and home check, the child's notification handler, child retirement, the start of automatic expiry. |
+| `tools.rs` | `App`, the tools, validation and start ordering, refine's edit target and home check, precise mode's claims and edit target, the child's notification handler, child retirement, the start of automatic expiry. |
+| `precise.rs` | Precise mode: option checks, request bodies, the answer and its errors, the daily cap, publishing. |
+| `https.rs` | WinHTTP over raw FFI to `api.openai.com` only, and the transport trait the tests fake. |
+| `credential.rs` | The API key in Credential Manager, `Secret`, and reading a line with typing hidden. |
 | `testutil.rs` | Test temp directories, and junctions made with `mklink /J`. |
 
 The estimate is about 3,500 lines without tests.

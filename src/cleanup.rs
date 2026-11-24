@@ -250,6 +250,9 @@ fn remove_session(
         },
         Err(e) => return Fate::Skipped(e.to_string()),
     };
+    if record.engine == session::Engine::Api {
+        return remove_api_session(store, name, &record);
+    }
     if !is_uuid(&record.thread_id) {
         return Fate::Skipped(
             "its Codex thread id is not a well-formed UUID, so nothing of it was deleted"
@@ -293,6 +296,38 @@ fn remove_session(
         Err(e) => Fate::Skipped(format!(
             "its thread and files were removed, but its record could not be dropped ({e}); \
              retried next time"
+        )),
+    }
+}
+
+/// Remove a precise session (docs/design.md, "Precise mode"): it has no thread and no Codex image
+/// folder, so only its published files go, under the same rules as any output, then its record,
+/// last. Called with the session's lease held.
+fn remove_api_session(store: &Store, name: &str, record: &Record) -> Fate {
+    let mut freed = 0;
+    let mut problems = Vec::new();
+    remove_outputs(record, &mut freed, &mut problems);
+    if !problems.is_empty() {
+        return Fate::Skipped(format!(
+            "{}; its record is kept, so the rest is retried next time",
+            problems.join("; ")
+        ));
+    }
+    let key = session::key(name);
+    let dropped = store.update(|file| {
+        if file
+            .sessions
+            .get(&key)
+            .is_some_and(|r| r.engine == session::Engine::Api && r.created == record.created)
+        {
+            file.sessions.remove(&key);
+        }
+        Ok(())
+    });
+    match dropped {
+        Ok(()) => Fate::Removed { freed },
+        Err(e) => Fate::Skipped(format!(
+            "its files were removed, but its record could not be dropped ({e}); retried next time"
         )),
     }
 }
@@ -711,8 +746,12 @@ fn record_outcome(store: &Store, tally: &Tally, at: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// The names of the sessions in `file` due at `now`, oldest first.
-fn due_names(file: &session::StoreFile, now: i64, days: u32) -> Vec<(String, PathBuf)> {
+/// The sessions in `file` due at `now`, oldest first: name, Codex home and engine.
+fn due_names(
+    file: &session::StoreFile,
+    now: i64,
+    days: u32,
+) -> Vec<(String, PathBuf, session::Engine)> {
     let mut due: Vec<&Record> = file
         .sessions
         .values()
@@ -720,7 +759,7 @@ fn due_names(file: &session::StoreFile, now: i64, days: u32) -> Vec<(String, Pat
         .collect();
     due.sort_by_key(|r| r.updated);
     due.iter()
-        .map(|r| (r.name.clone(), r.codex_home.clone()))
+        .map(|r| (r.name.clone(), r.codex_home.clone(), r.engine))
         .collect()
 }
 
@@ -750,7 +789,7 @@ pub fn expire(
     let now = session::now_unix();
     let names: Vec<String> = due_names(&file, now, days)
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(name, _, _)| name)
         .collect();
     let tally = clean_store(
         store,
@@ -835,11 +874,17 @@ pub fn sweep(
     let mut tallies: Vec<Option<Tally>> = Vec::new();
     // (home, [(store index, session name)]), homes compared as Windows compares paths.
     let mut groups: Vec<(PathBuf, Vec<(usize, String)>)> = Vec::new();
+    // Precise sessions need no Codex child: they have no thread.
+    let mut precise: Vec<(usize, String)> = Vec::new();
     for (index, store) in stores.iter().enumerate() {
         match store.read() {
             Ok(file) => {
                 tallies.push(Some(Tally::default()));
-                for (name, home) in due_names(&file, now, days) {
+                for (name, home, engine) in due_names(&file, now, days) {
+                    if engine == session::Engine::Api {
+                        precise.push((index, name));
+                        continue;
+                    }
                     match groups
                         .iter_mut()
                         .find(|(h, _)| same_resolved_path(h, &home))
@@ -857,7 +902,19 @@ pub fn sweep(
         }
     }
 
-    if groups.is_empty() {
+    for (index, name) in &precise {
+        let store = &stores[*index];
+        let no_thread = |_: &str| -> Result<(), RpcError> { Ok(()) };
+        let fate = remove_session(store, name, Path::new(""), now, days, &no_thread, &|_| {
+            false
+        });
+        report_fate(out, store, name, &fate);
+        if let Some(tally) = tallies[*index].as_mut() {
+            tally.add(name, fate);
+        }
+    }
+
+    if groups.is_empty() && precise.is_empty() {
         let _ = writeln!(
             out,
             "nothing to remove{}",
@@ -867,7 +924,7 @@ pub fn sweep(
                 ""
             }
         );
-    } else {
+    } else if !groups.is_empty() {
         failed |= sweep_groups(
             cfg,
             launcher,
@@ -902,7 +959,7 @@ pub fn sweep(
         if total.removed.is_empty() {
             ""
         } else {
-            " (not counting the Codex rollouts thread/delete removed)"
+            " (not counting any Codex rollouts thread/delete removed)"
         },
         total.skipped.len(),
         match unsearched.len() {
@@ -911,6 +968,20 @@ pub fn sweep(
         }
     );
     i32::from(failed)
+}
+
+/// The sweep's line for one session's fate.
+fn report_fate(out: &mut dyn Write, store: &Store, name: &str, fate: &Fate) {
+    let _ = match fate {
+        Fate::Removed { freed } => writeln!(
+            out,
+            "removed {}: {name} (freed {})",
+            label(store),
+            megabytes(*freed)
+        ),
+        Fate::Skipped(why) => writeln!(out, "skipped {}: {name}: {why}", label(store)),
+        Fate::NotDue => writeln!(out, "left {}: {name}: it was used meanwhile", label(store)),
+    };
 }
 
 /// Run each home's sessions through a child of that home. Returns whether a home could not be
@@ -1019,22 +1090,7 @@ fn sweep_groups(
                 &delete,
                 &|_| false,
             );
-            match &fate {
-                Fate::Removed { freed } => {
-                    let _ = writeln!(
-                        out,
-                        "removed {}: {name} (freed {})",
-                        label(store),
-                        megabytes(*freed)
-                    );
-                }
-                Fate::Skipped(why) => {
-                    let _ = writeln!(out, "skipped {}: {name}: {why}", label(store));
-                }
-                Fate::NotDue => {
-                    let _ = writeln!(out, "left {}: {name}: it was used meanwhile", label(store));
-                }
-            }
+            report_fate(out, store, name, &fate);
             if let Some(tally) = tallies[*index].as_mut() {
                 tally.add(name, fate);
             }
@@ -1217,6 +1273,7 @@ mod tests {
                 output_dir: self.out_dir(),
                 next_version: versions.iter().max().map_or(1, |v| v + 1),
                 outputs,
+                engine: crate::session::Engine::Codex,
             };
             self.store
                 .update(|file| {
@@ -1283,6 +1340,66 @@ mod tests {
             busy,
             Instant::now() + Duration::from_secs(30),
         );
+    }
+
+    #[test]
+    fn an_expired_precise_session_loses_its_files_and_record_and_no_thread_is_deleted() {
+        let world = World::new();
+        let record = world.session("pic", THREAD, OLD, &[1, 2]);
+        // As precise mode writes it: no thread, no Codex home.
+        world
+            .store
+            .update(|file| {
+                let r = file.sessions.get_mut("pic").unwrap();
+                r.engine = session::Engine::Api;
+                r.thread_id = String::new();
+                r.codex_home = PathBuf::new();
+                Ok(())
+            })
+            .unwrap();
+        let codex_folder = world.images_dir(THREAD);
+        let deletes = Deletes::ok();
+        expire_with(&world, 7, &deletes, &|_| false);
+
+        assert!(
+            deletes.asked().is_empty(),
+            "no thread/delete for a precise session"
+        );
+        assert!(world.file().get("pic").is_none());
+        for output in &record.outputs {
+            assert!(!output.path.exists(), "{}", output.path.display());
+        }
+        // Only its own files: a Codex folder of the same id is not its to touch.
+        assert!(codex_folder.exists());
+
+        // The sweep handles one without starting any Codex.
+        let world = World::new();
+        world.session("pic2", THREAD, OLD, &[1]);
+        world
+            .store
+            .update(|file| {
+                let r = file.sessions.get_mut("pic2").unwrap();
+                r.engine = session::Engine::Api;
+                r.thread_id = String::new();
+                r.codex_home = PathBuf::new();
+                Ok(())
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        let deletes = Deletes::ok();
+        let fate = remove_session(
+            &world.store,
+            "pic2",
+            Path::new(""),
+            session::now_unix(),
+            7,
+            &|t| deletes.call(t),
+            &|_| false,
+        );
+        report_fate(&mut out, &world.store, "pic2", &fate);
+        assert!(matches!(fate, Fate::Removed { .. }));
+        assert!(deletes.asked().is_empty());
+        assert!(String::from_utf8(out).unwrap().starts_with("removed "));
     }
 
     #[test]
@@ -2059,7 +2176,7 @@ mod tests {
         let file = world.file();
         let names: Vec<String> = due_names(&file, session::now_unix(), 7)
             .into_iter()
-            .map(|(n, _)| n)
+            .map(|(n, _, _)| n)
             .collect();
         assert_eq!(names, vec!["fox"]);
         // A refine elsewhere finishes between the listing and the lease.
@@ -2223,6 +2340,7 @@ mod tests {
                 last_output_bytes: Some(5),
                 output_dir: out.clone(),
                 next_version: 2,
+                engine: crate::session::Engine::Codex,
                 outputs: vec![Output {
                     version: 1,
                     resolved_path: Some(fs::canonicalize(&path).unwrap()),

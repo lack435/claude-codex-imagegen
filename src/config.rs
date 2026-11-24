@@ -25,6 +25,37 @@ pub const DEFAULT_SESSION_TTL_DAYS: u32 = 7;
 /// Upper bound for the day counts, so later arithmetic on them (days to seconds, added to a Unix
 /// time) can never overflow. Ten years is past any useful expiry.
 pub const MAX_DAYS: u32 = 3650;
+/// Precise mode's image model, pinned by full id: a dated snapshot (docs/design.md, "Precise
+/// mode") [decided].
+pub const DEFAULT_PRECISE_MODEL: &str = "gpt-image-2.5-sunburst-2026-09-08";
+/// Precise mode's daily image cap [decided]. 0 means no cap.
+pub const DEFAULT_PRECISE_MAX_PER_DAY: u32 = 20;
+/// The GPT image model ids the Images API reference lists, read 2026-11-23 [assumed: P2].
+/// `gpt-image-1` (shut down 2026-10-23) and the `dall-e-*` models are left out.
+pub const PRECISE_MODELS: &[&str] = &[
+    "gpt-image-2.5-sunburst-2026-09-08",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare-2026-09-08",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2-2026-04-21",
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1-mini",
+    "chatgpt-image-latest",
+];
+
+/// Precise mode's settings, present only under `--precise`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Precise {
+    pub model: String,
+    /// Images a day across every project of this user's state base; 0 means no cap.
+    pub max_images_per_day: u32,
+    /// `--precise-moderation low`: sent as `moderation: low` on every call. Otherwise the field is
+    /// left out and the API's `auto` applies.
+    pub moderation_low: bool,
+}
 
 /// What the process was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +68,10 @@ pub enum Mode {
     Cleanup {
         older_than_days: Option<u32>,
     },
+    /// Prompt for precise mode's API key with typing hidden, check it, store it, then exit.
+    SetApiKey,
+    /// Delete precise mode's stored API key, then exit.
+    RemoveApiKey,
     Help,
     Version,
 }
@@ -67,6 +102,8 @@ pub struct Config {
     /// The Codex child's working directory: `<base>\work`, empty and outside any repository, so no
     /// project AGENTS.md, config or trust entry comes into play (docs/design.md, "Spawn").
     pub work_dir: PathBuf,
+    /// `--precise` and its settings; `None` without it, and then precise mode does not exist.
+    pub precise: Option<Precise>,
 }
 
 /// The parts of the process environment configuration depends on, gathered in one place so tests
@@ -107,6 +144,10 @@ impl Config {
         let mut session_ttl_days = DEFAULT_SESSION_TTL_DAYS;
         let mut older_than_days = None;
         let (mut doctor, mut cleanup, mut help, mut version) = (false, false, false, false);
+        let (mut precise, mut set_key, mut remove_key) = (false, false, false);
+        let mut precise_model = None;
+        let mut precise_max = None;
+        let mut precise_moderation = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -137,6 +178,9 @@ impl Config {
                     "--doctor" => doctor = true,
                     "--cleanup" => cleanup = true,
                     "--help" => help = true,
+                    "--precise" => precise = true,
+                    "--set-api-key" => set_key = true,
+                    "--remove-api-key" => remove_key = true,
                     _ => version = true,
                 }
                 i += 1;
@@ -178,6 +222,29 @@ impl Config {
                 "--older-than-days" => {
                     older_than_days = Some(number(canonical, value, 0, MAX_DAYS as u64)? as u32)
                 }
+                "--precise-model" => {
+                    if !PRECISE_MODELS.contains(&value) {
+                        return Err(format!(
+                            "--precise-model must be one of {}, got '{value}'",
+                            PRECISE_MODELS.join(", ")
+                        ));
+                    }
+                    precise_model = Some(value.to_string());
+                }
+                "--precise-max-images-per-day" => {
+                    precise_max = Some(number(canonical, value, 0, 10_000)? as u32)
+                }
+                "--precise-moderation" => {
+                    precise_moderation = Some(match value {
+                        "low" => true,
+                        "auto" => false,
+                        _ => {
+                            return Err(format!(
+                                "--precise-moderation must be low or auto, got '{value}'"
+                            ))
+                        }
+                    })
+                }
                 other => unreachable!("{other} is in FLAGS but has no handler"),
             }
             i += 1;
@@ -186,19 +253,40 @@ impl Config {
         if older_than_days.is_some() && !cleanup {
             return Err("--older-than-days is only valid with --cleanup".into());
         }
+        if !precise
+            && (precise_model.is_some() || precise_max.is_some() || precise_moderation.is_some())
+        {
+            return Err(
+                "--precise-model, --precise-max-images-per-day and --precise-moderation are only \
+                 valid with --precise"
+                    .into(),
+            );
+        }
+        let modes = [doctor, cleanup, set_key, remove_key];
         let mode = if help {
             Mode::Help
         } else if version {
             Mode::Version
-        } else if doctor && cleanup {
-            return Err("--doctor and --cleanup cannot be combined".into());
+        } else if modes.iter().filter(|m| **m).count() > 1 {
+            return Err(
+                "--doctor, --cleanup, --set-api-key and --remove-api-key cannot be combined".into(),
+            );
         } else if doctor {
             Mode::Doctor
         } else if cleanup {
             Mode::Cleanup { older_than_days }
+        } else if set_key {
+            Mode::SetApiKey
+        } else if remove_key {
+            Mode::RemoveApiKey
         } else {
             Mode::Serve
         };
+        let precise = precise.then(|| Precise {
+            model: precise_model.unwrap_or_else(|| DEFAULT_PRECISE_MODEL.to_string()),
+            max_images_per_day: precise_max.unwrap_or(DEFAULT_PRECISE_MAX_PER_DAY),
+            moderation_low: precise_moderation.unwrap_or(false),
+        });
 
         let cwd = normalize_dir(env.cwd.clone());
         let state_base = state_base(env)?;
@@ -219,6 +307,7 @@ impl Config {
             state_base,
             state_dir,
             work_dir,
+            precise,
         })
     }
 }
@@ -235,14 +324,28 @@ const FLAGS: &[&str] = &[
     "--max-concurrent",
     "--session-ttl-days",
     "--older-than-days",
+    "--precise",
+    "--precise-model",
+    "--precise-max-images-per-day",
+    "--precise-moderation",
     "--doctor",
     "--cleanup",
+    "--set-api-key",
+    "--remove-api-key",
     "--help",
     "--version",
 ];
 
 /// The flags that take no value.
-const SWITCHES: &[&str] = &["--doctor", "--cleanup", "--help", "--version"];
+const SWITCHES: &[&str] = &[
+    "--doctor",
+    "--cleanup",
+    "--precise",
+    "--set-api-key",
+    "--remove-api-key",
+    "--help",
+    "--version",
+];
 
 fn absolute_dir(flag: &str, value: &str) -> Result<PathBuf, String> {
     absolute(flag, value, r"D:\codex-imagegen")
@@ -453,6 +556,16 @@ OPTIONS:
   --session-ttl-days <n>      Expire sessions idle this many days, and their files. 0 disables.
                               Default: 7
 
+PRECISE MODE (billed per image to an OpenAI API key, not to the ChatGPT plan):
+  --precise                   Offer codex_imagegen_precise, which calls the OpenAI Images API
+                              with size, quality and background options. Off by default. Store
+                              the key first with --set-api-key.
+  --precise-model <id>        Image model, full id. Default: gpt-image-2.5-sunburst-2026-09-08
+  --precise-max-images-per-day <n>
+                              Images a day (UTC), across all projects. 0 = no cap. Default: 20
+  --precise-moderation <low|auto>
+                              The API's moderation level. Default: auto
+
 OTHER:
   --doctor                    Check the Codex CLI, login, plan, image capability and model from
                               a terminal (free: no image is generated), then exit.
@@ -460,6 +573,10 @@ OTHER:
                               threads, Codex's image copies and the published files), print
                               what was removed and skipped, then exit.
   --older-than-days <n>       With --cleanup: override the TTL (0 = every session not in use).
+  --set-api-key               Prompt for the OpenAI API key with typing hidden, check it with a
+                              free call, and store it in Windows Credential Manager. Run it in
+                              a terminal; the key is never read from a pipe.
+  --remove-api-key            Delete the stored key.
   --help, -h                  Show this help.
   --version, -V               Show the version.
 
@@ -485,6 +602,52 @@ mod tests {
 
     fn err(items: &[&str]) -> String {
         parse(items).expect_err("expected a parse error")
+    }
+
+    #[test]
+    fn precise_mode_is_off_by_default_and_its_flags_need_it() {
+        assert_eq!(parse(&[]).unwrap().precise, None);
+        let on = parse(&["--precise"]).unwrap();
+        assert_eq!(
+            on.precise,
+            Some(Precise {
+                model: DEFAULT_PRECISE_MODEL.to_string(),
+                max_images_per_day: DEFAULT_PRECISE_MAX_PER_DAY,
+                moderation_low: false,
+            })
+        );
+        let set = parse(&[
+            "--precise",
+            "--precise-model=gpt-image-2-2026-04-21",
+            "--precise-max-images-per-day",
+            "0",
+            "--precise-moderation",
+            "low",
+        ])
+        .unwrap()
+        .precise
+        .unwrap();
+        assert_eq!(set.model, "gpt-image-2-2026-04-21");
+        assert_eq!(set.max_images_per_day, 0);
+        assert!(set.moderation_low);
+
+        assert!(err(&["--precise-model", "gpt-image-2"]).contains("only valid with --precise"));
+        assert!(err(&["--precise", "--precise-model", "dall-e-3"]).contains("must be one of"));
+        assert!(err(&["--precise", "--precise-moderation", "off"]).contains("low or auto"));
+        assert!(err(&["--precise", "--precise-max-images-per-day", "-1"]).contains("whole number"));
+        assert!(err(&["--precise=yes"]).contains("takes no value"));
+    }
+
+    #[test]
+    fn the_key_commands_are_modes_of_their_own() {
+        assert_eq!(parse(&["--set-api-key"]).unwrap().mode, Mode::SetApiKey);
+        assert_eq!(
+            parse(&["--remove-api-key"]).unwrap().mode,
+            Mode::RemoveApiKey
+        );
+        assert!(err(&["--set-api-key", "--doctor"]).contains("cannot be combined"));
+        assert!(err(&["--set-api-key", "--remove-api-key"]).contains("cannot be combined"));
+        assert!(err(&["--set-api-key=sk-123"]).contains("takes no value"));
     }
 
     #[test]

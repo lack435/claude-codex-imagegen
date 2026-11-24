@@ -40,6 +40,11 @@ pub const STOP_AND_ESCALATE_CODES: &[&str] = &[
     "TIMEOUT",
     "STORE_CORRUPT",
     "INTERNAL_ERROR",
+    "API_KEY_MISSING",
+    "API_KEY_REJECTED",
+    "API_QUOTA",
+    "API_ACCESS",
+    "PRECISE_CAP_REACHED",
 ];
 
 /// Codes the agent corrects by calling again differently, exactly as the design's table.
@@ -619,6 +624,176 @@ pub fn quote_untrusted(text: &str, max_chars: usize) -> String {
         .unwrap_or_else(|_| "\"\"".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Precise mode (docs/design.md, "Precise mode")
+// ---------------------------------------------------------------------------
+
+/// How much of an API error message a failure quotes.
+const MAX_API_MESSAGE_CHARS: usize = 500;
+
+/// The OpenAI API's own error message, for a failure's detail: quoted and marked untrusted. A
+/// message that quotes anything key-like is withheld: the 401 message echoes part of the key
+/// [verified: live], and no other is known to, but none is worth the risk.
+fn api_message_detail(status: u16, message: Option<&str>) -> String {
+    match message {
+        Some(message) if message.contains("sk-") || message.contains("****") => {
+            format!(
+                "HTTP {status}; the API's message was withheld because it quotes part of a key."
+            )
+        }
+        Some(message) => format!(
+            "HTTP {status}; the API's message (untrusted, quoted): {}",
+            quote_untrusted(message, MAX_API_MESSAGE_CHARS)
+        ),
+        None => format!("HTTP {status}; the API sent no message."),
+    }
+}
+
+const SET_KEY_COMMAND: &str = "codex-imagegen.exe --set-api-key";
+
+/// No key is stored for precise mode.
+pub fn api_key_missing() -> Failure {
+    Failure::new(
+        "API_KEY_MISSING",
+        "Precise mode needs an OpenAI API key, and none is stored.",
+        format!(
+            "The user stores the key once, in a terminal (not through Claude): {SET_KEY_COMMAND}. \
+             It prompts with typing hidden and keeps the key in Windows Credential Manager. Never \
+             ask the user to paste the key into this conversation."
+        ),
+    )
+}
+
+/// The stored key could not be read from Credential Manager.
+pub fn api_key_unreadable(detail: impl Into<String>) -> Failure {
+    api_key_missing().with_detail(detail)
+}
+
+/// 401: the API refused the key. Its message is not quoted: it echoes part of the key
+/// ("Incorrect API key provided: sk-proj****abcd") [verified: live, 2026-11-23], and says nothing
+/// else of use.
+pub fn api_key_rejected(status: u16) -> Failure {
+    Failure::new(
+        "API_KEY_REJECTED",
+        "The OpenAI API refused the stored API key (it is wrong, revoked or expired). Nothing was \
+         billed.",
+        format!(
+            "The user replaces the key in a terminal: {SET_KEY_COMMAND}. Never ask the user to \
+             paste the key into this conversation."
+        ),
+    )
+    .with_detail(format!("HTTP {status}"))
+}
+
+/// 429 with `insufficient_quota`: the API account or project has no credit or hit its limit.
+pub fn api_quota(status: u16, message: Option<&str>) -> Failure {
+    Failure::new(
+        "API_QUOTA",
+        "The OpenAI API account behind the key is out of credit, or its project hit its spend \
+         limit.",
+        "The user checks billing and the project's limits on the OpenAI platform.",
+    )
+    .with_detail(api_message_detail(status, message))
+}
+
+/// 403: the key may not use the model or endpoint, for example before organization verification.
+pub fn api_access(status: u16, message: Option<&str>) -> Failure {
+    Failure::new(
+        "API_ACCESS",
+        "The OpenAI API refused access to the image model for this key (403).",
+        "The user checks the key's permissions (a restricted key needs image generation), and \
+         whether the organization must complete API Organization Verification for GPT image \
+         models. The API's message below says which.",
+    )
+    .with_detail(api_message_detail(status, message))
+}
+
+/// Other 429s: a rate limit to wait out.
+pub fn api_rate_limited(status: u16, message: Option<&str>) -> Failure {
+    Failure::new(
+        "RATE_LIMITED",
+        "The OpenAI API rate-limited the request.",
+        "Wait a minute and retry once. If it persists, tell the user.",
+    )
+    .with_detail(api_message_detail(status, message))
+}
+
+/// The API's moderation blocked the prompt or the image.
+pub fn api_content_refused(status: u16, stage: Option<&str>, message: Option<&str>) -> Failure {
+    let stage = match stage {
+        Some("input") => " It refused the prompt.",
+        Some("output") => " It refused the generated image.",
+        _ => "",
+    };
+    Failure::new(
+        "CONTENT_REFUSED",
+        format!("The OpenAI API's moderation blocked the request.{stage}"),
+        "Tell the user the request was refused by image moderation; they may want to rephrase it.",
+    )
+    .with_detail(api_message_detail(status, message))
+}
+
+/// What a failure after the request was sent says about billing: the API may have made, and
+/// billed, an image this call never received, so the agent must not retry on its own.
+const MAY_HAVE_BILLED: &str = "The request was sent, so the API may have made and billed an image \
+     that never arrived. Do not retry on your own: tell the user, who can check the usage on the \
+     OpenAI platform and decide whether to try again.";
+
+/// 5xx, or no HTTP response at all, after the request was sent.
+pub fn api_upstream(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "UPSTREAM_ERROR",
+        "The OpenAI API could not be reached, or failed on its side.",
+        MAY_HAVE_BILLED,
+    )
+    .with_detail(detail)
+}
+
+/// The call's limit passed while waiting for the API's answer.
+pub fn api_timeout(secs: u64) -> Failure {
+    Failure::new(
+        "TIMEOUT",
+        format!(
+            "The OpenAI API did not answer within the call's {secs}-second limit \
+             (--timeout-seconds)."
+        ),
+        MAY_HAVE_BILLED,
+    )
+}
+
+/// 400 other than moderation: the API refused the arguments (for example an option the model does
+/// not take).
+pub fn api_refused_request(status: u16, message: Option<&str>) -> Failure {
+    bad_request(
+        "The OpenAI API refused the request's arguments. Its message below says which; a size, \
+         quality or background the model does not support is the usual cause.",
+    )
+    .with_detail(api_message_detail(status, message))
+}
+
+/// A 200 that held no image that could be decoded.
+pub fn api_no_image(detail: impl Into<String>) -> Failure {
+    Failure::new(
+        "IMAGE_FAILED",
+        "The OpenAI API answered, but its response held no image that could be read.",
+        "Retry once. If it fails again, tell the user.",
+    )
+    .with_detail(detail)
+}
+
+/// The daily cap would be passed. Nothing was sent.
+pub fn precise_cap_reached(cap: u32, used: u32, asked: u32) -> Failure {
+    Failure::new(
+        "PRECISE_CAP_REACHED",
+        format!(
+            "Precise mode's daily cap is {cap} images (UTC day), {used} were already requested \
+             today, and this call asked for {asked}. Nothing was sent or billed."
+        ),
+        "Tell the user. The cap resets at 00:00 UTC; the user can raise it with the server flag \
+         --precise-max-images-per-day.",
+    )
+}
+
 /// The image tool hit the `image_gen` usage limit: an item-level `failure` of type
 /// `usageLimitExceeded`. `resets` is the reset time already formatted, `None` when Codex gave none.
 pub fn image_quota_exhausted(limit_id: &str, resets: Option<&str>) -> Failure {
@@ -810,6 +985,18 @@ mod tests {
     /// Every constructor, so the code tables can be checked against what is actually raised.
     fn every_constructor() -> Vec<Failure> {
         vec![
+            api_key_missing(),
+            api_key_unreadable("os error 5"),
+            api_key_rejected(401),
+            api_quota(429, None),
+            api_access(403, Some("verify")),
+            api_rate_limited(429, None),
+            api_content_refused(400, Some("input"), Some("blocked")),
+            api_upstream("HTTP 502"),
+            api_timeout(300),
+            api_refused_request(400, Some("size")),
+            api_no_image("empty"),
+            precise_cap_reached(20, 19, 2),
             cli_not_found(None, &["PATH".to_string()]),
             cli_not_found(
                 Some(r"C:\nope\codex.exe"),
@@ -863,7 +1050,8 @@ mod tests {
         // deliberate edit in two places.
         let stop = "CLI_NOT_FOUND SPAWN_FAILED APP_SERVER_FAILED NOT_AUTHENTICATED AUTH_EXPIRED \
                     IMAGEGEN_UNAVAILABLE MODEL_UNAVAILABLE RATE_LIMITED UPSTREAM_ERROR \
-                    CONTENT_REFUSED IMAGE_FAILED NO_IMAGE TIMEOUT STORE_CORRUPT INTERNAL_ERROR";
+                    CONTENT_REFUSED IMAGE_FAILED NO_IMAGE TIMEOUT STORE_CORRUPT INTERNAL_ERROR \
+                    API_KEY_MISSING API_KEY_REJECTED API_QUOTA API_ACCESS PRECISE_CAP_REACHED";
         let short = "BAD_REQUEST SESSION_EXISTS SESSION_NOT_FOUND SESSION_NOT_RESUMABLE \
                      SESSION_BUSY SESSION_OPEN_ELSEWHERE TOO_MANY_RUNNING CANCELLED \
                      SERVER_SHUTTING_DOWN";
