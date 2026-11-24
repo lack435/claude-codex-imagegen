@@ -1167,7 +1167,10 @@ cancel is checked one last time, the images are counted against the daily cap, a
 **Cancel and timeout.** A cancel stops the call up to the moment the request is sent. Once it is sent, the call
 waits for the answer, bounded by `--timeout-seconds`, and keeps any image that comes back, since it is billed
 either way [decided: proportionate; aborting a synchronous WinHTTP call from another thread was not worth its
-machinery]. The response is capped at 64 MiB.
+machinery]. Each WinHTTP step gets the remaining budget, and the response is read only until the deadline. The
+response is capped at 64 MiB. A failure after the send (a timeout, a 5xx, a broken connection) may follow an
+image the API made and billed, so its remediation tells the agent not to retry on its own but to let the user
+check the usage first [decided].
 
 ### The API key
 
@@ -1220,8 +1223,9 @@ A request with a made-up key to `GET /v1/models` came back 401 through this path
 - **A daily cap**, `--precise-max-images-per-day` (default 20; 0 = no cap). It counts images, per UTC day,
   across every project under the state base, in `<state base>\precise-usage.json`, under
   `precise-usage.lock`. A request's `n` counts when it is sent, whether or not it then succeeds [decided]. A
-  call that would pass the cap is refused before anything is sent: `PRECISE_CAP_REACHED`. A count that cannot
-  be saved fails closed.
+  call that would pass the cap is refused before anything is sent: `PRECISE_CAP_REACHED`. A count file that is
+  missing is zero; one that cannot be read or parsed, or saved, fails closed (`INTERNAL_ERROR`, nothing sent)
+  and is left as it is. A stored day later than today (the clock went back) keeps counting into that day.
 - **On OpenAI's side** (README): a project just for this key with a monthly spend limit and "enforce a hard
   limit" on, and a restricted key if image generation can be its only permission [assumed: P5].
 - **Every result** says it was billed to the API key, with its tokens.
@@ -1241,7 +1245,8 @@ The failure contract is unchanged. New codes, all stop-and-escalate:
 Existing codes cover the rest: `RATE_LIMITED` (other 429s), `CONTENT_REFUSED` (`moderation_blocked`, with its
 stage) [assumed: P4], `BAD_REQUEST` (other 4xx: the API refused the arguments), `UPSTREAM_ERROR` (5xx, or no
 response), `TIMEOUT`, and `IMAGE_FAILED` (a 200 without a decodable image). The API's message is quoted,
-bounded and marked untrusted, except on a 401.
+bounded and marked untrusted, except on a 401, and except a message holding `sk-` or `****`, which is withheld
+as possibly quoting part of a key. No precise failure points the agent at another tool.
 
 ### Sessions and cleanup
 
@@ -1254,7 +1259,9 @@ an empty `thread_id` and `codex_home`, and its `model` is the image model.
 - `status` marks them `(precise)`, and adds a line: on or off, the model, the key (last four characters, or "no
   API key stored"), and today's count against the cap.
 - An older build reading an api record ignores `engine`. Its cleanup skips the record whole, because the empty
-  `thread_id` is not a UUID, which is safe; its `refine` fails at `thread/resume`, spending nothing.
+  `thread_id` is not a UUID, which is safe; its `refine` fails at `thread/resume`, spending nothing. When it
+  rewrites the store it drops `engine` from every record, so every read restores it: a record with neither a
+  thread nor a Codex home is an api record, since a Codex record always has both [verified: unit test].
 
 ### Verification
 

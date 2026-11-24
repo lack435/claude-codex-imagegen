@@ -31,7 +31,8 @@ pub struct Request<'a> {
     pub path: &'a str,
     /// A JSON body, sent with `Content-Type: application/json`.
     pub body: Option<&'a [u8]>,
-    /// The whole exchange's limit.
+    /// The exchange's limit: each WinHTTP step (resolve, connect, send, receive) gets it, and the
+    /// response is read only while it lasts, so a slow trickle of data cannot run past it by much.
     pub timeout: Duration,
 }
 
@@ -189,10 +190,12 @@ fn set_u32(handle: &Handle, option: u32, value: u32) -> i32 {
 }
 
 /// The request headers, as UTF-16 for WinHTTP. The key goes here and nowhere else; it is encoded
-/// straight into this buffer, which the caller overwrites after the send, so no other copy of it
-/// is made.
+/// straight into this buffer, sized up front so it never reallocates and leaves a partial copy
+/// behind, and the caller overwrites it after the send. WinHTTP keeps its own copy, which this
+/// code cannot reach.
 fn headers(key: &Secret, json: bool) -> Vec<u16> {
-    let mut text: Vec<u16> = "Authorization: Bearer ".encode_utf16().collect();
+    let mut text: Vec<u16> = Vec::with_capacity(64 + key.expose().len());
+    text.extend("Authorization: Bearer ".encode_utf16());
     text.extend(key.expose().encode_utf16());
     text.extend("\r\n".encode_utf16());
     if json {
@@ -202,6 +205,7 @@ fn headers(key: &Secret, json: bool) -> Vec<u16> {
 }
 
 fn send(key: &Secret, request: &Request<'_>) -> Result<Response, TransportError> {
+    let deadline = std::time::Instant::now() + request.timeout;
     let agent = wide(USER_AGENT);
     // SAFETY: NUL-terminated strings that outlive the call; null proxy names as the access type
     // requires.
@@ -324,6 +328,9 @@ fn send(key: &Secret, request: &Request<'_>) -> Result<Response, TransportError>
 
     let mut body = Vec::new();
     loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(TransportError::TimedOut);
+        }
         let mut available = 0u32;
         // SAFETY: a valid request handle and out pointer.
         check(

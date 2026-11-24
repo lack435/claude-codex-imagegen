@@ -116,11 +116,16 @@ fn set_api_key() -> i32 {
         Ok(line) => line,
         Err(why) => return fail(&why),
     };
-    let key = match credential::Secret::new(&line) {
+    let mut line = line;
+    let key = credential::Secret::new(&line);
+    // The typed line held the key: overwrite it before it is freed.
+    // SAFETY: zero bytes keep the string valid UTF-8.
+    unsafe { line.as_bytes_mut().fill(0) };
+    drop(line);
+    let key = match key {
         Ok(key) => key,
         Err(why) => return fail(&format!("not stored: {why}")),
     };
-    drop(line);
     eprintln!("checking the key with OpenAI (a free call that lists models)...");
     let check = https::Transport::send(
         &https::WinHttp,

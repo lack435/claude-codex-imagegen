@@ -575,6 +575,7 @@ impl Store {
             file.last_cleanup = value
                 .get("last_cleanup")
                 .and_then(|c| LastCleanup::deserialize(c).ok());
+            recognise_precise(&mut file);
         }
         Tolerant {
             file,
@@ -611,8 +612,9 @@ impl Store {
             path: self.path(),
             detail,
         };
-        let file: StoreFile =
+        let mut file: StoreFile =
             serde_json::from_slice(without_bom(bytes)).map_err(|e| corrupt(e.to_string()))?;
+        recognise_precise(&mut file);
         if file.version != STORE_VERSION {
             return Err(corrupt(format!(
                 "it is store version {}, and this build reads version {STORE_VERSION}; a newer \
@@ -657,6 +659,18 @@ impl Tolerant {
         Self {
             file,
             problem: None,
+        }
+    }
+}
+
+/// A build older than precise mode does not know `engine`, and drops it from every record when it
+/// rewrites the store. A precise record is still recognisable: only it has neither a thread nor a
+/// Codex home (a Codex record always has both). Restored here, on every read, so such a session is
+/// still edited by precise mode and expired by cleanup.
+fn recognise_precise(file: &mut StoreFile) {
+    for record in file.sessions.values_mut() {
+        if record.thread_id.is_empty() && record.codex_home.as_os_str().is_empty() {
+            record.engine = Engine::Api;
         }
     }
 }
@@ -969,6 +983,31 @@ mod tests {
         let file = Store::new(&dir).read().unwrap();
         assert_eq!(file.sessions.len(), 30);
         assert_eq!(listing(&dir), vec!["sessions.json", "sessions.lock"]);
+    }
+
+    #[test]
+    fn a_precise_record_an_older_build_rewrote_without_its_engine_is_still_precise() {
+        let dir = temp_dir("session-engine");
+        let store = Store::new(&dir);
+        // As an older build writes it: no `engine` field at all.
+        let json = r#"{"version": 1, "sessions": {
+            "pic": {"name": "pic", "thread_id": "", "codex_home": "", "model": "gpt-image-2",
+                    "created": 1, "updated": 1, "turns": 1, "last_saved_path": null,
+                    "last_output_path": null, "last_output_bytes": null, "output_dir": "C:\\o",
+                    "next_version": 2, "outputs": []},
+            "fox": {"name": "fox", "thread_id": "019a0000-0000-7000-8000-00000000cafe",
+                    "codex_home": "C:\\h", "model": "gpt-6-astra", "created": 1, "updated": 1,
+                    "turns": 1, "last_saved_path": null, "last_output_path": null,
+                    "last_output_bytes": null, "output_dir": "C:\\o", "next_version": 2,
+                    "outputs": []}}}"#;
+        fs::write(store.path(), json).unwrap();
+        let file = store.read().unwrap();
+        assert_eq!(file.get("pic").unwrap().engine, Engine::Api);
+        assert_eq!(file.get("fox").unwrap().engine, Engine::Codex);
+        assert_eq!(
+            store.read_tolerant().file.get("pic").unwrap().engine,
+            Engine::Api
+        );
     }
 
     #[test]

@@ -631,9 +631,16 @@ pub fn quote_untrusted(text: &str, max_chars: usize) -> String {
 /// How much of an API error message a failure quotes.
 const MAX_API_MESSAGE_CHARS: usize = 500;
 
-/// The OpenAI API's own error message, for a failure's detail: quoted and marked untrusted.
+/// The OpenAI API's own error message, for a failure's detail: quoted and marked untrusted. A
+/// message that quotes anything key-like is withheld: the 401 message echoes part of the key
+/// [verified: live], and no other is known to, but none is worth the risk.
 fn api_message_detail(status: u16, message: Option<&str>) -> String {
     match message {
+        Some(message) if message.contains("sk-") || message.contains("****") => {
+            format!(
+                "HTTP {status}; the API's message was withheld because it quotes part of a key."
+            )
+        }
         Some(message) => format!(
             "HTTP {status}; the API's message (untrusted, quoted): {}",
             quote_untrusted(message, MAX_API_MESSAGE_CHARS)
@@ -684,9 +691,7 @@ pub fn api_quota(status: u16, message: Option<&str>) -> Failure {
         "API_QUOTA",
         "The OpenAI API account behind the key is out of credit, or its project hit its spend \
          limit.",
-        "The user checks billing and the project's limits on the OpenAI platform. Precise mode \
-         is billed to the API key, not to the ChatGPT plan, so codex_imagegen_generate still \
-         works meanwhile, without the precise options.",
+        "The user checks billing and the project's limits on the OpenAI platform.",
     )
     .with_detail(api_message_detail(status, message))
 }
@@ -728,14 +733,32 @@ pub fn api_content_refused(status: u16, stage: Option<&str>, message: Option<&st
     .with_detail(api_message_detail(status, message))
 }
 
-/// 5xx, or no HTTP response at all.
+/// What a failure after the request was sent says about billing: the API may have made, and
+/// billed, an image this call never received, so the agent must not retry on its own.
+const MAY_HAVE_BILLED: &str = "The request was sent, so the API may have made and billed an image \
+     that never arrived. Do not retry on your own: tell the user, who can check the usage on the \
+     OpenAI platform and decide whether to try again.";
+
+/// 5xx, or no HTTP response at all, after the request was sent.
 pub fn api_upstream(detail: impl Into<String>) -> Failure {
     Failure::new(
         "UPSTREAM_ERROR",
         "The OpenAI API could not be reached, or failed on its side.",
-        "Retry once in a minute. If it fails again, tell the user; the API may be degraded.",
+        MAY_HAVE_BILLED,
     )
     .with_detail(detail)
+}
+
+/// The call's limit passed while waiting for the API's answer.
+pub fn api_timeout(secs: u64) -> Failure {
+    Failure::new(
+        "TIMEOUT",
+        format!(
+            "The OpenAI API did not answer within the call's {secs}-second limit \
+             (--timeout-seconds)."
+        ),
+        MAY_HAVE_BILLED,
+    )
 }
 
 /// 400 other than moderation: the API refused the arguments (for example an option the model does
@@ -970,6 +993,7 @@ mod tests {
             api_rate_limited(429, None),
             api_content_refused(400, Some("input"), Some("blocked")),
             api_upstream("HTTP 502"),
+            api_timeout(300),
             api_refused_request(400, Some("size")),
             api_no_image("empty"),
             precise_cap_reached(20, 19, 2),

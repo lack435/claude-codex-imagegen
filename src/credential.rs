@@ -153,7 +153,20 @@ pub fn read(target: &str) -> Result<Option<Secret>, String> {
         }
         return Err(format!("reading the credential {target} failed ({error})"));
     }
-    // SAFETY: on success `credential` points at a CREDENTIALW whose blob holds
+    // SAFETY: on success `credential` points at a valid CREDENTIALW until CredFree.
+    let (blob_ptr, blob_len) = unsafe {
+        (
+            (*credential).credential_blob,
+            (*credential).credential_blob_size as usize,
+        )
+    };
+    if blob_ptr.is_null() || blob_len == 0 {
+        // An entry made by hand with no password. Not a key.
+        // SAFETY: the buffer CredReadW returned, freed once.
+        unsafe { CredFree(credential as *mut c_void) };
+        return Err(format!("the credential {target} is empty"));
+    }
+    // SAFETY: on success `credential` points at a CREDENTIALW whose non-null blob holds
     // `credential_blob_size` bytes; both live until CredFree.
     let result = unsafe {
         let blob = std::slice::from_raw_parts(

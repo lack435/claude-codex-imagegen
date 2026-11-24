@@ -353,29 +353,45 @@ pub fn today() -> i64 {
     session::now_unix().div_euclid(86_400)
 }
 
-fn read_count(state_base: &Path) -> DayCount {
-    std::fs::read(state_base.join(USAGE_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The stored count, strictly: a missing file is no images yet, and anything else that cannot be
+/// read or parsed is an error, so the cap never fails open.
+fn read_count(state_base: &Path) -> Result<DayCount, String> {
+    let path = state_base.join(USAGE_FILE);
+    match output::retry_transient(|| std::fs::read(&path)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{} cannot be parsed ({e})", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DayCount::default()),
+        Err(e) => Err(format!("{} cannot be read ({e})", path.display())),
+    }
 }
 
-/// Images requested so far on `day`, for `status`.
-pub fn used_on(state_base: &Path, day: i64) -> u32 {
-    let count = read_count(state_base);
-    if count.day == day {
-        count.images
+/// The day a count belongs to and the images in it, as of `today`. A stored day later than today
+/// (the clock went back) keeps counting into that day rather than starting again.
+fn current(count: &DayCount, today: i64) -> (i64, u32) {
+    if count.day >= today {
+        (count.day, count.images)
     } else {
-        0
+        (today, 0)
     }
+}
+
+/// Images requested so far today, for `status`; 0 when the count cannot be read.
+pub fn used_on(state_base: &Path, day: i64) -> u32 {
+    read_count(state_base).map_or(0, |count| current(&count, day).1)
 }
 
 /// Count `asked` images against `day`'s cap, under a lock across processes, before anything is
 /// sent. A request counts whether or not it then succeeds [decided]. With `cap` 0 it is counted
-/// and never refused. A count that cannot be kept fails closed.
+/// and never refused. A count that cannot be read or kept fails closed.
 pub fn reserve(state_base: &Path, cap: u32, asked: u32, day: i64) -> Result<u32, Failure> {
     let _lock = session::lock_file(&state_base.join(USAGE_LOCK)).map_err(|e| e.failure())?;
-    let used = used_on(state_base, day);
+    let stored = read_count(state_base).map_err(|why| {
+        errors::internal_error(format!(
+            "precise mode's daily image count: {why}, so nothing was sent. Moving the file aside \
+             starts the count again"
+        ))
+    })?;
+    let (day, used) = current(&stored, day);
     if cap > 0 && used.saturating_add(asked) > cap {
         return Err(errors::precise_cap_reached(cap, used, asked));
     }
@@ -472,7 +488,7 @@ pub fn run(call: &Call<'_>) -> Result<Value, Failure> {
         )
         .map_err(|e| match e {
             TransportError::TimedOut => {
-                errors::timeout(call.deadline.duration_since(call.started).as_secs())
+                errors::api_timeout(call.deadline.duration_since(call.started).as_secs())
             }
             TransportError::Failed(why) => {
                 errors::api_upstream(format!("no response from {}: {why}", https::API_HOST))
@@ -1224,5 +1240,18 @@ mod tests {
         assert_eq!(reserve(&dir, 5, 4, 101).unwrap(), 4);
         // 0 is no cap: counted, never refused.
         assert_eq!(reserve(&dir, 0, 4, 101).unwrap(), 8);
+        // A clock that goes back keeps counting into the later day.
+        assert_eq!(reserve(&dir, 10, 1, 100).unwrap(), 9);
+        // A count that cannot be parsed fails closed, and is left as it is.
+        std::fs::write(dir.join(USAGE_FILE), b"{trunc").unwrap();
+        let broken = reserve(&dir, 5, 1, 101).unwrap_err();
+        assert_eq!(broken.code, "INTERNAL_ERROR");
+        assert!(
+            broken.summary.contains("nothing was sent"),
+            "{}",
+            broken.summary
+        );
+        assert_eq!(std::fs::read(dir.join(USAGE_FILE)).unwrap(), b"{trunc");
+        assert_eq!(used_on(&dir, 101), 0);
     }
 }
