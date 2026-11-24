@@ -35,7 +35,8 @@ and every `savedPath` named the dedicated home, and nothing of the thread was in
 "check that it works" list for Claude Code, the tools, options, the dedicated home, output files and cleanup,
 troubleshooting, and the IJG notice. The tag-driven release workflow (see Build and CI) published v0.1.0 on
 2026-09-26: the downloaded exe matched its published SHA-256, reported `0.1.0 (<commit>)`, and passed
-`--doctor`.
+`--doctor`. After it, `refine` gained `from_version`, to edit an earlier version (see [Refine](#refine)).
+Unit tests cover it; no paid run has exercised it yet.
 
 Claims carry one of three tags:
 
@@ -60,7 +61,9 @@ Out of scope for v1:
 - an OpenAI API-key mode
 - choosing the image model, size or quality
 - several variants per call
-- branching from an earlier version
+- branching into parallel histories. `refine`'s `from_version` edits an earlier version, but the new image
+  joins the one linear version list (see [Refine](#refine))
+- redoing the first prompt inside its session; a new session does the same
 - a cancel tool (see [Progress and cancellation](#progress-and-cancellation))
 - metrics
 - platforms other than Windows
@@ -235,12 +238,13 @@ Starts a new session and generates one image.
 
 ### `codex_imagegen_refine`
 
-Continues a session. It edits the session's latest image and returns the new version.
+Continues a session. It edits the session's latest image, or an earlier version, and returns the new version.
 
 | arg | type | notes |
 | --- | --- | --- |
 | `session` | string, required | Must exist, or `SESSION_NOT_FOUND`. |
 | `feedback` | string, required | Passed to the image tool verbatim as the edit prompt. |
+| `from_version` | integer ≥ 1, optional | Edit this published version instead of the latest image: undo a step and retry it with new feedback. The new image still gets the next free version number and becomes the latest. See [Refine](#refine). |
 | `reference_images` | string[], optional | Up to 4 more images, validated like generate's. The first slot is the edit target. |
 | `output_dir` | string, optional | Defaults to the session's recorded output directory. A folder given here applies to this call only; the record keeps the session's own [decided]. |
 
@@ -371,6 +375,15 @@ thread id, no session records it, and it stays loaded in the child until the chi
    neither does: `SESSION_NOT_RESUMABLE`, with the remediation "start a new session with
    `generate(reference_images=[<a surviving copy>])`", naming the newest published file that still has its
    recorded size, or saying that none survives. Nothing is spent.
+
+   With `from_version` N, the target is instead version N's published file, from `outputs`, while it still
+   has its recorded size. Codex's own copy of an earlier version is not recorded, so there is no fallback. A
+   version the session never published gets `BAD_REQUEST` listing the ones it has; a file that is gone or
+   changed gets `BAD_REQUEST` naming it. Nothing is spent either way. The thread itself is not rewound: the
+   turns after version N stay in its history [decided]. The image tool does not see that history: its call
+   takes only `prompt`, `referenced_image_paths` and `num_last_images_to_include` [verified], and the
+   developer instructions forbid the last, so the call gets the feedback and the edit target alone. The new
+   image is numbered and recorded like any other, so it becomes the latest, and earlier files are untouched.
 2. **Check the Codex home.** A record whose `codex_home` is not the child's `codexHome` gets
    `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare exactly, as cleanup compares
    them, apart from a `\\?\` prefix and a trailing separator: both sides come from Codex's handshake, which
@@ -1246,7 +1259,9 @@ tested against a scripted fake child that replays message sequences for these ca
   store version refused; leases excluding each other across handles whatever the case; the store lock's wait
 - refine: the exact `thread/resume` parameters and the tagged edit input; the recorded output folder, and an
   `output_dir` argument for one call; the edit target falling back to the published copy, versions carrying on
-  past a taken name; no copy left (nothing sent, a surviving older version named); a foreign `codex_home`;
+  past a taken name; no copy left (nothing sent, a surviving older version named); `from_version` editing
+  that version's published file and numbering the result next, and refused before Codex starts for a version
+  never published or a file deleted or changed; a foreign `codex_home`;
   "is closing" retried; "active writer" waited out, and ending in `SESSION_OPEN_ELSEWHERE`; "no rollout found"
   and another refusal (unsubscribed); a resume abandoned on a cancel or a timeout, then answered late, followed by
   `thread/unsubscribe`; `contextWindowExceeded`; a revised prompt that is not the feedback; a turn with no image;

@@ -715,15 +715,24 @@ impl App {
         if let Err(failure) = output::precheck(&dir) {
             return mcp::failure_result(&failure);
         }
-        let Some(edit_target) = edit_target(&record) else {
-            return mcp::failure_result(&errors::session_not_resumable(
-                &record.name,
-                "Neither copy of the session's latest image still exists as it was saved (Codex's \
-                 own copy and the published file are both gone, or were changed), so there is \
-                 nothing to edit. Nothing was spent.",
-                surviving_copy(&record).as_deref(),
-            ));
-        };
+        let edit_target =
+            match request.from_version {
+                // Rewind: edit an earlier version's published file instead of the latest image.
+                Some(version) => match version_target(&record, version) {
+                    Ok(target) => target,
+                    Err(failure) => return mcp::failure_result(&failure),
+                },
+                None => match edit_target(&record) {
+                    Some(target) => target,
+                    None => return mcp::failure_result(&errors::session_not_resumable(
+                        &record.name,
+                        "Neither copy of the session's latest image still exists as it was saved \
+                         (Codex's own copy and the published file are both gone, or were \
+                         changed), so there is nothing to edit. Nothing was spent.",
+                        surviving_copy(&record).as_deref(),
+                    )),
+                },
+            };
         let progress = ctx.progress();
         let child = match self.ensure_child(Some(ctx.cancel()), Some(&progress), Some(budget)) {
             Ok(child) => child,
@@ -1027,7 +1036,8 @@ impl ToolHost for App {
             "codex-imagegen makes images with the user's local Codex CLI, billed to their \
              ChatGPT plan.\n\n\
              - {GENERATE}: start a new session and make one image from a prompt.\n\
-             - {REFINE}: edit the latest image of a session; each call returns a new version.\n\
+             - {REFINE}: edit the latest image of a session, or an earlier version with \
+             from_version; each call returns a new version.\n\
              - {STATUS}: check the setup (Codex, login, plan, model, usage) without generating \
              anything or using quota.\n\n\
              Each image comes back as a 1024px preview plus the absolute path of the \
@@ -1098,8 +1108,9 @@ impl ToolHost for App {
                 "description": format!(
                     "Edit the latest image of an existing session with the user's local Codex \
                      CLI and return the new version: a 1024px preview image plus the absolute \
-                     path of the full-resolution PNG. Takes about a minute. {scratch} \
-                     {failure_rule}"
+                     path of the full-resolution PNG. To undo a step and retry it, pass \
+                     from_version to edit that earlier version instead. Takes about a minute. \
+                     {scratch} {failure_rule}"
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1114,9 +1125,20 @@ impl ToolHost for App {
                             "description": "The change to make. Passed to the image tool \
                                             verbatim as the edit request.",
                         },
+                        "from_version": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Edit this earlier version of the session instead \
+                                            of the latest image, for example to retry a step \
+                                            that went wrong with better feedback. The new \
+                                            image still gets the next version number, and \
+                                            later refines build on it. Omit to edit the \
+                                            latest image.",
+                        },
                         "reference_images": reference_images(
                             4,
-                            " The session's latest image is always the edit target."
+                            " The edit target (the latest image, or from_version) always comes \
+                             first."
                         ),
                         "output_dir": {
                             "type": "string",
@@ -1362,6 +1384,40 @@ fn edit_target(record: &Record) -> Option<PathBuf> {
         .cloned()
 }
 
+/// The edit target of a refine with `from_version`: that version's published file, while it is
+/// still at its recorded size, checked as the latest image's copies are. Codex's own copy of an
+/// earlier version is not recorded, so the published file is the only one. Nothing is spent on a
+/// refusal: an unknown version lists the ones the session has.
+fn version_target(record: &Record, version: u32) -> Result<PathBuf, Failure> {
+    let Some(output) = record.outputs.iter().rev().find(|o| o.version == version) else {
+        let versions: Vec<String> = record
+            .outputs
+            .iter()
+            .map(|o| o.version.to_string())
+            .collect();
+        let known = if versions.is_empty() {
+            "none".to_string()
+        } else {
+            versions.join(", ")
+        };
+        return Err(errors::bad_request(format!(
+            "Session '{}' has no published version {version} (its published versions: {known}). \
+             Pass one of those as 'from_version', or omit it to edit the latest image.",
+            record.name
+        )));
+    };
+    if !has_size(&output.path, Some(output.bytes)) {
+        return Err(errors::bad_request(format!(
+            "Version {version} of session '{}' ({}) no longer exists as it was published: it was \
+             deleted, moved or changed, so it cannot be edited. Choose another version, or omit \
+             'from_version' to edit the latest image.",
+            record.name,
+            output.path.display()
+        )));
+    }
+    Ok(output.path.clone())
+}
+
 /// A copy of the session's images that still exists, for a remediation that starts a new session
 /// from it: the edit target, else the newest published file still at its recorded size.
 fn surviving_copy(record: &Record) -> Option<PathBuf> {
@@ -1493,7 +1549,13 @@ const REFINE_SPEC: ToolSpec = ToolSpec {
     text_key: "feedback",
     session_required: true,
     max_references: 4,
-    keys: &["session", "feedback", "reference_images", "output_dir"],
+    keys: &[
+        "session",
+        "feedback",
+        "from_version",
+        "reference_images",
+        "output_dir",
+    ],
 };
 
 /// A validated generate or refine call.
@@ -1504,6 +1566,8 @@ struct ImageRequest {
     /// Absolute, and each checked to start with an image signature.
     reference_images: Vec<PathBuf>,
     output_dir: Option<String>,
+    /// refine only: the version to edit instead of the latest image.
+    from_version: Option<u32>,
 }
 
 /// Check a call's arguments strictly, before anything is started or spent. The schema says the
@@ -1599,11 +1663,24 @@ fn validate(spec: &ToolSpec, args: &Value, base: &Path) -> Result<ImageRequest, 
         Some(_) => return Err(errors::bad_request("'output_dir' must be a string.")),
     };
 
+    // Only refine's keys admit it; check_keys has refused it for generate.
+    let from_version =
+        match present("from_version") {
+            None => None,
+            Some(value) => match value.as_u64().and_then(|v| u32::try_from(v).ok()) {
+                Some(version) if version >= 1 => Some(version),
+                _ => return Err(errors::bad_request(
+                    "'from_version' must be a whole number, 1 or more: a version of the session.",
+                )),
+            },
+        };
+
     Ok(ImageRequest {
         text,
         session,
         reference_images,
         output_dir,
+        from_version,
     })
 }
 
@@ -1874,6 +1951,15 @@ mod tests {
         let refine = &tools[1]["inputSchema"];
         assert_eq!(refine["required"], json!(["session", "feedback"]));
         assert_eq!(refine["properties"]["reference_images"]["maxItems"], 4);
+        assert_eq!(
+            refine["properties"]["from_version"],
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": refine["properties"]["from_version"]["description"],
+            })
+        );
+        assert!(generate["properties"].get("from_version").is_none());
         // Each tool's own default folder: refine's is the session's, not the project's.
         assert_eq!(
             generate["properties"]["output_dir"]["description"],
@@ -1948,6 +2034,27 @@ mod tests {
             rejected(app, GENERATE, json!({"prompt": "x", "feedback": "y"}))
                 .contains("Unknown argument 'feedback'")
         );
+        assert!(
+            rejected(app, GENERATE, json!({"prompt": "x", "from_version": 1}))
+                .contains("Unknown argument 'from_version'")
+        );
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(1u64 << 32),
+        ] {
+            assert!(
+                rejected(
+                    app,
+                    REFINE,
+                    json!({"session": "s", "feedback": "x", "from_version": bad})
+                )
+                .contains("'from_version' must be a whole number, 1 or more"),
+                "{bad}"
+            );
+        }
         assert!(rejected(app, STATUS, json!({"verbose": true})).contains("takes no arguments"));
         assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "nothing may start");
     }
