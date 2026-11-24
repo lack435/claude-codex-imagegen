@@ -131,6 +131,11 @@ function Complete-Smoke([string]$PassLabel, [string]$Footer = '', [string]$FailL
 #   input (the multi-MB image result among it) and no tools. The tools code-mode `exec` can call
 #   are listed in exec's description as "### `name`" headings; the calls it shows as examples
 #   are not.
+#   From codex-cli 0.171.0 (manifest.json schema_version 3), an event names its payload by id,
+#   {raw_payload_id, kind, shard, parts?}, and the payloads live in zstd-compressed shards, which
+#   Windows PowerShell 5.1 cannot read. smoke-trace.py (Python 3.14 or later, standard library
+#   only) decodes the payloads read here into plain JSON files first; see its header for the
+#   layout. Requests carry the same content as before, so everything below reads them alike.
 # - tool_call_started with kind {type: "image_generation"} is an image call. Its
 #   invocation_payload holds {tool_name, tool_namespace, payload: {type: "function", arguments:
 #   "<JSON>"}}; the code_cell_started event of its runtime cell holds the JavaScript the agent
@@ -162,6 +167,56 @@ function Get-Field($Object, [string[]]$Path) {
 
 function Get-TraceLogs([string]$Root) {
     return @(Get-ChildItem -LiteralPath $Root -Recurse -Filter 'trace.jsonl' -File -ErrorAction SilentlyContinue | Sort-Object FullName)
+}
+
+# Where smoke-trace.py wrote the schema-3 payloads it decoded; set by Expand-TracePayloads.
+$script:decodedRoot = $null
+
+# A Python with compression.zstd (3.14 or later): the command and its leading arguments, or $null.
+function Find-ZstdPython {
+    foreach ($candidate in @(@('py', '-3'), @('python'))) {
+        if (-not (Get-Command $candidate[0] -ErrorAction SilentlyContinue)) { continue }
+        $leading = @($candidate | Select-Object -Skip 1)
+        & $candidate[0] @leading -I -c 'import compression.zstd' 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { return , $candidate }
+    }
+    return $null
+}
+
+# Decode the schema-3 payloads under $Root into $OutDir with smoke-trace.py. Returns $null when that
+# ran, or no folder needed it, else why it could not run. A payload the helper could not decode
+# (it prints why) is simply not written, so the check that reads it finds it missing and fails.
+function Expand-TracePayloads([string]$Root, [string]$OutDir) {
+    $needed = @(Get-TraceLogs $Root | Where-Object {
+            $manifest = Join-Path $_.DirectoryName 'manifest.json'
+            (Test-Path -LiteralPath $manifest) -and ([IO.File]::ReadAllText($manifest, $utf8) -match '"schema_version"\s*:\s*3\b')
+        })
+    if ($needed.Count -eq 0) { return $null }
+    $python = Find-ZstdPython
+    if (-not $python) {
+        return "$($needed.Count) trace folder(s) are in schema 3 (codex-cli 0.171.0 and later), whose zstd payloads need Python 3.14 or later (py -3) to read"
+    }
+    Write-Host "      decoding $($needed.Count) schema-3 trace folder(s) into $OutDir" -ForegroundColor DarkGray
+    $leading = @($python | Select-Object -Skip 1)
+    $output = & $python[0] @leading -I (Join-Path $PSScriptRoot 'smoke-trace.py') $Root $OutDir 2>&1
+    $exit = $LASTEXITCODE
+    foreach ($line in @($output)) { Write-Host "      $line" -ForegroundColor DarkGray }
+    if ($exit -ne 0 -and $exit -ne 1) { return "smoke-trace.py failed (exit code $exit)" }
+    $script:decodedRoot = $OutDir
+    return $null
+}
+
+# The file holding the payload a trace event names ($Reference): by its path in the trace folder
+# (schema 2 and earlier), or the file smoke-trace.py decoded it to (schema 3). $null when the event
+# names none, or names one by id and nothing was decoded.
+function Resolve-PayloadFile($Log, $Reference) {
+    $relative = Get-Field $Reference 'path'
+    if ($relative) { return Join-Path $Log.DirectoryName $relative }
+    $id = [string](Get-Field $Reference 'raw_payload_id')
+    if ($id -and $script:decodedRoot) {
+        return Join-Path (Join-Path $script:decodedRoot $Log.Directory.Name) (($id -replace ':', '_') + '.json')
+    }
+    return $null
 }
 
 # The trace events of the given types in one trace.jsonl, parsed, in order, one per pipeline
@@ -223,9 +278,8 @@ function Read-OfferedTools([string]$Root) {
     $result = [pscustomobject]@{ Requests = 0; WithTools = 0; Incremental = 0; Tools = [ordered]@{}; Problems = @() }
     foreach ($log in Get-TraceLogs $Root) {
         foreach ($traceEvent in Get-TraceEvents $log @('inference_started')) {
-            $relative = Get-Field $traceEvent 'payload', 'request_payload', 'path'
-            if (-not $relative) { $result.Problems += "an inference_started event in $($log.Directory.Name) names no request payload"; continue }
-            $file = Join-Path $log.DirectoryName $relative
+            $file = Resolve-PayloadFile $log (Get-Field $traceEvent 'payload', 'request_payload')
+            if (-not $file) { $result.Problems += "an inference_started event in $($log.Directory.Name) names no request payload"; continue }
             if (-not (Test-Path -LiteralPath $file)) { $result.Problems += "missing $file"; continue }
             $result.Requests++
             try {
@@ -342,9 +396,8 @@ function Read-ImageCalls([string]$Root) {
             }
             if ((Get-Field $payload 'kind', 'type') -ne 'image_generation') { continue }
             $call = [pscustomobject]@{ Folder = $log.Directory.Name; At = Get-Field $traceEvent 'wall_time_unix_ms'; Source = ''; Paths = @(); Known = $false }
-            $relative = Get-Field $payload 'invocation_payload', 'path'
-            if ($relative) {
-                $file = Join-Path $log.DirectoryName $relative
+            $file = Resolve-PayloadFile $log (Get-Field $payload 'invocation_payload')
+            if ($file) {
                 if (Test-Path -LiteralPath $file) {
                     $invocation = ConvertFrom-JsonText ([IO.File]::ReadAllText($file, $utf8))
                     $arguments = Get-Field $invocation 'payload', 'arguments'
@@ -382,8 +435,13 @@ function Get-FullPathOrSelf([string]$Path) {
 # V1 and V3 from the trace under $TraceRoot. V3 looks for any of $References, when given, in the
 # image calls' referenced_image_paths. The lists are also written to $ReportPath, when given.
 function Invoke-TraceChecks([string]$TraceRoot, [string[]]$References, [string]$ReportPath,
-    [string]$V3Name = 'V3: the reference reached the image tool''s referenced_image_paths') {
+    [string]$DecodeDir, [string]$V3Name = 'V3: the reference reached the image tool''s referenced_image_paths') {
     Write-Host '-> V1: tools offered to the agent model (rollout trace)'
+    $decodeError = Expand-TracePayloads $TraceRoot $DecodeDir
+    if ($decodeError) {
+        Add-Check 'V1 and V3: the rollout trace is readable' 'MANUAL' "$decodeError; inspect $TraceRoot by hand"
+        return
+    }
     $offered = $null
     $calls = @()
     $traceError = $null
@@ -503,7 +561,7 @@ if ($CheckTrace) {
         Write-Host "No trace.jsonl under $CheckTrace" -ForegroundColor Red
         exit 1
     }
-    Invoke-TraceChecks $CheckTrace $ReferencePath ''
+    Invoke-TraceChecks $CheckTrace $ReferencePath '' (Join-Path ([IO.Path]::GetTempPath()) "codex-imagegen-trace-decoded-$(Get-Date -Format 'yyyyMMdd-HHmmss')")
     Complete-Smoke 'TRACE CHECK PASS' '' 'TRACE CHECK FAIL'
 }
 
@@ -1190,7 +1248,7 @@ if ($SpendQuota) {
     # the fallback. Either in referenced_image_paths passes V3 for refine.
     $savedLines = @([regex]::Matches($allStderr, '(?m)^codex-imagegen: session ([A-Za-z0-9._-]+): image item has savedPath (.+?)\r?$'))
     $firstSaved = @($savedLines | Where-Object { $_.Groups[1].Value -eq $session } | Select-Object -First 1 | ForEach-Object { $_.Groups[2].Value })
-    Invoke-TraceChecks $traceRoot (@($firstSaved) + @($v1) | Where-Object { $_ }) (Join-Path $work 'v1-tools.txt') 'V3 (refine): the edit target reached the image tool''s referenced_image_paths'
+    Invoke-TraceChecks $traceRoot (@($firstSaved) + @($v1) | Where-Object { $_ }) (Join-Path $work 'v1-tools.txt') (Join-Path $work 'trace-decoded') 'V3 (refine): the edit target reached the image tool''s referenced_image_paths'
 
     # V1's last part: Codex reports savedPath. The result reads the same when the server falls
     # back to the image's base64, so the server logs where each image came from (turn.rs,
