@@ -41,7 +41,8 @@ passed V11 and 68 of 69 checks. The one failure was V1's trace reading: 0.171.0'
 name no request payload, so the tool-surface checks did not run on that version. `smoke.ps1` has since learned
 that trace format, and V1 passes on it (see the V1 row). Precise mode, an opt-in tool on the OpenAI Images API
 with its key in Credential Manager, is built, unit-tested and checked live, including 2 paid images (see
-[Precise mode](#precise-mode)).
+[Precise mode](#precise-mode)). The release workflow published v0.2.0, with all three, on 2026-11-24: the
+downloaded exe matched its published SHA-256, reported `0.2.0 (<commit>)`, and passed `--doctor`.
 
 Claims carry one of three tags:
 
