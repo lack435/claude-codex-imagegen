@@ -13,7 +13,7 @@
   process of ours is left, then runs --cleanup on the empty state folder. Nothing is generated and
   no quota is spent.
 
-  With -SpendQuota it also spends about 3 images of the ChatGPT plan's image quota (docs/design.md,
+  With -SpendQuota it also spends about 4 images of the ChatGPT plan's image quota (docs/design.md,
   "smoke.ps1"; this is the milestone M3 version):
     a) generate(session=smoke-<stamp>) with a prompt holding double quotes, a backslash, a newline
        and non-ASCII text (V2: Codex must use it verbatim);
@@ -21,8 +21,9 @@
        check in Codex's rollout trace that the image call's referenced_image_paths named the
        first image, the edit target (V3 for refine);
     c) kill the server, start a fresh one on the same state folder, and refine again (resume after
-       a restart);
-    d) status lists the session with 3 turns;
+       a restart), then refine with from_version 1: the trace must show v1's published file as
+       that image call's edit target (V11), and the result is v4;
+    d) status lists the session with 4 turns;
   then reads the trace for the tools the agent model was offered (V1) and the servers' stderr for
   the savedPath Codex reported for each image (V1), and finally, free:
     e) closes every server and, whatever the run got to, runs codex-imagegen.exe --cleanup
@@ -551,7 +552,7 @@ foreach ($d in @($work, $outDir, $stateBase, $projectDir)) { New-Item -ItemType 
 
 Write-Host ''
 if ($SpendQuota) {
-    $images = if ($Interrupt) { 'about 1 image plus 1 cut short' } else { 'about 3 images' }
+    $images = if ($Interrupt) { 'about 1 image plus 1 cut short' } else { 'about 4 images' }
     if ($Concurrent) { $images += ', plus 2 for V9' }
     Write-Host 'codex-imagegen smoke test: PAID run.' -ForegroundColor Yellow
     Write-Host "Expected cost: $images of the ChatGPT plan's image quota, plus the agent" -ForegroundColor Yellow
@@ -559,7 +560,7 @@ if ($SpendQuota) {
 }
 else {
     Write-Host 'codex-imagegen smoke test: free steps only (initialize, tools/list, status, --cleanup).'
-    Write-Host 'Pass -SpendQuota to also generate and refine images (about 3 images of the image quota).'
+    Write-Host 'Pass -SpendQuota to also generate and refine images (about 4 images of the image quota).'
 }
 Write-Host "Working folder: $work"
 Write-Host "State base (CODEX_IMAGEGEN_HOME for every server here): $stateBase"
@@ -1117,10 +1118,18 @@ try {
             [void](Test-ImageResult 'refine after a restart' $result $session 3 $feedback2 'feedback')
             if ($result.isError -ne $true) { $sessionsMade[$session] = 3 }
 
+            # V11: rewind to v1 and retry. The edit target is v1's published file, and the new
+            # image is the next version, v4.
+            Write-Host '-> (c2) refine from version 1 (1 image)'
+            $feedback3 = 'Make it early morning, with soft pink light.'
+            $result = Invoke-Tool $s2 'codex_imagegen_refine' @{ session = $session; feedback = $feedback3; from_version = 1 }
+            [void](Test-ImageResult 'refine from version 1' $result $session 4 $feedback3 'feedback')
+            if ($result.isError -ne $true) { $sessionsMade[$session] = 4 }
+
             Write-Host '-> (d) status'
             $status2 = Get-ResultText (Invoke-Mcp $s2 'tools/call' @{ name = 'codex_imagegen_status'; arguments = @{} } 120)
             Write-Host ($status2 -replace '(?m)^', '      ') -ForegroundColor DarkGray
-            Test-Check 'status lists the session with 3 turns' ($status2 -match ('(?m)^  ' + [regex]::Escape($session) + ': 3 turns, latest ' + [regex]::Escape((Join-Path $outDir "$session-v3.png")))) ''
+            Test-Check 'status lists the session with 4 turns' ($status2 -match ('(?m)^  ' + [regex]::Escape($session) + ': 4 turns, latest ' + [regex]::Escape((Join-Path $outDir "$session-v4.png")))) ''
             Test-Check 'status: no turn is left running' ($status2 -match '(?m)^running turns: none') ''
             Stop-Server $s2
         }
@@ -1191,6 +1200,27 @@ if ($SpendQuota) {
     $savedLines = @([regex]::Matches($allStderr, '(?m)^codex-imagegen: session ([A-Za-z0-9._-]+): image item has savedPath (.+?)\r?$'))
     $firstSaved = @($savedLines | Where-Object { $_.Groups[1].Value -eq $session } | Select-Object -First 1 | ForEach-Object { $_.Groups[2].Value })
     Invoke-TraceChecks $traceRoot (@($firstSaved) + @($v1) | Where-Object { $_ }) (Join-Path $work 'v1-tools.txt') 'V3 (refine): the edit target reached the image tool''s referenced_image_paths'
+
+    # V11: the refine from version 1 is the run's last image call with references (V9's generates
+    # have none), and its edit target, listed first, must be v1's published file: Codex's own copy
+    # of an earlier version is not recorded, so ours is the only candidate.
+    if (-not $Interrupt -and $sessionsMade.Contains($session) -and $sessionsMade[$session] -ge 4 -and $v1) {
+        $v11Name = 'V11: refine from version 1 named v1''s published file as the edit target'
+        try {
+            $withRefs = @(Read-ImageCalls $traceRoot | Where-Object { $_.Known -and @($_.Paths).Count -gt 0 } | Sort-Object { [int64]$_.At })
+            if ($withRefs.Count -eq 0) {
+                Add-Check $v11Name 'MANUAL' "no image call with readable referenced_image_paths; inspect $traceRoot by hand"
+            }
+            else {
+                $last = $withRefs[-1]
+                $target = Get-FullPathOrSelf ([string]@($last.Paths)[0])
+                Test-Check $v11Name ($target -eq (Get-FullPathOrSelf $v1)) "first of [$(@($last.Paths) -join ', ')] in $($last.Folder)"
+            }
+        }
+        catch {
+            Add-Check $v11Name 'MANUAL' "the image calls could not be read ($($_.Exception.Message)); inspect $traceRoot by hand"
+        }
+    }
 
     # V1's last part: Codex reports savedPath. The result reads the same when the server falls
     # back to the image's base64, so the server logs where each image came from (turn.rs,

@@ -55,7 +55,7 @@ copy fails, and `build.ps1` reports the process holding the file rather than lea
 
 - **`cargo test`** is unit tests only. No network, no model calls, and no real Codex. The app-server
   client is tested against a scripted fake child.
-- **`smoke.ps1`** is a real end-to-end run against Codex. It spends image quota (about 3 images), so
+- **`smoke.ps1`** is a real end-to-end run against Codex. It spends image quota (about 4 images), so
   run it when a change touches the protocol, spawning or session handling, and tell the user the
   cost before running it. `build.ps1` passing is not a substitute, because it never starts Codex.
 - **If OpenAI's service is degraded**, live checks fail for reasons unrelated to the code. Say so,

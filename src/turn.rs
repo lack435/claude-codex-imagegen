@@ -3391,6 +3391,118 @@ mod refine_tests {
         );
     }
 
+    /// Record a v2 for a seeded session, as a refine leaves it: published in `out` with bytes of
+    /// its own, Codex's copy at `saved`, and the latest image now v2.
+    fn seed_v2(f: &Fixture, name: &str, saved: &Saved, out: &Path) -> PathBuf {
+        let v2 = out.join(format!("{name}-v2.png"));
+        std::fs::write(&v2, &saved.bytes).unwrap();
+        let resolved = std::fs::canonicalize(&v2).unwrap();
+        SessionWriter::new(f.store().clone(), name, None)
+            .image_completed(
+                THREAD_ID,
+                &ImageOutcome {
+                    version: Some(2),
+                    output_path: Some(&v2),
+                    saved_path: Some(&saved.path),
+                    bytes: Some(saved.bytes.len() as u64),
+                    fnv1a64: Some(Fnv1a64::of(&saved.bytes)),
+                    resolved_path: Some(&resolved),
+                },
+            )
+            .unwrap();
+        v2
+    }
+
+    #[test]
+    fn a_refine_from_an_earlier_version_edits_that_file_and_publishes_the_next_version() {
+        let first = saved_png();
+        let second = saved_png();
+        let turn_image = saved_png();
+        let fake = codex(image_turn(&turn_image.path, FEEDBACK));
+        let seen = Arc::clone(&fake.seen);
+        let f = fixture(fake);
+        let out = f.dir.join("generated-images");
+        let v1 = seed(&f, "fox", &first, &out);
+        let v2 = seed_v2(&f, "fox", &second, &out);
+        assert_eq!(f.record("fox").unwrap().next_version, 3);
+
+        let result = refine(
+            &f,
+            json!({"session": "fox", "feedback": FEEDBACK, "from_version": 1}),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        // v1's published file is the edit target, not the latest image.
+        let sent = FakeCodex::sent(&seen, "turn/start");
+        assert_eq!(sent[0]["input"][0]["text"], edit_text(&v1));
+        let text = text_of(&result);
+        assert!(text.starts_with("session: fox   version: 3\n"), "{text}");
+
+        // Earlier versions are left as they were; the new image is the latest from now on.
+        assert_eq!(std::fs::read(&v1).unwrap(), first.bytes);
+        assert_eq!(std::fs::read(&v2).unwrap(), second.bytes);
+        let v3 = out.join("fox-v3.png");
+        let record = f.record("fox").unwrap();
+        assert_eq!(record.turns, 3);
+        assert_eq!(record.next_version, 4);
+        assert_eq!(record.last_output_path.as_deref(), Some(v3.as_path()));
+        assert_eq!(
+            record.outputs.iter().map(|o| o.version).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn a_refine_from_a_version_that_is_unknown_or_changed_spends_nothing() {
+        let first = saved_png();
+        let second = saved_png();
+        let fake = codex(image_turn(&second.path, FEEDBACK));
+        let seen = Arc::clone(&fake.seen);
+        let f = fixture(fake);
+        let out = f.dir.join("generated-images");
+        let v1 = seed(&f, "fox", &first, &out);
+        seed_v2(&f, "fox", &second, &out);
+
+        let unknown = refine(
+            &f,
+            json!({"session": "fox", "feedback": FEEDBACK, "from_version": 7}),
+        );
+        assert_eq!(code_of(&unknown), "BAD_REQUEST");
+        let text = text_of(&unknown);
+        assert!(
+            text.contains("has no published version 7 (its published versions: 1, 2)"),
+            "{text}"
+        );
+
+        // v1 edited after publication: its size no longer matches, so it is not edited.
+        std::fs::write(&v1, b"changed").unwrap();
+        let changed = refine(
+            &f,
+            json!({"session": "fox", "feedback": FEEDBACK, "from_version": 1}),
+        );
+        assert_eq!(code_of(&changed), "BAD_REQUEST");
+        let text = text_of(&changed);
+        assert!(
+            text.contains(&format!(
+                "Version 1 of session 'fox' ({}) no longer exists as it was published",
+                v1.display()
+            )),
+            "{text}"
+        );
+        // Deleted is the same.
+        std::fs::remove_file(&v1).unwrap();
+        let deleted = refine(
+            &f,
+            json!({"session": "fox", "feedback": FEEDBACK, "from_version": 1}),
+        );
+        assert_eq!(code_of(&deleted), "BAD_REQUEST");
+
+        assert_eq!(f.spawns.load(Ordering::SeqCst), 0, "Codex was started");
+        assert!(FakeCodex::sent(&seen, "turn/start").is_empty());
+        assert!(f.running().is_empty());
+        assert!(f.store().try_lease("fox").unwrap().is_some(), "the lease");
+        assert_eq!(f.record("fox").unwrap().turns, 2);
+    }
+
     #[test]
     fn a_session_from_another_codex_home_is_not_resumable() {
         let saved = saved_png();

@@ -89,8 +89,13 @@ Ask in plain language; Claude picks the tool. Three tools are offered:
 | Tool | What it does | Arguments |
 | --- | --- | --- |
 | `codex_imagegen_generate` | Starts a new session and makes an image | `prompt`; optional `session` name, `output_dir`, up to 5 `reference_images` |
-| `codex_imagegen_refine` | Edits the session's latest image | `session`, `feedback`; optional `output_dir`, up to 4 more `reference_images` |
+| `codex_imagegen_refine` | Edits the session's latest image, or an earlier version | `session`, `feedback`; optional `from_version`, `output_dir`, up to 4 more `reference_images` |
 | `codex_imagegen_status` | Reports the setup, usage, running turns and this project's sessions | none (free) |
+
+To undo a refinement that went wrong, ask Claude to retry it from the version before, with better
+feedback. It passes `from_version`: the new image is an edit of that version, gets the next version
+number, and later refinements build on it. Earlier files are left as they are. To redo the very first
+prompt, start a new session.
 
 Reference images are files: Claude passes their paths, and each must be a PNG, JPEG or WebP. In the
 desktop app you can also paste an image into the chat and ask for a variation, an edit or a remaster of
@@ -207,7 +212,7 @@ The paid modes are billed to your ChatGPT plan:
 
 | Command | Cost | Checks |
 | --- | --- | --- |
-| `.\smoke.ps1 -SpendQuota` | about 3 images | generate, refine, refine after a restart, status, cleanup, Codex's tool surface |
+| `.\smoke.ps1 -SpendQuota` | about 4 images | generate, refine, refine after a restart, refine from an earlier version, status, cleanup, Codex's tool surface |
 | `... -Concurrent` | 2 more | two servers generating at once |
 | `... -Interrupt` | 1 image plus 1 cut short, instead of the refines | a refine cancelled during its image call |
 | `... -CodexHome <dir>` | none extra | every server runs with `--codex-home <dir>` |
