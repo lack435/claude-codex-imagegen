@@ -380,9 +380,10 @@ thread id, no session records it, and it stays loaded in the child until the chi
    has its recorded size. Codex's own copy of an earlier version is not recorded, so there is no fallback. A
    version the session never published gets `BAD_REQUEST` listing the ones it has; a file that is gone or
    changed gets `BAD_REQUEST` naming it. Nothing is spent either way. The thread itself is not rewound: the
-   turns after version N stay in its history [decided]. The image tool does not see that history: its call
-   takes only `prompt`, `referenced_image_paths` and `num_last_images_to_include` [verified], and the
-   developer instructions forbid the last, so the call gets the feedback and the edit target alone. The new
+   turns after version N stay in its history [decided]. The agent model sees that history, but only relays
+   the feedback verbatim. The image tool's call takes only `prompt`, `referenced_image_paths` and
+   `num_last_images_to_include` [verified], and the developer instructions forbid the last, so the call
+   should get the feedback and the edit target alone [assumed: no paid run has used `from_version`]. The new
    image is numbered and recorded like any other, so it becomes the latest, and earlier files are untouched.
 2. **Check the Codex home.** A record whose `codex_home` is not the child's `codexHome` gets
    `SESSION_NOT_RESUMABLE`, naming both, before any thread call. Paths compare exactly, as cleanup compares
@@ -1383,6 +1384,7 @@ Each item must pass before the code that depends on it is considered done.
 | V4 | **Passed 2026-09-26** (codex-cli 0.157.1). `turn/interrupt` during an image call gives `turn/completed` with status `interrupted` and no file. A refine cancelled with `notifications/cancelled` 5 s into its image call got no response; the server logged its `turn/interrupt` and Codex's `turn/completed: interrupted` for that turn; `status` showed no running turn; 60 s after the cancel there was no `-v2` file, the thread's `generated_images` folder still held only the first image, and the record still had 1 turn and 1 output. `smoke.ps1 -SpendQuota -Interrupt`. | 1 partial image (quota effect unknown) | M4 |
 | V5 | **Passed 2026-09-26.** With `--codex-home` pointing at a dedicated home, images land under that home. `status` reported the home as dedicated, the session's record named it, the image's `savedPath` and the rollout were under it, and neither the thread's image folder nor a rollout of it existed in the ambient home. The sweep removed the session from the dedicated home. `smoke.ps1 -CodexHome <dir>`. | 1 image, plus a one-time login by the owner | M4 |
 | V10 | On a FAT32 or exFAT volume (a USB stick), the POSIX delete is refused with one of the errors that fall back to the legacy disposition, and cleanup still deletes the session's files there. The fallback itself is covered by a unit test with the refusal injected. | free (no turn) | when such a volume is at hand |
+| V11 | `refine` with `from_version` names that version's published file as the edit target: it reaches `referenced_image_paths` (trace), the new image edits it rather than the latest one, and `revisedPrompt` is the feedback verbatim. Not yet in `smoke.ps1`. | 1 image | when next running the paid smoke |
 | V9 | **Passed 2026-09-26.** Two codex-imagegen processes (two Claude windows) generate at the same moment. Both succeeded (26 s and 30 s), and both sessions were recorded in the shared store. `smoke.ps1 -SpendQuota -Concurrent`. | 2 images | M3 |
 
 ## Milestones
